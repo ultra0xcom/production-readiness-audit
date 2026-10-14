@@ -12,7 +12,7 @@ metadata:
 
 # Production readiness audit
 
-Package (PACKAGE): `${CLAUDE_SKILL_DIR}` when expanded by the harness; if literal, use the directory containing this SKILL.md from its loaded location. If unknown, look for `production-readiness-audit/tools/audit_tools.py` under selected installer destinations: `./.agents/skills`, `~/.agents/skills`, `./.claude/skills`, `~/.claude/skills`, `./.github/skills`, `~/.copilot/skills`, `~/.gemini/skills`, `~/.gemini/antigravity-cli/skills`, `~/.cursor/skills`, `~/.config/opencode/skills`, `./.windsurf/skills`, `~/.codeium/windsurf/skills`; ask if several or none. These are search locations, not claims of native discovery.
+Package (PACKAGE): `${CLAUDE_SKILL_DIR}` when expanded by the harness; if literal, use the directory containing this SKILL.md from its loaded location. If unknown, look for `production-readiness-audit/tools/audit_tools.py` under selected installer destinations: `./.agents/skills`, `~/.agents/skills`, `./.claude/skills`, `~/.claude/skills`, `./.github/skills`, `~/.copilot/skills`, `~/.gemini/antigravity-cli/skills`, `~/.cursor/skills`, `~/.config/opencode/skills`, `./.windsurf/skills`, `~/.codeium/windsurf/skills`; ask if several or none. These are search locations, not claims of native discovery.
 Invocation text: `$ARGUMENTS`; if literal or not provided by the harness, use the user's message after the skill name. The audit subject is the project in the current working directory.
 
 Run only on explicit user request; no skill controls grant additional permissions. If loaded implicitly, ask whether to start a run and wait for an explicit user request before creating one.

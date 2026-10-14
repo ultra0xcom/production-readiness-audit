@@ -322,7 +322,7 @@ README_TEXT = {
                              'names not classified as sensitive', 'follow §6'),
     'README_NEUTRALITY_LIMIT': ('Neutral wording cannot guarantee that project content never triggers model behavior.',),
 }
-README_AGENTS = ('Claude Code', 'Codex CLI', 'Gemini CLI', 'Antigravity CLI', 'Antigravity app/IDE',
+README_AGENTS = ('Claude Code', 'Codex CLI', 'Antigravity CLI', 'Antigravity app/IDE',
                  'Cursor', 'GitHub Copilot', 'OpenCode', 'Windsurf')
 PERSONAL_PATH = re.compile(r'(?<![A-Z0-9\\])[A-Z]:[\\/]|/(?:Users|home)/|'
                           r'(?<![A-Z0-9_\\])\\{2,4}[A-Z0-9][A-Z0-9._-]+\\{1,2}[A-Z0-9][A-Z0-9._-]+', re.IGNORECASE)

@@ -32,8 +32,8 @@
     },
     {
       "name": "maintenance/check_prompt_structure.py",
-      "size_bytes": 80515,
-      "sha256": "38ff944da811251113d242a459053e625282fe42e731710a1dfdae6c65b57926"
+      "size_bytes": 80501,
+      "sha256": "50feba416239d3b10dd1f2906eca952d9ff53dee22bd20131949a4801f7dc76e"
     },
     {
       "name": "maintenance/EVAL_PLAN.md",
@@ -52,8 +52,8 @@
     },
     {
       "name": "README.md",
-      "size_bytes": 23998,
-      "sha256": "ff7530c164ca9aeef2885e9b6ea6ad23c3d8842eb5e6f39f1466ab10a076646f"
+      "size_bytes": 23471,
+      "sha256": "c56d6ab4e387af14177344af30b74ef6a6f3f1966d4cff71af82788d1f5ec728"
     },
     {
       "name": "RESUME_PROMPT.md",
@@ -67,8 +67,8 @@
     },
     {
       "name": "SKILL.md",
-      "size_bytes": 10156,
-      "sha256": "4ad76c90e58e87a32f94116e61e2639b7603d2203cbcc242d73e1d5896ce1cdb"
+      "size_bytes": 10136,
+      "sha256": "9ce070e97ffee85af652d30ed2c96f9b3245bb0724026624178dd623df9e39ad"
     },
     {
       "name": "START_PROMPT.md",

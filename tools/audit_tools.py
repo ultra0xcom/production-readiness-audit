@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tools for the Production Readiness System Audit (master prompt V4.0).
+"""Tools for the Production Readiness System Audit.
 
 Commands:
   init       create a run directory with a unique RUN_ID and capture the start baseline
@@ -10,7 +10,8 @@ Commands:
   stop       stop an active run command, such as a service started for E2E tests
   cleanup    remove a working copy; only with a marker, no overlap with the original, without following links
   envkeys    show keys and value shapes of .env files without printing values
-  validate   check audit.json against the audit-core/1 core data contract
+  validate   check audit.json against the audit-core/2 core data contract
+  checkpoint create or verify the immutable interim checkpoint
   selftest   run positive and negative controls of these tools
   example    print a minimal valid audit.json
 
@@ -31,6 +32,7 @@ import hashlib
 import json
 import locale
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -45,14 +47,15 @@ from stat import S_ISLNK
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
+from urllib.parse import unquote
 
 if os.name == 'nt':
     import ctypes
     from ctypes import wintypes
 
-TOOL_VERSION = '2.0.0'
-PROMPT_VERSION = '4.0'
-SCHEMA_VERSION = 'audit-core/1'
+TOOL_VERSION = '3.0.0'
+PROMPT_VERSION = '5.0'
+SCHEMA_VERSION = 'audit-core/2'
 DEFAULT_RESULTS_DIRNAME = 'audit-results'
 WORKSPACE_MARKER = '.audit-workspace.json'
 PACKAGE_DIR = Path(__file__).resolve().parent.parent
@@ -225,21 +228,29 @@ BINDING = {'BINDING', 'CLAIMED', 'DERIVED', 'ASSUMED', 'OPEN_DECISION', 'EXCLUDE
 SIZE_PROFILE = {'S', 'M', 'L'}
 BOOL = {True, False}
 DOMAINS = [chr(code) for code in range(ord('A'), ord('S') + 1)]
+FINDING_CATEGORY = (set(DOMAINS) - {'H'}) | {'SECURITY'}
 RUN_LOG_METHODS = {'UNIT', 'CONTRACT', 'INTEGRATION', 'PRODUCTION_LIKE'}
 END_TO_END_METHODS = {'CONTRACT', 'INTEGRATION', 'E2E', 'PRODUCTION_LIKE', 'MANUAL'}
 UI_EVIDENCE_KINDS = {'UI', 'SCREENSHOT', 'TRACE', 'VIDEO', 'HAR'}
+REVIEW_METHOD = {'READ_CODE', 'RAN_TESTS', 'COMMENT_ONLY'}
+REVIEW_OUTCOME = {'UPHELD', 'LIMITED', 'DISPUTED', 'UNAVAILABLE'}
+SECURITY_STATUS = {'PENDING', 'IN_PROGRESS', 'DONE', 'BLOCKED', 'NOT_APPLICABLE', 'NOT_PERFORMED'}
+SECURITY_RELEVANCE = {'IDENTITY', 'ACCESS_RULES', 'EXTERNAL_INPUT', 'SECRETS_AND_KEYS', 'PERSONAL_DATA',
+                      'OUTBOUND_CALLS', 'BUILD_AND_DEPENDENCIES', 'AI_TOOL_USE', 'EXECUTED_CONTENT'}
 
 TOP_LEVEL_REQUIRED = [
     'schema_version', 'prompt_version', 'run_id', 'run_type', 'previous_run_ids', 'baseline', 'scope', 'sources',
     'vision', 'objectives', 'invariants', 'environments', 'components', 'requirements', 'journeys',
     'domain_matrix', 'claims', 'checks', 'evidence', 'findings', 'tasks', 'release_gates', 'audit_status',
-    'release_status', 'residual_risks', 'next_actions',
+    'release_status', 'residual_risks', 'next_actions', 'security_review', 'security_scope',
 ]
 ID_REGISTERS = ['sources', 'objectives', 'invariants', 'environments', 'components', 'requirements', 'journeys',
-                'claims', 'checks', 'evidence', 'findings', 'tasks', 'release_gates']
+                'claims', 'checks', 'evidence', 'findings', 'tasks', 'release_gates', 'security_scope']
 OPTIONAL_ID_REGISTERS = ['test_assessments', 'doc_claims']
 # field -> (allowed values, nullable)
 REGISTER_SPEC: dict[str, dict[str, Any]] = {
+    'security_scope': {'required': ['ref', 'component_ids', 'journey_ids', 'relevance', 'reason', 'check_ids'],
+                       'enums': {}},
     'sources': {'required': ['ref', 'authority'], 'enums': {}},
     'objectives': {'required': ['statement', 'source_ids', 'fulfillment', 'claim_ids'],
                    'enums': {'fulfillment': (FULFILLMENT, False)}},
@@ -260,7 +271,7 @@ REGISTER_SPEC: dict[str, dict[str, Any]] = {
                          'required_for_audit': (BOOL, True), 'required_for_release': (BOOL, True)}},
     'evidence': {'required': ['kind', 'captured_at_utc', 'freshness', 'limits'],
                  'enums': {'freshness': (FRESHNESS, False)}},
-    'findings': {'required': ['title', 'type', 'assessment', 'state', 'severity', 'priority', 'confidence',
+    'findings': {'required': ['title', 'type', 'category', 'assessment', 'state', 'severity', 'priority', 'confidence',
                               'release_blocker', 'cause_status', 'claim_ids', 'evidence_ids', 'code_refs',
                               'task_ids', 'file'],
                  'enums': {'type': (FINDING_TYPE, False), 'assessment': (FINDING_ASSESSMENT, False),
@@ -280,7 +291,8 @@ REF_TARGETS = {
     'environment_ids': 'environments', 'component_ids': 'components', 'requirement_ids': 'requirements',
     'journey_ids': 'journeys', 'claim_ids': 'claims', 'check_ids': 'checks', 'evidence_ids': 'evidence',
     'counter_evidence_ids': 'evidence', 'finding_ids': 'findings', 'task_ids': 'tasks', 'depends_on': 'tasks',
-    'gate_ids': 'release_gates',
+    'gate_ids': 'release_gates', 'doc_claim_ids': 'doc_claims', 'countercheck_evidence_ids': 'evidence',
+    'decision_source_ids': 'sources',
 }
 
 
@@ -736,7 +748,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     write_json_new(run_dir / baseline_rel, snap)
     now = utc_now()
     write_json_new(run_dir / 'RUN-STATE.json', {
-        'run_id': run_id, 'prompt_version': PROMPT_VERSION, 'phase': 'P0',
+        'run_id': run_id, 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'phase': 'P0',
         'created_at_utc': now, 'updated_at_utc': now, 'closed_at_utc': None, 'project_root': str(project),
         'baseline': {'content_fingerprint': snap['content_fingerprint'], 'head': head, 'file': baseline_rel},
         'run_type': None, 'previous_run_ids': [], 'authorization': None, 'workspace': None, 'size_profile': None,
@@ -862,7 +874,7 @@ RESERVED_EXAMPLE_HOST = re.compile(r'(?:[a-z0-9-]+\.)*(?:example(?:\.(?:com|org|
 
 def is_placeholder_url_credential(match: re.Match[str], text: str) -> bool:
     """URL credentials that reveal nothing: masked or templated, a publicly known default password, or a reserved
-    example host (RFC 2606/6761). In four real audit runs all but one match fell into these classes."""
+    example host (RFC 2606/6761)."""
     secret = match.group('secret')
     if URL_MASKED_SECRET.fullmatch(secret) or secret.lower() in URL_DEFAULT_SECRETS:
         return True
@@ -2086,13 +2098,41 @@ def version_tuple(value: Any) -> tuple[int, ...] | None:
 
 
 def status_value(value: Any) -> Any:
-    """Earlier prompt versions stored some verdicts as objects such as {"value": "PARTIAL", "reason": ...}."""
+    """Accept scalar verdicts and stored objects such as {"value": "PARTIAL", "reason": ...}."""
     if isinstance(value, dict):
         value = value.get('value', value.get('status'))
     return value if isinstance(value, (str, type(None))) else None
 
 
-def describe_run(directory: Path) -> dict[str, Any] | None:
+def security_closure_allowed(data: dict[str, Any], state: dict[str, Any], run: Path) -> bool:
+    """Terminal review state, or a supported successor that links back to this run."""
+    review = data.get('security_review')
+    if isinstance(review, dict) and review.get('status') in ('DONE', 'NOT_APPLICABLE', 'NOT_PERFORMED', 'BLOCKED'):
+        return True
+    successor_id = state.get('superseded_by_run')
+    if (not isinstance(successor_id, str) or not ID_PATTERN.fullmatch(successor_id)
+            or successor_id == data.get('run_id') or successor_id == run.name):
+        return False
+    successor = run.parent / successor_id
+    if not is_within(successor, run.parent) or successor.resolve() == run.resolve():
+        return False
+    found = False
+    for name in ('RUN-STATE.json', 'audit.json'):
+        path = successor / name
+        if not path.is_file():
+            continue
+        try:
+            linked = read_json(path)
+        except (OSError, ValueError):
+            return False
+        if (not isinstance(linked, dict) or linked.get('run_id') != successor_id
+                or linked.get('schema_version') != SCHEMA_VERSION):
+            return False
+        found = found or data.get('run_id') in id_list(linked.get('previous_run_ids'))
+    return found
+
+
+def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any] | None:
     """Facts about one run directory; None if it is no audit run (e.g. a folder of implementation notes)."""
     loaded: dict[str, Any] = {}
     problems = []
@@ -2110,17 +2150,22 @@ def describe_run(directory: Path) -> dict[str, Any] | None:
     if not loaded:
         return None
     state, audit = loaded.get('RUN-STATE.json', {}), loaded.get('audit.json', {})
+    corrupt = len(problems) == 2
     raw_version = state.get('prompt_version') or audit.get('prompt_version')
     version = str(raw_version) if isinstance(raw_version, (int, float)) else status_value(raw_version)
     parsed = version_tuple(version)
     report = (directory / 'REPORT.md').is_file()
     audit_status = status_value(audit.get('audit_status'))
-    if state.get('closed_at_utc'):
-        status = 'CLOSED'
+    schema = audit.get('schema_version', state.get('schema_version'))
+    compatible = schema == SCHEMA_VERSION
+    if corrupt:
+        status = 'CORRUPT'
+    elif state.get('closed_at_utc'):
+        status = 'OPEN' if compatible and not security_closure_allowed(audit, state, directory) else 'CLOSED'
     elif 'closed_at_utc' in state or (parsed is not None and parsed >= (3, 1)):
-        status = 'OPEN'  # since 3.1 a run is closed only by closed_at_utc
+        status = 'OPEN'  # explicit closure field or supported identifier requires a closure marker
     elif audit_status in AUDIT_STATUS and report:
-        status = 'LEGACY_CLOSED_INFERRED'  # before 3.1 there was no closed_at_utc
+        status = 'LEGACY_CLOSED_INFERRED'  # stored run has no explicit closure field
     else:
         status = 'LEGACY_OPEN_INFERRED'
     baseline = audit.get('baseline') if isinstance(audit.get('baseline'), dict) else {}
@@ -2129,7 +2174,53 @@ def describe_run(directory: Path) -> dict[str, Any] | None:
                or (f'{stamp.group(1)}T{stamp.group(2)}:{stamp.group(3)}:00Z' if stamp else None)
                or datetime.fromtimestamp(directory.stat().st_mtime, timezone.utc).replace(microsecond=0)
                .isoformat().replace('+00:00', 'Z'))
+    live_valid = False
+    top_type_error = False
+    live_codes: set[str] = set()
+    if inspect_live and compatible and audit:
+        try:
+            live_issues, _ = validate_audit(audit, directory, None, final=False)
+            live_codes = live_issues.codes()
+            top_type_error = any(e['code'] == 'E_TYPE' and e['where'] in TOP_LEVEL_REQUIRED for e in live_issues.errors)
+            live_valid = not live_issues.errors
+        except (OSError, ValueError, TypeError):
+            live_codes = {'E_TYPE'}
+    checkpoint = (verify_checkpoint(directory) if inspect_live else
+                  {'state': 'PRESENT_UNVERIFIED' if (directory / 'checkpoints/interim').is_dir() else 'ABSENT'})
+    phase = re.match(r'^P(\d+)\b', str(state.get('phase', '')))
+    before_interim = phase is not None and int(phase[1]) < 7
+    project_changed = bool(live_codes & {'E_CODE_REF_STALE', 'E_SOURCE_STALE', 'E_CODE_REF_FILE'})
+    malformed = bool(problems) or not compatible or top_type_error or any(key not in audit for key in TOP_LEVEL_REQUIRED)
+    if corrupt and not inspect_live:
+        guidance = 'CORRUPT live state; inspect this run and verify its interim checkpoint for possible recovery. Restoring discards all progress since the interim checkpoint.'
+    elif not inspect_live:
+        guidance = 'Continue from the persisted phase; inspect this run before resuming.'
+    elif project_changed:
+        guidance = 'Continue / revalidate; project changed since checkpoint: follow re-audit rules. Do not restore over live progress.'
+    elif live_codes and not malformed:
+        guidance = 'Repair live state, then revalidate; preserve progress and continue from the persisted phase.'
+    elif before_interim and compatible:
+        guidance = 'Continue from the persisted phase; complete and revalidate live state before the interim checkpoint.'
+    elif malformed and not before_interim and checkpoint['state'] == 'VALID':
+        guidance = 'Live state malformed or schema-invalid. Offer the verified interim checkpoint; restoring discards all progress since the interim checkpoint. Restore its files to live state using temp files + atomic rename, keep the last valid state, then validate before resuming P8/P9.'
+    elif corrupt:
+        guidance = 'CORRUPT live state; no verified checkpoint is available. Repair live state, then revalidate.'
+    elif not compatible:
+        guidance = 'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. Never change the schema identifier.'
+    elif malformed:
+        guidance = 'Repair live state, then revalidate; no verified interim checkpoint is available.'
+    else:
+        guidance = 'Continue from live state and persisted phase; revalidate unresolved checks and verify the interim checkpoint before P8.'
+    if not compatible and not inspect_live and not corrupt:
+        guidance = 'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. Never change the schema identifier.'
     return {'dir': directory.name, 'run_id': status_value(state.get('run_id')) or status_value(audit.get('run_id')),
+            'schema_version': schema, 'resumable_with_package':
+                (checkpoint['state'] == 'VALID' if inspect_live else None) if corrupt else compatible,
+            'live_state': 'CORRUPT' if corrupt else (('VALID' if live_valid else 'INVALID_OR_INCOMPLETE') if inspect_live else 'NOT_CHECKED'),
+            'live_validation_errors': sorted(live_codes) if inspect_live else None, 'resume_guidance': guidance,
+            'security_review': {'status': status_value((audit.get('security_review') or {}).get('status'))
+                                if isinstance(audit.get('security_review'), dict) else None},
+            'checkpoint': checkpoint,
             'prompt_version': version, 'run_type': status_value(audit.get('run_type') or state.get('run_type')),
             'phase': state.get('phase'), 'created_at_utc': created, 'updated_at_utc': state.get('updated_at_utc'),
             'closed_at_utc': state.get('closed_at_utc'), 'status': status, 'audit_status': audit_status,
@@ -2144,17 +2235,23 @@ def cmd_runs(args: argparse.Namespace) -> int:
     runs, other = [], []
     if results.is_dir():
         for directory in sorted(p for p in results.iterdir() if p.is_dir()):
-            info = describe_run(directory)
+            info = describe_run(directory, inspect_live=False)
             if info is None:
                 other.append(directory.name)
             else:
                 runs.append(info)
     runs.sort(key=lambda item: str(item['created_at_utc']))
-    open_runs = [r['dir'] for r in runs if r['status'] in ('OPEN', 'LEGACY_OPEN_INFERRED')]
+    open_runs = [r['dir'] for r in runs if r['status'] in ('OPEN', 'LEGACY_OPEN_INFERRED', 'CORRUPT')]
     closed_runs = [r['dir'] for r in runs if r['status'] in ('CLOSED', 'LEGACY_CLOSED_INFERRED')]
+    latest_resumable = next((r['dir'] for r in reversed(runs) if r['resumable_with_package'] and r['dir'] in open_runs), None)
+    selected = latest_resumable or (open_runs[-1] if open_runs else None)
+    for index, info in enumerate(runs):
+        if args.inspect_all or info['dir'] == selected:
+            runs[index] = describe_run(results / info['dir']) or info
+    latest_resumable = next((r['dir'] for r in reversed(runs) if r['resumable_with_package'] and r['dir'] in open_runs), None)
     notes = []
     if any(r['status'].startswith('LEGACY') for r in runs):
-        notes.append('Runs before 3.1 have no closed_at_utc; LEGACY_* status is inferred from audit_status and REPORT.md '
+        notes.append('Runs without an explicit closure field may have LEGACY_* status inferred from audit_status and REPORT.md '
                      'and must be clarified with the user if uncertain.')
     if len(open_runs) > 1:
         notes.append('Multiple unclosed runs: clarify which one is intended before resuming.')
@@ -2162,7 +2259,8 @@ def cmd_runs(args: argparse.Namespace) -> int:
         notes.append('Other directories without RUN-STATE.json and audit.json (other_dirs) are not audit runs.')
     print_json({'results_dir': str(results), 'exists': results.is_dir(), 'package_prompt_version': PROMPT_VERSION,
                 'runs': runs, 'latest_open': open_runs[-1] if open_runs else None,
-                'latest_closed': closed_runs[-1] if closed_runs else None, 'other_dirs': other, 'notes': notes})
+                'latest_closed': closed_runs[-1] if closed_runs else None,
+                'latest_resumable': latest_resumable, 'other_dirs': other, 'notes': notes})
     return 0
 
 
@@ -2230,6 +2328,21 @@ def project_path_of(ref: Any) -> str | None:
     return None
 
 
+def utc_stamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', value)
+    try:
+        stamp = datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+    except ValueError:
+        return None
+
+
+def canonical_run_path(value: str) -> str:
+    return posixpath.normpath(value.replace('\\', '/'))
+
+
 def validate_audit(data: Any, run_dir: Path, project: Path | None,
                    final: bool = False) -> tuple[Issues, dict[str, Any]]:
     issues = Issues()
@@ -2244,14 +2357,17 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     if not isinstance(data, dict):
         issues.error('E_TYPE', 'audit.json', 'Top level must be a JSON object.')
         return issues, {}
+    if data.get('schema_version') != SCHEMA_VERSION:
+        issues.error('E_SCHEMA_VERSION', 'schema_version',
+                     f'Expected {SCHEMA_VERSION!r}, found {data.get("schema_version")!r}. '
+                     'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. '
+                     'Never convert a run by changing its schema identifier.')
+        return issues, {}
     run_root = run_dir.resolve()
     evidence_root = run_root / 'evidence'
     for key in TOP_LEVEL_REQUIRED:
         if key not in data:
             issues.error('E_MISSING_FIELD', key, 'Required field missing (use null with a reason for unknown values).')
-    if data.get('schema_version') != SCHEMA_VERSION:
-        issues.error('E_SCHEMA_VERSION', 'schema_version',
-                     f'Expected {SCHEMA_VERSION!r}, found {data.get("schema_version")!r}.')
     if data.get('prompt_version') != PROMPT_VERSION:
         issues.warning('W_PROMPT_VERSION', 'prompt_version',
                        f'Tool is for {PROMPT_VERSION}, found {data.get("prompt_version")!r}.')
@@ -2448,7 +2564,8 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 issues.error('E_CODE_REF_NOT_IN_BASELINE', at, f'{rel} does not belong to the audited project state.')
                 valid = False
                 continue
-            if project_root is None:
+            if project_root is None or baseline_snapshot is None:
+                valid = False
                 continue
             target = project_root / rel
             if not is_within(target, project_root) or not target.is_file():
@@ -2482,6 +2599,14 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
 
     log_exit: dict[str, Any] = {}
     verifiable: set[str] = set()
+    qualifying: set[str] = set()
+    observed: set[str] = set()
+    baseline_time = utc_stamp((baseline_snapshot or {}).get('captured_at_utc'))
+
+    def within_run(value: Any) -> bool:
+        stamp = utc_stamp(value)
+        return stamp is not None and baseline_time is not None and baseline_time <= stamp <= datetime.now(timezone.utc)
+
     for item in registers['evidence']:
         where = f'evidence[{item["id"]}]'
         path_value = item.get('path')
@@ -2490,7 +2615,7 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         else:
             historical = False
         if path_value:
-            target = run_root / str(path_value)
+            target = run_root / canonical_run_path(str(path_value))
             if not is_within(target, evidence_root):
                 issues.error('E_EVIDENCE_PATH', where, 'Evidence files belong under evidence/ in the run directory.')
                 continue
@@ -2519,27 +2644,41 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 if meta.get('log_sha256') != actual:
                     issues.error('E_LOG_META_HASH', where, 'Metadata does not belong to this log file.')
                     continue
-                ended = str(meta.get('ended_at_utc') or meta.get('started_at_utc') or '')
-                started_run = str((baseline_snapshot or {}).get('captured_at_utc') or '')
-                if item.get('freshness') == 'CURRENT' and ended and started_run and ended < started_run:
+                ended = meta.get('ended_at_utc') or meta.get('started_at_utc')
+                ended_stamp = utc_stamp(ended)
+                if item.get('freshness') == 'CURRENT' and ended_stamp and baseline_time and ended_stamp < baseline_time:
                     issues.error('E_EVIDENCE_PREDATES_BASELINE', where,
                                  'Log predates the start baseline of this run; mark as STALE or regenerate.')
                     continue
                 log_exit[item['id']] = meta.get('exit_code')
             verifiable.add(item['id'])
+            current = item.get('freshness') == 'CURRENT' and within_run(item.get('captured_at_utc'))
+            if (item.get('kind') == 'LOG' and current and meta.get('tool') == 'audit_tools.py'
+                    and nonempty(meta.get('command')) and within_run(meta.get('started_at_utc')) and within_run(ended)):
+                qualifying.add(item['id'])
+                observed.add(item['id'])
+            observation = item.get('observation')
+            if (item.get('kind') in UI_EVIDENCE_KINDS and current and isinstance(observation, dict)
+                    and all(isinstance(observation.get(k), str) and observation[k].strip()
+                            for k in ('observer', 'description'))):
+                qualifying.add(item['id'])
+                observed.add(item['id'])
         elif not nonempty(item.get('ref')):
             issues.error('E_EVIDENCE_REF', where, 'Neither path (with sha256) nor ref specified.')
         if 'code_refs' in item and not historical and check_code_refs(where, item.get('code_refs')):
             verifiable.add(item['id'])
+            if item.get('freshness') == 'CURRENT':
+                qualifying.add(item['id'])
         if item.get('kind') == 'STATIC_REF' and not item.get('code_refs'):
             issues.warning('W_STATIC_REF_UNVERIFIED', where, 'Static evidence without verifiable code_refs.')
 
+    verified_finding_refs: set[str] = set()
     for finding in registers['findings']:
         where = f'findings[{finding["id"]}]'
         if finding.get('state') in ('VERIFIED_FIXED', 'SUPERSEDED'):
             continue  # historical citations refer to an earlier state
         if check_code_refs(where, finding.get('code_refs')):
-            finding['_verified_refs'] = True
+            verified_finding_refs.add(finding['id'])
 
     for kind, entries in (('findings', registers['findings']), ('tasks', registers['tasks'])):
         for entry in entries:
@@ -2635,6 +2774,8 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     for requirement in registers['requirements']:
         where = f'requirements[{requirement["id"]}]'
         binding = requirement.get('binding')
+        if binding in ('BINDING', 'CLAIMED', 'DERIVED') and not id_list(requirement.get('source_ids')):
+            issues.error('E_UNSOURCED_REQUIREMENT', where, 'BINDING/CLAIMED/DERIVED requires source_ids.')
         if binding in ('BINDING', 'CLAIMED') and not id_list(requirement.get('check_ids')) and not nonempty(
                 requirement.get('gap')):
             issues.error('E_REQ_TRACE', where, 'Binding requirement without a check and without a named gap.')
@@ -2646,11 +2787,16 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     critical_objectives = {o['id'] for o in registers['objectives'] if o.get('critical') is not False}
     for objective in registers['objectives']:
         where = f'objectives[{objective["id"]}]'
+        if not id_list(objective.get('source_ids')):
+            issues.error('E_UNSOURCED_OBJECTIVE', where, 'An objective requires source_ids.')
         if objective.get('critical') is False and not id_list(objective.get('source_ids')):
             issues.error('E_UNSOURCED_NONCRITICAL', where, 'critical: false requires a supporting source.')
         if objective.get('fulfillment') == 'DEMONSTRATED' and not any(
                 claims.get(cid, {}).get('assessment') == 'SUPPORTED' for cid in id_list(objective.get('claim_ids'))):
             issues.error('E_OBJECTIVE_SUPPORT', where, 'DEMONSTRATED requires at least one SUPPORTED claim.')
+    for invariant in registers['invariants']:
+        if not id_list(invariant.get('source_ids')):
+            issues.error('E_UNSOURCED_INVARIANT', f'invariants[{invariant["id"]}]', 'An invariant requires source_ids.')
     for journey in registers['journeys']:
         where = f'journeys[{journey["id"]}]'
         check_ids = id_list(journey.get('check_ids'))
@@ -2671,6 +2817,9 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     run_type = data.get('run_type')
     for finding in registers['findings']:
         where = f'findings[{finding["id"]}]'
+        category = finding.get('category')
+        if not isinstance(category, str) or category not in FINDING_CATEGORY:
+            issues.error('E_FINDING_CATEGORY', f'{where}.category', 'Required category: domain A-S except H, or SECURITY. Use SECURITY for every P8 finding and the early secret-in-product finding.')
         assessment, state = finding.get('assessment'), finding.get('state')
         evidence_ids = id_list(finding.get('evidence_ids'))
         if assessment == 'CONFIRMED':
@@ -2679,10 +2828,56 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                     issues.error('E_FINDING_FIELDS', f'{where}.{field}', 'Required for CONFIRMED.')
             if finding.get('confidence') == 'LOW':
                 issues.error('E_FINDING_CONFIDENCE', where, 'CONFIRMED with confidence LOW is contradictory.')
-            if not finding.get('_verified_refs') and not any(eid in verifiable for eid in evidence_ids) and state not in (
+            if finding['id'] not in verified_finding_refs and not any(eid in qualifying for eid in evidence_ids) and state not in (
                     'VERIFIED_FIXED', 'SUPERSEDED'):
-                issues.error('E_FINDING_EVIDENCE', where, 'CONFIRMED requires verifiable evidence (code_refs, file with '
-                             'hash or run log).')
+                issues.error('E_FINDING_EVIDENCE', where, 'CONFIRMED requires current baseline-bound code_refs, '
+                             'a run-backed log, or a stored UI observation with recorded origin and capture time.')
+            if (finding.get('release_blocker') is True or finding.get('severity') == 'CRITICAL') and finding.get('confidence') != 'HIGH':
+                issues.error('E_BLOCKER_CONFIDENCE', where, 'CRITICAL and release blockers require HIGH confidence.')
+            control = finding.get('release_control')
+            control_valid = False
+            if isinstance(control, dict):
+                check_refs(f'{where}.release_control', control)
+                linked = any(gid in by_id['release_gates'] for gid in id_list(control.get('gate_ids'))) or any(
+                    by_id['requirements'].get(rid, {}).get('source_ids') for rid in id_list(control.get('requirement_ids')))
+                control_valid = (linked and isinstance(control.get('malfunction'), str) and bool(control['malfunction'].strip())
+                                 and any(eid in qualifying for eid in id_list(control.get('evidence_ids'))))
+            if finding.get('release_blocker') is True and (finding.get('type') in ('MISSING_EVIDENCE', 'CLEANUP')
+                    or finding.get('type') == 'TEST_QUALITY' and not control_valid):
+                issues.error('E_GAP_AS_BLOCKER', where, 'Coverage gaps and cleanup cannot be blockers; TEST_QUALITY '
+                             'requires a linked release control with an evidenced malfunction.')
+            if state in ('OPEN', 'CANDIDATE_FIXED'):
+                target = finding.get('target')
+                target_valid = False
+                if isinstance(target, dict):
+                    check_refs(f'{where}.target', target)
+                    target_fields = ('requirement_ids', 'objective_ids', 'invariant_ids', 'doc_claim_ids')
+                    refs = [(REF_TARGETS[field], ref) for field in target_fields for ref in id_list(target.get(field))]
+                    sourced = bool(refs) and all(by_id[reg].get(ref, {}).get('source_ids') for reg, ref in refs)
+                    necessity = target.get('necessity')
+                    necessary = isinstance(necessity, dict) and all(
+                        isinstance(necessity.get(k), str) and necessity[k].strip() for k in ('actor', 'reachable_path', 'harm'))
+                    target_valid = (sourced or necessary) and all(
+                        by_id[reg].get(ref, {}).get('source_ids') for reg, ref in refs)
+                if finding.get('type') in ('DEFECT', 'MISSING_IMPLEMENTATION', 'UNMET_PROMISE', 'FALSE_CLAIM', 'OPERABILITY_GAP') and not target_valid:
+                    soft('E_FINDING_TARGET', where, 'An active confirmed finding needs a sourced target or necessity '
+                         '{actor, reachable_path, harm}.')
+                if finding.get('severity') in ('CRITICAL', 'HIGH') or finding.get('release_blocker') is True:
+                    review = finding.get('review')
+                    review_valid = isinstance(review, dict) and all(
+                        isinstance(review.get(k), str) and review[k].strip() for k in ('reviewer', 'method', 'outcome'))
+                    if isinstance(review, dict):
+                        check_refs(f'{where}.review', review)
+                        review_valid = (review_valid and review.get('method') in REVIEW_METHOD
+                                        and review.get('outcome') in REVIEW_OUTCOME)
+                        if review.get('outcome') == 'UNAVAILABLE':
+                            review_valid = (review_valid and isinstance(review.get('reason'), str)
+                                            and bool(review['reason'].strip()) and review.get('method') == 'COMMENT_ONLY')
+                        if review.get('outcome') == 'DISPUTED':
+                            review_valid = review_valid and any(eid in qualifying for eid in id_list(review.get('countercheck_evidence_ids')))
+                    if not review_valid:
+                        soft('E_FINDING_REVIEW', where, 'Record reviewer, method and outcome; UNAVAILABLE needs a reason '
+                             'and COMMENT_ONLY; DISPUTED while CONFIRMED needs qualifying countercheck_evidence_ids.')
             if state == 'OPEN' and not id_list(finding.get('task_ids')):
                 soft('E_FINDING_TASK', where, 'Open confirmed finding without a package.')
             if (finding.get('severity') == 'CRITICAL' and finding.get('release_blocker') is False
@@ -2733,6 +2928,84 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             soft('E_REQUIRED_MISSING', where, 'None of the checks of this gate is mandatory for release.')
 
     audit_status, release_status = data.get('audit_status'), data.get('release_status')
+    security = data.get('security_review')
+    security_valid = isinstance(security, dict)
+    security = security if security_valid else {}
+    security_status = security.get('status')
+    required_security = ('status', 'reason', 'started_at_utc', 'completed_at_utc', 'executed_by')
+    security_valid = (security_valid and all(k in security for k in required_security)
+                      and isinstance(security_status, str) and security_status in SECURITY_STATUS
+                      and isinstance(security.get('reason'), str))
+    started, completed = utc_stamp(security.get('started_at_utc')), utc_stamp(security.get('completed_at_utc'))
+    start_pair = ((security.get('started_at_utc') is None and security.get('executed_by') is None)
+                  or (within_run(security.get('started_at_utc')) and isinstance(security.get('executed_by'), str)
+                      and bool(security['executed_by'].strip())))
+    if security_status == 'PENDING':
+        security_valid = security_valid and start_pair and security.get('completed_at_utc') is None
+    elif security_status in ('IN_PROGRESS', 'DONE', 'BLOCKED'):
+        security_valid = (security_valid and within_run(security.get('started_at_utc'))
+                          and isinstance(security.get('executed_by'), str) and bool(security['executed_by'].strip()))
+        if security_status == 'DONE':
+            security_valid = (security_valid and within_run(security.get('completed_at_utc'))
+                              and started is not None and completed is not None and started <= completed)
+        else:
+            security_valid = security_valid and security.get('completed_at_utc') is None
+        if security_status == 'BLOCKED':
+            security_valid = security_valid and bool(security.get('reason'))
+    elif security_status == 'NOT_APPLICABLE':
+        security_valid = (security_valid and security.get('started_at_utc') is None and security.get('executed_by') is None
+                          and within_run(security.get('completed_at_utc')))
+    elif security_status == 'NOT_PERFORMED':
+        security_valid = (security_valid and start_pair and within_run(security.get('completed_at_utc'))
+                          and (started is None or completed is not None and started <= completed))
+    if not security_valid:
+        issues.error('E_SECURITY_REVIEW', 'security_review', 'Required security review object/status/fields or status-dependent timestamps are invalid.')
+    scope_valid = isinstance(data.get('security_scope'), list)
+    for area in registers['security_scope']:
+        ids = id_list(area.get('check_ids'))
+        valid = (all(isinstance(area.get(k), str) and area[k].strip() for k in ('ref', 'reason'))
+                 and isinstance(area.get('relevance'), str) and area['relevance'] in SECURITY_RELEVANCE)
+        valid = valid and bool(ids) and all(checks.get(cid, {}).get('required_for_audit') is True
+                                             and checks.get(cid, {}).get('required_for_release') is True for cid in ids)
+        scope_valid = scope_valid and valid
+    if isinstance(data.get('security_scope'), list):
+        scope_valid = scope_valid and len(registers['security_scope']) == len(data['security_scope'])
+    if not scope_valid:
+        issues.error('E_SECURITY_SCOPE', 'security_scope', 'Required list: each area needs ref, reason, relevance and existing checks mandatory for audit and release.')
+    if security_status == 'DONE':
+        security_checks = {cid for area in registers['security_scope'] for cid in id_list(area.get('check_ids'))}
+        security_checks.update(cid for row in matrix_rows if row.get('domain') == 'H'
+                               for cid in id_list(row.get('check_ids')) if checks.get(cid, {}).get('required_for_audit') is True
+                               or checks.get(cid, {}).get('required_for_release') is True)
+        security_checks.update(c['id'] for c in registers['checks'] if c.get('security') is True
+                               and (c.get('required_for_audit') is True or c.get('required_for_release') is True))
+        done_checks = scope_valid and all(checks.get(cid, {}).get('execution') in ('PASS', 'FAIL') and any(
+            eid in qualifying for eid in id_list(checks.get(cid, {}).get('evidence_ids'))) for cid in security_checks)
+        if not done_checks:
+            issues.error('E_SECURITY_DONE_CHECKS', 'security_review', 'DONE requires all mandatory security checks resolved with current qualifying evidence.')
+        security_valid = security_valid and done_checks
+    if security_status == 'NOT_APPLICABLE':
+        na_valid = (isinstance(security.get('reason'), str) and bool(security['reason'].strip()) and data.get('security_scope') == []
+                    and any(row.get('domain') == 'H' and row.get('applicability') == 'NOT_APPLICABLE'
+                            and nonempty(row.get('reason')) and not id_list(row.get('check_ids')) for row in matrix_rows))
+        if not na_valid:
+            issues.error('E_SECURITY_NA_REASON', 'security_review', 'NOT_APPLICABLE needs a project reason, empty scope and consistent domain H assessment.')
+        security_valid = security_valid and na_valid
+    if security_status == 'NOT_PERFORMED':
+        check_refs('security_review', security)
+        decision = id_list(security.get('decision_source_ids'))
+        decision_tasks = id_list(security.get('task_ids'))
+        if not (nonempty(security.get('reason')) and decision and all(
+                isinstance(by_id['sources'].get(sid, {}).get('ref'), str)
+                and by_id['sources'][sid]['ref'].startswith('user:') for sid in decision)
+                and any(tasks.get(tid, {}).get('type') in ('HUMAN', 'VERIFY') for tid in decision_tasks)
+                and audit_status == 'PARTIAL'):
+            issues.error('E_SECURITY_NOT_PERFORMED', 'security_review', 'NOT_PERFORMED needs a user-decision source, a HUMAN/VERIFY task reference and PARTIAL audit status.')
+    security_complete = security_valid and scope_valid and security_status in ('DONE', 'NOT_APPLICABLE')
+    if release_status == 'GO_FOR_DEFINED_SCOPE' and not security_complete:
+        issues.error('E_GO_SECURITY_PENDING', 'release_status', 'GO requires a valid DONE or NOT_APPLICABLE security review.')
+    if audit_status == 'COMPLETE_FOR_DEFINED_SCOPE' and not security_complete:
+        issues.error('E_COMPLETE_SECURITY_PENDING', 'audit_status', 'COMPLETE requires a valid DONE or NOT_APPLICABLE security review.')
     if 'audit_status' in data:
         check_enum(issues, 'audit_status', audit_status, AUDIT_STATUS, nullable=not final)
     if 'release_status' in data:
@@ -2824,7 +3097,9 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         for journey in registers['journeys']:
             if journey.get('tier') == 'T1' and not any(
                     checks.get(cid, {}).get('execution') in ('PASS', 'FAIL')
-                    and checks.get(cid, {}).get('method') in END_TO_END_METHODS for cid in id_list(journey.get('check_ids'))):
+                    and checks.get(cid, {}).get('method') in END_TO_END_METHODS
+                    and any(eid in observed for eid in id_list(checks.get(cid, {}).get('evidence_ids')))
+                    for cid in id_list(journey.get('check_ids'))):
                 issues.error('E_COMPLETE_T1', f'journeys[{journey["id"]}]',
                              'T1 journey without an executed check close to end-to-end (not only STATIC/UNIT).')
         if vision.get('status') == 'CONFLICTED':
@@ -2833,7 +3108,12 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             issues.warning('W_COMPLETE_UNCONFIRMED', 'findings', 'Justify open unconfirmed findings with COMPLETE.')
 
     if run_root.is_dir():
-        for path in sorted(run_root.rglob('*')):
+        live_paths = []
+        for parent, directories, names in os.walk(run_root):
+            if Path(parent) == run_root:
+                directories[:] = [name for name in directories if name != 'checkpoints']
+            live_paths.extend(Path(parent) / name for name in names)
+        for path in sorted(live_paths):
             if not path.is_file():
                 continue
             name, suffix = path.name.lower(), path.suffix.lower()
@@ -2878,6 +3158,8 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         for needle in ('Executive summary', str(audit_status), str(release_status)):
             if report is not None and needle not in report:
                 issues.error('E_FINAL_CONTENT', 'REPORT.md', f'Does not contain {needle!r} (executive summary with verdict).')
+        if report is not None and not re.search(r'^#{1,6}\s+(?:\d+(?:\.\d+)*\.?\s+)?Security review\b[^\n]*$', report, flags=re.MULTILINE | re.IGNORECASE):
+            issues.error('E_FINAL_CONTENT', 'REPORT.md', 'Security review section heading missing.')
         vision_text = text_of('VISION.md')
         if vision_text is not None and str(vision.get('status')) not in vision_text:
             issues.error('E_FINAL_CONTENT', 'VISION.md', 'Vision status missing.')
@@ -2909,6 +3191,11 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 issues.error('E_RUN_STATE', 'RUN-STATE.json', f'Fields missing: {", ".join(missing)}')
             elif run_state.get('run_id') != data.get('run_id'):
                 issues.warning('W_RUN_ID', 'RUN-STATE.json', 'run_id differs from audit.json.')
+            if (isinstance(run_state, dict) and run_state.get('closed_at_utc')
+                    and not security_closure_allowed(data, run_state, run_root)):
+                issues.error('E_RUN_SECURITY_CLOSURE', 'RUN-STATE.json',
+                             'Closed run requires DONE, NOT_APPLICABLE, NOT_PERFORMED or BLOCKED security review, '
+                             'or a supported superseding run linked through previous_run_ids.')
             if final and isinstance(run_state, dict):
                 authorization = run_state.get('authorization')
                 if not isinstance(authorization, list) or not all(isinstance(item, str) and item.strip()
@@ -2918,16 +3205,18 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                                  'list (master prompt §16).')
                 if not nonempty(run_state.get('closed_at_utc')):
                     issues.warning('W_RUN_NOT_CLOSED', 'RUN-STATE.json', 'closed_at_utc missing; the final check '
-                                   'runs before closure in P7 (master prompt §16). Then record the timestamp.')
+                                   'runs before closure (master prompt §16); P7 remains open. Record closure only at P9 or a valid supersession.')
 
-    for finding in registers['findings']:
-        finding.pop('_verified_refs', None)
     confirmed = [f for f in registers['findings'] if f.get('assessment') == 'CONFIRMED']
     counts: dict[str, Any] = {
         'audit_status': audit_status, 'release_status': release_status, 'open_release_blockers': open_blockers,
+        'security_review': {'status': security_status},
         'findings': {'total': len(registers['findings']), 'assessment': tally(registers['findings'], 'assessment'),
                      'state': tally(registers['findings'], 'state'), 'type': tally(registers['findings'], 'type'),
-                     'severity_confirmed': tally(confirmed, 'severity')},
+                     'severity_confirmed': tally(confirmed, 'severity'),
+                     'confirmed_open': tally([f for f in confirmed if f.get('state') in ('OPEN', 'CANDIDATE_FIXED')], 'severity'),
+                     'unconfirmed_open': sum(f.get('assessment') == 'UNCONFIRMED' and f.get('state') == 'OPEN'
+                                             for f in registers['findings'])},
         'checks': {'total': len(registers['checks']), 'execution': tally(registers['checks'], 'execution'),
                    'purpose': tally(registers['checks'], 'purpose'), 'method': tally(registers['checks'], 'method'),
                    'required_for_audit': tally(registers['checks'], 'required_for_audit'),
@@ -2950,6 +3239,223 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     if registers['doc_claims']:
         counts['doc_claims'] = tally(registers['doc_claims'], 'verdict')
     return issues, counts
+
+
+def markdown_links(text: str) -> list[str]:
+    """Artifact links in Markdown prose; code examples are not references."""
+    prose = []
+    fence: str | None = None
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
+        if fence is not None:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = None
+        elif marker:
+            fence = marker[1]
+        else:
+            prose.append(line)
+    text = re.sub(r'(?<!`)(`+)(?!`)(.*?)\1(?!`)', '', ''.join(prose), flags=re.DOTALL)
+    return re.findall(r'!?\[[^\]]*\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)', text)
+
+
+def checkpoint_files(run: Path, data: dict[str, Any]) -> tuple[set[str], list[dict[str, str]], set[str]]:
+    """Stored current-run files plus an explicit inventory of uncopied references."""
+    found = {'audit.json', 'REPORT.md', 'RUN-STATE.json', 'VISION.md', 'RESUME.md',
+             'evidence/baseline/baseline-start.json'}
+    omitted: set[tuple[str, str, str]] = set()
+    directories: set[str] = set()
+
+    def list_or_empty(value: Any) -> list[Any]:
+        return value if isinstance(value, list) else []
+
+    def omit(value: str, source: str, reason: str) -> None:
+        omitted.add((source, value, reason))
+
+    def add(value: str, source: str = 'audit.json', *, markdown: bool = False) -> None:
+        reference = value
+        value = value.strip('<>')
+        if not value or value.startswith('#'):
+            return
+        value = value.split('#', 1)[0].split('?', 1)[0]
+        value = canonical_run_path(unquote(value) if markdown else value)
+        if Path(value).is_absolute() or re.match(r'^(?:[A-Za-z]:[\\/]|[\\/]{2})', value):
+            omit(reference, source, 'absolute path')
+            return
+        if re.match(r'[A-Za-z][A-Za-z0-9+.-]*:', value):
+            omit(reference, source, 'URL or external scheme')
+            return
+        target = run / (Path(source).parent if markdown else Path('.')) / value
+        if not is_within(target, run):
+            omit(reference, source, 'outside current run')
+            return
+        if is_within(target, run / 'checkpoints'):
+            omit(reference, source, 'checkpoint artifact')
+            return
+        if target.is_dir():
+            directories.add(target.resolve().relative_to(run.resolve()).as_posix())
+            omit(reference, source, 'directory')
+            return
+        if not target.is_file():
+            raise ToolError(f'Checkpoint artifact missing inside current run: {reference}')
+        found.add(target.resolve().relative_to(run.resolve()).as_posix())
+
+    for register, field in (('evidence', 'path'), ('findings', 'file'), ('tasks', 'file')):
+        for record in list_or_empty(data.get(register)):
+            if isinstance(record, dict) and isinstance(record.get(field), str):
+                add(record[field])
+    baseline = data.get('baseline')
+    if isinstance(baseline, dict) and isinstance(baseline.get('file'), str):
+        add(baseline['file'])
+    for register, field in (('sources', 'ref'), ('components', 'ref'), ('evidence', 'ref'),
+                            ('security_scope', 'ref'), ('test_assessments', 'ref'), ('doc_claims', 'source')):
+        for record in list_or_empty(data.get(register)):
+            item = record.get(field) if isinstance(record, dict) else None
+            if not isinstance(item, str):
+                continue
+            reference = unquote(item.split('#', 1)[0].split('?', 1)[0])
+            if reference.startswith('run:'):
+                path = canonical_run_path(reference[4:])
+                first, sep, rest = path.partition('/')
+                if sep and first == data.get('run_id'):
+                    add(rest)
+                elif sep and (first in id_list(data.get('previous_run_ids')) or re.match(r'^\d{4}-\d{2}-\d{2}T', first)):
+                    omit(item, 'audit.json', 'previous-run reference')
+                else:
+                    add(path)
+            else:
+                omit(item, 'audit.json', 'project or external reference')
+    for register in ('evidence', 'findings'):
+        for record in list_or_empty(data.get(register)):
+            for ref in list_or_empty(record.get('code_refs')) if isinstance(record, dict) else []:
+                if isinstance(ref, dict) and isinstance(ref.get('path'), str):
+                    omit(ref['path'], 'audit.json', 'project or external reference')
+    scanned: set[str] = set()
+    while found - scanned:
+        rel = sorted(found - scanned)[0]
+        scanned.add(rel)
+        path = run / rel
+        if not path.is_file() or not is_within(path, run):
+            raise ToolError(f'Checkpoint artifact missing: {rel}')
+        if path.suffix == '.md':
+            for link in markdown_links(path.read_text(encoding='utf-8-sig')):
+                add(link, rel, markdown=True)
+        if path.suffix == '.log' and path.with_suffix('.meta.json').is_file():
+            add(path.with_suffix('.meta.json').relative_to(run).as_posix())
+    return found, [{'source': source, 'reference': reference, 'reason': reason}
+                   for source, reference, reason in sorted(omitted)], directories
+
+
+def verify_checkpoint(run: Path) -> dict[str, Any]:
+    directory = run / 'checkpoints' / 'interim'
+    if not directory.exists():
+        return {'state': 'ABSENT'}
+    try:
+        manifest = read_json(directory / 'manifest.json')
+        snapshot = directory / 'files'
+        data = read_json(snapshot / 'audit.json')
+        if not isinstance(manifest, dict) or not isinstance(data, dict):
+            raise ToolError('Checkpoint manifest and audit.json must be objects.')
+        if (manifest.get('format') != 'audit-interim-checkpoint/1'
+                or manifest.get('schema_version') != SCHEMA_VERSION
+                or manifest.get('package') != 'production-readiness-audit'
+                or not all(isinstance(manifest.get(k), str) and manifest[k] for k in ('prompt_version', 'tool_version'))
+                or manifest.get('run_id') != data.get('run_id')
+                or manifest.get('baseline') != data.get('baseline')
+                or manifest.get('validation') != {'result': 'PASS', 'final': True, 'errors': 0}):
+            raise ToolError('Checkpoint identity or validation metadata mismatch.')
+        saved_state = read_json(snapshot / 'RUN-STATE.json')
+        if not isinstance(saved_state, dict) or saved_state.get('run_id') != manifest['run_id']:
+            raise ToolError('Checkpoint RUN-STATE.json run_id mismatch.')
+        for name in ('RUN-STATE.json', 'audit.json'):
+            try:
+                live = read_json(run / name)
+            except (OSError, ValueError):
+                continue  # Recovery must work when a live file was interrupted.
+            if isinstance(live, dict) and live.get('run_id') is not None and live['run_id'] != manifest['run_id']:
+                raise ToolError(f'Checkpoint does not belong to this run: {name} run_id mismatch.')
+        hashes = manifest.get('sha256')
+        actual_files = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob('*') if p.is_file()}
+        not_snapshotted = manifest.get('not_snapshotted', [])
+        if not isinstance(not_snapshotted, list) or not all(isinstance(item, dict) for item in not_snapshotted):
+            raise ToolError('Checkpoint not_snapshotted inventory malformed.')
+        expected, omitted, directories = checkpoint_files(snapshot, data)
+        if not isinstance(hashes, dict) or set(hashes) != actual_files or set(hashes) != expected:
+            raise ToolError('Checkpoint artifact inventory mismatch.')
+        if 'not_snapshotted' in manifest and not_snapshotted != omitted:
+            raise ToolError('Checkpoint not_snapshotted inventory mismatch.')
+        expected_entries = {'manifest.json'} | {(Path('files') / rel).as_posix() for rel in expected | directories}
+        expected_entries |= {parent.as_posix() for rel in expected_entries for parent in Path(rel).parents if parent != Path('.')}
+        expected_entries = {'interim'} | {'interim/' + rel for rel in expected_entries}
+        actual_entries = set()
+        for parent, dirs, files in os.walk(directory.parent):
+            if Path(parent) == directory.parent:
+                dirs[:] = [name for name in dirs if not name.startswith('.interim-')]
+            actual_entries.update((Path(parent) / name).relative_to(directory.parent).as_posix() for name in dirs + files)
+        if actual_entries != expected_entries:
+            raise ToolError('Checkpoint directory inventory mismatch.')
+        for rel, digest in hashes.items():
+            path = snapshot / rel
+            if not is_within(path, snapshot) or sha256_file(path) != digest:
+                raise ToolError(f'Checkpoint hash mismatch: {rel}')
+        return {'state': 'VALID', 'directory': str(directory), 'run_id': manifest['run_id'], 'files': len(hashes)}
+    except (OSError, ValueError, TypeError, ToolError) as exc:
+        return {'state': 'INVALID', 'directory': str(directory), 'error': str(exc)}
+
+
+def create_checkpoint(run: Path, project: Path | None) -> dict[str, Any]:
+    leftovers = sorted(path for path in (run / 'checkpoints').glob('.interim-*') if path.is_dir())
+    if leftovers:
+        raise ToolError('Remove leftover checkpoint staging directories before creating a checkpoint: '
+                        + ', '.join(str(path) for path in leftovers))
+    data = read_json(run / 'audit.json')
+    if not isinstance(data, dict) or not isinstance(data.get('security_review'), dict):
+        raise ToolError('Checkpoint requires an audit object with security_review.')
+    if data['security_review'].get('status') != 'PENDING' or data.get('audit_status') != 'PARTIAL':
+        raise ToolError('Interim checkpoint requires PARTIAL with security review PENDING.')
+    destination = run / 'checkpoints' / 'interim'
+    if destination.exists():
+        raise ToolError('Interim checkpoint already exists; never overwrite it.')
+    files, not_snapshotted, directories = checkpoint_files(run, data)
+    hashes = {rel: sha256_file(run / rel) for rel in sorted(files)}
+    manifest = {'format': 'audit-interim-checkpoint/1', 'package': 'production-readiness-audit',
+                'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'tool_version': TOOL_VERSION,
+                'run_id': data['run_id'], 'baseline': data['baseline'],
+                'validation': {'result': 'PASS', 'final': True, 'errors': 0}, 'sha256': hashes,
+                'not_snapshotted': not_snapshotted}
+    staging = destination.with_name('.interim-' + os.urandom(8).hex())
+    staging.mkdir(parents=True)
+    try:
+        for rel in sorted(directories):
+            (staging / 'files' / rel).mkdir(parents=True, exist_ok=True)
+        for rel in sorted(files):
+            target = staging / 'files' / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(run / rel, target)
+            if sha256_file(target) != hashes[rel] or sha256_file(run / rel) != hashes[rel]:
+                raise ToolError('Live state changed during checkpoint creation.')
+        saved = read_json(staging / 'files/audit.json')
+        if saved != data:
+            raise ToolError('Live audit.json changed during checkpoint creation.')
+        issues, _ = validate_audit(saved, staging / 'files', project, final=True)
+        if issues.errors:
+            raise ToolError('Checkpoint requires validate --final PASS: ' + ', '.join(sorted(issues.codes())))
+        write_json_new(staging / 'manifest.json', manifest)
+        staging.rename(destination)
+    finally:
+        if staging.exists():
+            remove_tree(staging)
+    return verify_checkpoint(run)
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    run = Path(args.run_dir).resolve()
+    try:
+        result = (create_checkpoint(run, Path(args.project) if args.project else None)
+                  if args.action == 'create' else verify_checkpoint(run))
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise ToolError(f'Checkpoint input unreadable: {exc}') from exc
+    print_json(result)
+    return 0 if result['state'] == 'VALID' else 1
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -3008,6 +3514,9 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
         else:
             domains.append({'domain': domain, 'applicability': 'NOT_APPLICABLE',
                             'reason': 'Not present in the fictional mini-project (example).', 'check_ids': []})
+    for row in domains:
+        if row['domain'] == 'H':
+            row.update(applicability='APPLICABLE', reason='Local note input.', check_ids=['CHK-001'])
     return {
         '_note': 'Example structure with fictional contents - use only as a format template.',
         'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION,
@@ -3032,12 +3541,18 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
         'journeys': [{'id': 'J-001', 'name': 'Create a note and read it after a restart', 'tier': 'T1',
                       'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-002'], 'status': 'VIOLATED', 'gap': None}],
         'domain_matrix': domains,
+        'security_review': {'status': 'DONE', 'reason': 'Defined local scope reviewed.',
+                            'started_at_utc': '2026-01-01T00:00:00Z',
+                            'completed_at_utc': '2026-01-01T00:06:00Z', 'executed_by': 'Synthetic reviewer'},
+        'security_scope': [{'id': 'SEC-001', 'ref': 'src/store.py', 'component_ids': ['CMP-001'],
+                            'journey_ids': ['J-001'], 'relevance': 'EXTERNAL_INPUT',
+                            'reason': 'The note store receives user-supplied text.', 'check_ids': ['CHK-001']}],
         'claims': [{'id': 'CLM-001', 'statement': 'A saved note is readable after a restart.',
                     'basis': 'OBSERVED', 'assessment': 'VIOLATED', 'evidence_ids': ['EV-001'],
                     'counter_evidence_ids': []}],
         'checks': [
             {'id': 'CHK-001', 'title': 'Hypothesis: NoteStore stores in memory only (static)',
-             'purpose': 'INVESTIGATION', 'method': 'STATIC', 'required_for_audit': True, 'required_for_release': False,
+             'purpose': 'INVESTIGATION', 'method': 'STATIC', 'required_for_audit': True, 'required_for_release': True,
              'required_reason': 'Cause investigation for REQ-001', 'execution': 'PASS', 'exit_code': None,
              'claim_ids': [], 'evidence_ids': ['EV-002'], 'catch_up_plan': None},
             {'id': 'CHK-002', 'title': 'Save a note, restart the process, read the note',
@@ -3055,9 +3570,11 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
                             'excerpt': 'def save(self, note_id, text):\n        self._notes[note_id] = text'}]},
         ],
         'findings': [{
-            'id': 'F-001', 'title': 'Notes are held in memory only', 'type': 'DEFECT',
+            'id': 'F-001', 'title': 'Notes are held in memory only', 'type': 'DEFECT', 'category': 'F',
             'assessment': 'CONFIRMED', 'state': 'OPEN', 'severity': 'HIGH', 'priority': 'P1', 'confidence': 'HIGH',
             'release_blocker': True, 'cause_status': 'CONFIRMED', 'claim_ids': ['CLM-001'],
+            'target': {'requirement_ids': ['REQ-001']},
+            'review': {'reviewer': 'Synthetic independent reviewer', 'method': 'READ_CODE', 'outcome': 'UPHELD'},
             'evidence_ids': ['EV-001', 'EV-002'],
             'code_refs': [{'path': 'src/store.py', 'line_start': 6, 'line_end': 6,
                            'excerpt': 'self._notes[note_id] = text  # in memory only'}],
@@ -3073,7 +3590,7 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
         'test_assessments': [{'id': 'TA-001', 'ref': 'tests/test_store.py', 'class': 'WEAK',
                               'reason': 'Checks only the return value, not persistence.',
                               'objective_ids': ['OBJ-001']}],
-        'doc_claims': [{'id': 'DC-001', 'source': 'README.md', 'statement': 'Notes survive a restart.',
+        'doc_claims': [{'id': 'DC-001', 'source': 'README.md', 'source_ids': ['SRC-001'], 'statement': 'Notes survive a restart.',
                         'verdict': 'FALSE', 'reason': 'Disproven by CHK-002, see F-001.'}],
         'audit_status': 'PARTIAL', 'release_status': 'NO_GO',
         'residual_risks': ['The example models only one journey.'],
@@ -3105,6 +3622,17 @@ def example_go_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
     return data
 
 
+def example_interim_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
+    data = example_go_audit(fingerprint)
+    data['security_review'].update(status='PENDING', reason='Deferred review is next.', started_at_utc=None,
+                                    completed_at_utc=None, executed_by=None)
+    data['checks'][0].update(execution='NOT_RUN', evidence_ids=[], catch_up_plan='P8 security review')
+    data['release_gates'][0]['status'] = 'NOT_DEMONSTRATED'
+    data['audit_status'], data['release_status'] = 'PARTIAL', 'NOT_DEMONSTRATED'
+    data['next_actions'] = ['Verify the interim checkpoint, then continue P8 and P9.']
+    return data
+
+
 def write_text_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8', newline='\n') as handle:  # Path.write_text(newline=) needs 3.10
@@ -3118,24 +3646,34 @@ def write_example_run(root: Path, variant: str) -> tuple[Path, Path, dict[str, A
     write_text_file(project / 'src' / 'store.py', EXAMPLE_SOURCE)
     write_text_file(project / 'tests' / 'test_store.py', EXAMPLE_TEST)
     snap, _ = take_snapshot(project, mode='filesystem', with_side_effects=False)
+    stamp = snap['captured_at_utc']
     write_json_new(run_dir / 'evidence' / 'baseline' / 'baseline-start.json', snap)
     for stem, text, code in (('CHK-002', EXAMPLE_FAIL_LOG, 1), ('CHK-002-2', EXAMPLE_PASS_LOG, 0)):
         write_text_file(run_dir / 'evidence' / 'logs' / f'{stem}.log', text)
         write_json_new(run_dir / 'evidence' / 'logs' / f'{stem}.meta.json',
-                       {'id': 'CHK-002', 'exit_code': code, 'log_sha256': sha256_bytes(text.encode('utf-8'))})
-    data = example_audit(snap['content_fingerprint']) if variant == 'nogo' else example_go_audit(
-        snap['content_fingerprint'])
-    write_text_file(run_dir / 'findings' / 'F-001-notes-not-persistent.md', '# F-001\n')
+                       {'id': 'CHK-002', 'tool': 'audit_tools.py', 'command': ['synthetic-test'],
+                        'started_at_utc': stamp, 'ended_at_utc': stamp,
+                        'exit_code': code, 'log_sha256': sha256_bytes(text.encode('utf-8'))})
+    data = {'nogo': example_audit, 'go': example_go_audit, 'interim': example_interim_audit}[variant](snap['content_fingerprint'])
+    data['baseline']['captured_at_utc'] = stamp
+    for item in data['evidence']:
+        if item['captured_at_utc'] is not None:
+            item['captured_at_utc'] = stamp
+    if variant != 'interim':
+        data['security_review'].update(started_at_utc=stamp, completed_at_utc=stamp)
+    write_text_file(run_dir / 'findings' / 'F-001-notes-not-persistent.md', '# F-001\n\nCategory: F\n')
     write_text_file(run_dir / 'tasks' / 'T-001-persistence.md', TASK_TEXT.format(id='T-001'))
     write_text_file(run_dir / 'tasks' / 'T-002-verification.md', TASK_TEXT.format(id='T-002'))
     write_text_file(run_dir / 'REPORT.md', f'# Report\n\n## Executive summary\n\n{data["audit_status"]}, '
-                                           f'{data["release_status"]}\n')
+                                           f'{data["release_status"]}\n\n## Security review\n{data["security_review"]["status"]}\n')
     write_text_file(run_dir / 'VISION.md', '# Vision\n\nStatus: EVIDENCED\n')
     write_text_file(run_dir / 'RESUME.md', '# Resume\n')
-    write_text_file(run_dir / 'RUN-STATE.json', json.dumps({'run_id': data['run_id'], 'phase': 'P7',
+    write_text_file(run_dir / 'RUN-STATE.json', json.dumps({'run_id': data['run_id'], 'schema_version': SCHEMA_VERSION,
+                                                            'prompt_version': PROMPT_VERSION, 'phase': 'P7',
                                                             'updated_at_utc': '2026-01-01T01:00:00Z',
                                                             'authorization': ['Synthetic start request: execute the audit.'],
                                                             'next_steps': []}))
+    write_json_new(run_dir / 'audit.json', data)
     return run_dir, project, data
 
 
@@ -3185,7 +3723,7 @@ FAKE_PEM_BODY = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC' + 'BKcwggSjAgEAAoIBAQ'  # gen
 
 def open_critical_suspicion(data: dict[str, Any], run: Path, project: Path) -> None:
     data['findings'].append({
-        'id': 'F-002', 'title': "Suspicion: other users' notes readable", 'type': 'DEFECT', 'assessment': 'UNCONFIRMED',
+        'id': 'F-002', 'title': "Suspicion: other users' notes readable", 'type': 'DEFECT', 'category': 'SECURITY', 'assessment': 'UNCONFIRMED',
         'state': 'OPEN', 'severity': 'CRITICAL', 'priority': 'P0', 'confidence': 'LOW', 'release_blocker': None,
         'cause_status': 'UNKNOWN', 'claim_ids': [], 'evidence_ids': [], 'code_refs': [], 'task_ids': ['T-003'],
         'file': None})
@@ -3200,6 +3738,251 @@ def log_from_earlier_run(data: dict[str, Any], run: Path, project: Path) -> None
     meta = read_json(meta_path)
     meta.update(started_at_utc='2020-01-01T00:00:00Z', ended_at_utc='2020-01-01T00:01:00Z')
     meta_path.write_text(json.dumps(meta), encoding='utf-8')
+
+
+def observation_only(kind: str = 'NOTE', *, origin: bool = False, stale: bool = False) -> Mutation:
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        text = 'Observed the saved note after reopening the notes view.\n'
+        write_text_file(run / 'evidence' / 'observation.txt', text)
+        item = {'id': 'EV-OBS', 'kind': kind, 'path': 'evidence/observation.txt',
+                'sha256': sha256_bytes(text.encode()), 'captured_at_utc': utc_now(),
+                'freshness': 'STALE' if stale else 'CURRENT', 'limits': 'One local observation.'}
+        if origin:
+            item['observation'] = {'observer': 'Synthetic reviewer', 'description': text.strip()}
+        data['evidence'].append(item)
+        data['findings'][0].update(evidence_ids=['EV-OBS'], code_refs=[])
+        data['checks'][1].update(method='MANUAL', exit_code=None, evidence_ids=['EV-OBS'])
+    return mutate
+
+
+def valid_security_na(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['security_scope'] = []
+    data['security_review'].update(status='NOT_APPLICABLE', reason='Synthetic fixture has no applicable areas.',
+                                   started_at_utc=None, completed_at_utc=utc_now(), executed_by=None)
+    next(row for row in data['domain_matrix'] if row['domain'] == 'H').update(
+        applicability='NOT_APPLICABLE', reason='No applicable areas in this synthetic variation.', check_ids=[])
+
+
+def valid_not_performed(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['sources'].append({'id': 'SRC-DECISION', 'ref': 'user:StopDecision', 'authority': 'User decision'})
+    data['security_review'].update(status='NOT_PERFORMED', reason='User chose closure without the deferred review.',
+                                   started_at_utc=None, completed_at_utc=utc_now(), executed_by=None,
+                                   decision_source_ids=['SRC-DECISION'], task_ids=['T-002'])
+
+
+def close_review_run(data: dict[str, Any], run: Path, project: Path) -> None:
+    state = read_json(run / 'RUN-STATE.json')
+    state.update(phase='P9', closed_at_utc=utc_now())
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+
+
+def superseded_review_run(data: dict[str, Any], run: Path, project: Path) -> None:
+    close_review_run(data, run, project)
+    successor_id = 'linked-successor'
+    state = read_json(run / 'RUN-STATE.json')
+    state['superseded_by_run'] = successor_id
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    write_json_new(run.parent / successor_id / 'RUN-STATE.json', {
+        'run_id': successor_id, 'schema_version': SCHEMA_VERSION, 'run_type': 'REAUDIT',
+        'previous_run_ids': [data['run_id']]})
+
+
+def initialized_supersession(data: dict[str, Any], run: Path, project: Path, link: str = 'audit') -> None:
+    """Successor metadata from the real init CLI, with an optional persisted backlink."""
+    code, output = run_cli('init', '--project', str(project), '--results-dir', str(run.parent), '--mode', 'filesystem')
+    if code != 0:
+        raise ToolError('Synthetic supersession init failed: ' + output)
+    successor = Path(json.loads(output)['run_dir'])
+    successor_state = read_json(successor / 'RUN-STATE.json')
+    assert successor_state['previous_run_ids'] == []
+    if link == 'audit':
+        write_json_new(successor / 'audit.json', {'run_id': successor.name, 'schema_version': SCHEMA_VERSION,
+                                                'previous_run_ids': [data['run_id']]})
+    elif link == 'state':
+        successor_state['previous_run_ids'] = [data['run_id']]
+        write_text_file(successor / 'RUN-STATE.json', json.dumps(successor_state))
+    state = read_json(run / 'RUN-STATE.json')
+    state.update(closed_at_utc=utc_now(), superseded_by_run=successor.name)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+
+
+def contradict_successor(field: str, value: str, file: str = 'RUN-STATE.json') -> Mutation:
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        successor = run.parent / read_json(run / 'RUN-STATE.json')['superseded_by_run']
+        record = read_json(successor / file)
+        record[field] = value
+        write_text_file(successor / file, json.dumps(record))
+    return mutate
+
+
+def release_control_defect(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['findings'][0].update(type='TEST_QUALITY', release_control={
+        'requirement_ids': ['REQ-001'], 'gate_ids': ['G-001'], 'evidence_ids': ['EV-001'],
+        'malfunction': 'Synthetic delivered release gate certifies the demonstrated broken persistence path.'})
+
+
+def pending_security(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['security_review'].update(status='PENDING', reason='Review stopped; resume required.',
+                                   started_at_utc=None, completed_at_utc=None, executed_by=None)
+
+
+def started_security(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['security_review'].update(started_at_utc=data['baseline']['captured_at_utc'], executed_by='Synthetic reviewer')
+
+
+def optional_security_check(data: dict[str, Any], run: Path, project: Path) -> None:
+    check = copy.deepcopy(EXTRA_REQUIRED_CHECK)
+    check.update(purpose='INVESTIGATION', required_for_audit=False, required_for_release=False, security=True)
+    data['checks'].append(check)
+    next(row for row in data['domain_matrix'] if row['domain'] == 'H')['check_ids'].append(check['id'])
+
+
+def cleanup_without_target(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['findings'][0].update(type='CLEANUP', target=None, release_blocker=False, severity='LOW', priority='P3')
+    data['release_gates'][0]['status'] = 'NOT_DEMONSTRATED'
+    data['release_status'] = 'NOT_DEMONSTRATED'
+    write_text_file(run / 'REPORT.md', '# Executive summary\nPARTIAL NOT_DEMONSTRATED\n## Security review\nDONE\n')
+
+
+def offset_observation(data: dict[str, Any], run: Path, project: Path) -> None:
+    observation_only('UI', origin=True)(data, run, project)
+    data['evidence'][-1]['captured_at_utc'] = utc_now().replace('Z', '+00:00')
+
+
+def offset_log(data: dict[str, Any], run: Path, project: Path) -> None:
+    from datetime import timedelta
+    stamp = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=-2))).isoformat()
+    data['evidence'][0]['captured_at_utc'] = stamp
+    path = run / 'evidence/logs/CHK-002.meta.json'
+    meta = read_json(path)
+    meta.update(started_at_utc=stamp, ended_at_utc=stamp)
+    write_text_file(path, json.dumps(meta))
+    data['findings'][0].update(code_refs=[], evidence_ids=['EV-001'])
+
+
+WORKFLOW_POSITIVE_CONTROLS: list[tuple[str, str, Mutation | None]] = [
+    ('VALID_SUPERSESSION_INIT_AUDIT_LINK', 'interim', initialized_supersession),
+    ('VALID_SUPERSESSION_INIT_STATE_LINK', 'interim',
+        lambda d, r, p: initialized_supersession(d, r, p, 'state')),
+    ('VALID_SUPERSEDED_PENDING_RUN', 'interim', superseded_review_run),
+    ('VALID_SUPERSEDED_IN_PROGRESS_RUN', 'interim', chain(superseded_review_run, started_security,
+        lambda d, r, p: d['security_review'].update(status='IN_PROGRESS'))),
+    ('PENDING_AFTER_STARTED_REVIEW', 'interim', started_security),
+    ('NOT_PERFORMED_AFTER_REFUSAL', 'interim', chain(valid_not_performed, started_security,
+        lambda d, r, p: write_text_file(r / 'RUN-STATE.json', json.dumps({
+            **read_json(r / 'RUN-STATE.json'), 'closed_at_utc': utc_now()})))),
+    ('DONE_WITH_OPTIONAL_DOMAIN_H_CHECK', 'go', optional_security_check),
+    ('SECURITY_HEADING_NUMBERED', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\n## 8. Security review\n')),
+    ('SECURITY_HEADING_SUFFIX_CASE', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\n## security REVIEW (interim)\n')),
+    ('UTC_OFFSET_OBSERVATION', 'nogo', offset_observation),
+    ('UTC_COMPACT_OFFSET_OBSERVATION', 'nogo', chain(offset_observation,
+        lambda d, r, p: d['evidence'][-1].update(captured_at_utc=utc_now().replace('Z', '+0000')))),
+    ('UTC_NONZERO_OFFSET_LOG', 'nogo', offset_log),
+    ('EVIDENCE_DOT_PATH', 'nogo', set_fields('evidence', 'EV-001', path='./evidence/logs/CHK-002.log')),
+    ('EVIDENCE_BACKSLASH_PATH', 'nogo', set_fields('evidence', 'EV-001', path='evidence\\logs\\CHK-002.log')),
+    ('LOW_CLEANUP_WITHOUT_TARGET', 'nogo', cleanup_without_target),
+]
+
+WORKFLOW_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('CLOSED_SECURITY_INIT_UNLINKED_SUCCESSOR', 'interim',
+        lambda d, r, p: initialized_supersession(d, r, p, 'none'), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_SUCCESSOR_STATE_ID', 'interim', chain(initialized_supersession,
+        contradict_successor('run_id', 'different-successor')), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_SUCCESSOR_STATE_SCHEMA', 'interim', chain(initialized_supersession,
+        contradict_successor('schema_version', 'unsupported-schema')), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_SUCCESSOR_AUDIT_ID', 'interim', chain(initialized_supersession,
+        contradict_successor('run_id', 'different-successor', 'audit.json')), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_SUCCESSOR_AUDIT_SCHEMA', 'interim', chain(initialized_supersession,
+        contradict_successor('schema_version', 'unsupported-schema', 'audit.json')), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_PENDING', 'interim', close_review_run, 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_IN_PROGRESS', 'interim', chain(close_review_run, started_security,
+        lambda d, r, p: d['security_review'].update(status='IN_PROGRESS')), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_FAKE_SUPERSESSION', 'interim', chain(close_review_run,
+        lambda d, r, p: write_text_file(r / 'RUN-STATE.json', json.dumps({
+            **read_json(r / 'RUN-STATE.json'), 'superseded_by_run': 'missing-successor'}))), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_SELF_SUPERSESSION', 'interim', chain(close_review_run,
+        lambda d, r, p: write_text_file(r / 'RUN-STATE.json', json.dumps({
+            **read_json(r / 'RUN-STATE.json'), 'superseded_by_run': d['run_id']}))), 'E_RUN_SECURITY_CLOSURE'),
+    ('CLOSED_SECURITY_UNLINKED_SUCCESSOR', 'interim', chain(superseded_review_run,
+        lambda d, r, p: write_text_file(r.parent / 'linked-successor/RUN-STATE.json', json.dumps({
+            'run_id': 'linked-successor', 'schema_version': SCHEMA_VERSION, 'previous_run_ids': []}))), 'E_RUN_SECURITY_CLOSURE'),
+    ('NOT_PERFORMED_PROJECT_DECISION', 'interim', chain(valid_not_performed,
+        lambda d, r, p: d['security_review'].update(decision_source_ids=['SRC-001'])), 'E_SECURITY_NOT_PERFORMED'),
+    ('NOT_PERFORMED_MIXED_DECISIONS', 'interim', chain(valid_not_performed,
+        lambda d, r, p: d['security_review'].update(decision_source_ids=['SRC-DECISION', 'SRC-001'])), 'E_SECURITY_NOT_PERFORMED'),
+    ('FINDING_CATEGORY_MISSING', 'nogo', lambda d, r, p: d['findings'][0].pop('category'), 'E_FINDING_CATEGORY'),
+    ('FINDING_CATEGORY_UNKNOWN', 'nogo', set_fields('findings', 'F-001', category='INVENTED'), 'E_FINDING_CATEGORY'),
+    ('FINDING_CATEGORY_H', 'nogo', set_fields('findings', 'F-001', category='H'), 'E_FINDING_CATEGORY'),
+    ('FINDING_CATEGORY_NULL', 'nogo', set_fields('findings', 'F-001', category=None), 'E_FINDING_CATEGORY'),
+    ('FINDING_CATEGORY_NON_STRING', 'nogo', set_fields('findings', 'F-001', category=['SECURITY']), 'E_FINDING_CATEGORY'),
+    ('PENDING_START_WITHOUT_EXECUTOR', 'interim', lambda d, r, p: d['security_review'].update(
+        started_at_utc=d['baseline']['captured_at_utc']), 'E_SECURITY_REVIEW'),
+    ('NOT_PERFORMED_EXECUTOR_WITHOUT_START', 'interim', chain(valid_not_performed,
+        lambda d, r, p: d['security_review'].update(executed_by='Synthetic reviewer')), 'E_SECURITY_REVIEW'),
+    ('SECURITY_NA_DOMAIN_H_APPLICABLE', 'interim', chain(valid_security_na, lambda d, r, p:
+        next(row for row in d['domain_matrix'] if row['domain'] == 'H').update(applicability='APPLICABLE')), 'E_SECURITY_NA_REASON'),
+    ('NOT_PERFORMED_DECISION_WITHOUT_TASK', 'interim', chain(valid_not_performed,
+        lambda d, r, p: d['security_review'].update(task_ids=[])), 'E_SECURITY_NOT_PERFORMED'),
+]
+
+
+CORE2_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('SECURITY_REVIEW_MISSING', 'go', lambda d, r, p: d.pop('security_review', None), 'E_SECURITY_REVIEW'),
+    ('SECURITY_REVIEW_MALFORMED', 'go', lambda d, r, p: d.update(security_review=[]), 'E_SECURITY_REVIEW'),
+    ('SECURITY_SCOPE_MALFORMED', 'go', lambda d, r, p: d.update(security_scope=None), 'E_SECURITY_SCOPE'),
+    ('SECURITY_STATUS_UNKNOWN', 'go', lambda d, r, p: d['security_review'].update(status='UNKNOWN'), 'E_SECURITY_REVIEW'),
+    ('SECURITY_TIMESTAMPS_INVALID', 'go', lambda d, r, p: d['security_review'].update(completed_at_utc=None), 'E_SECURITY_REVIEW'),
+    ('SECURITY_TIMESTAMPS_MALFORMED_DATE', 'go', lambda d, r, p: d['security_review'].update(started_at_utc='2026-01-01Z'), 'E_SECURITY_REVIEW'),
+    ('SECURITY_SCOPE_MISSING', 'go', lambda d, r, p: d.pop('security_scope', None), 'E_SECURITY_SCOPE'),
+    ('SECURITY_SCOPE_INVALID', 'go', lambda d, r, p: d['security_scope'][0].update(relevance='GUESS'), 'E_SECURITY_SCOPE'),
+    ('SECURITY_SCOPE_NO_MANDATORY_CHECK', 'go', lambda d, r, p: d['security_scope'][0].update(check_ids=[]), 'E_SECURITY_SCOPE'),
+    ('SECURITY_DONE_UNEXECUTED', 'go', set_fields('checks', 'CHK-001', execution='NOT_RUN', catch_up_plan='Resume review'), 'E_SECURITY_DONE_CHECKS'),
+    ('SECURITY_DONE_UNQUALIFIED', 'go', set_fields('checks', 'CHK-001', evidence_ids=[]), 'E_SECURITY_DONE_CHECKS'),
+    ('SECURITY_DONE_DOMAIN_CHECK_OPEN', 'go', lambda d, r, p: (d['checks'].append(copy.deepcopy(EXTRA_REQUIRED_CHECK)),
+        next(row for row in d['domain_matrix'] if row['domain'] == 'H')['check_ids'].append('CHK-004')), 'E_SECURITY_DONE_CHECKS'),
+    ('SECURITY_NA_WITH_SCOPE', 'go', lambda d, r, p: d['security_review'].update(status='NOT_APPLICABLE'), 'E_SECURITY_NA_REASON'),
+    ('SECURITY_NOT_PERFORMED_NO_DECISION', 'go', lambda d, r, p: d['security_review'].update(status='NOT_PERFORMED'), 'E_SECURITY_NOT_PERFORMED'),
+    ('SECURITY_NOT_PERFORMED_REQUIRES_PARTIAL', 'interim', chain(valid_not_performed,
+        lambda d, r, p: d.update(audit_status='BLOCKED')), 'E_SECURITY_NOT_PERFORMED'),
+    ('GO_SECURITY_PENDING', 'go', pending_security, 'E_GO_SECURITY_PENDING'),
+    ('COMPLETE_SECURITY_PENDING', 'go', pending_security, 'E_COMPLETE_SECURITY_PENDING'),
+    ('GAP_AS_BLOCKER', 'nogo', set_fields('findings', 'F-001', type='MISSING_EVIDENCE'), 'E_GAP_AS_BLOCKER'),
+    ('CLEANUP_AS_BLOCKER', 'nogo', set_fields('findings', 'F-001', type='CLEANUP'), 'E_GAP_AS_BLOCKER'),
+    ('TEST_QUALITY_AS_BLOCKER', 'nogo', set_fields('findings', 'F-001', type='TEST_QUALITY'), 'E_GAP_AS_BLOCKER'),
+    ('RELEASE_CONTROL_MALFUNCTION_NOT_TEXT', 'nogo', chain(release_control_defect,
+        lambda d, r, p: d['findings'][0]['release_control'].update(malfunction=['claimed'])), 'E_GAP_AS_BLOCKER'),
+    ('BLOCKER_CONFIDENCE_MEDIUM', 'nogo', set_fields('findings', 'F-001', confidence='MEDIUM'), 'E_BLOCKER_CONFIDENCE'),
+    ('FINDING_REVIEW_MISSING', 'nogo', set_fields('findings', 'F-001', review=None), 'E_FINDING_REVIEW'),
+    ('FINDING_REVIEW_UNAVAILABLE_NO_REASON', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(
+        outcome='UNAVAILABLE', method='COMMENT_ONLY'), 'E_FINDING_REVIEW'),
+    ('FINDING_REVIEW_UNAVAILABLE_REASON_NOT_TEXT', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(
+        outcome='UNAVAILABLE', method='COMMENT_ONLY', reason=['unavailable']), 'E_FINDING_REVIEW'),
+    ('FINDING_REVIEW_DISPUTED_NO_COUNTERCHECK', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(outcome='DISPUTED'), 'E_FINDING_REVIEW'),
+    ('FINDING_REVIEW_INVALID_METHOD', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(method='INVENTED'), 'E_FINDING_REVIEW'),
+    ('FINDING_REVIEW_INVALID_OUTCOME', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(outcome='INVENTED'), 'E_FINDING_REVIEW'),
+    ('UNSOURCED_REQUIREMENT', 'nogo', set_fields('requirements', 'REQ-001', source_ids=[]), 'E_UNSOURCED_REQUIREMENT'),
+    ('UNSOURCED_OBJECTIVE', 'nogo', set_fields('objectives', 'OBJ-001', source_ids=[]), 'E_UNSOURCED_OBJECTIVE'),
+    ('UNSOURCED_INVARIANT', 'nogo', set_fields('invariants', 'INV-001', source_ids=[]), 'E_UNSOURCED_INVARIANT'),
+    ('FINDING_TARGET_MISSING', 'nogo', set_fields('findings', 'F-001', target=None), 'E_FINDING_TARGET'),
+    ('FINDING_TARGET_UNSOURCED', 'nogo', chain(set_fields('requirements', 'REQ-001', source_ids=[])), 'E_FINDING_TARGET'),
+    ('FINDING_TARGET_NECESSITY_INCOMPLETE', 'nogo', set_fields('findings', 'F-001', target={'necessity': {'actor': 'user'}}), 'E_FINDING_TARGET'),
+    ('FINDING_TARGET_DANGLING_REF', 'nogo', set_fields('findings', 'F-001', target={'requirement_ids': ['REQ-NONE']}), 'E_REF'),
+    ('CONFIRMED_ON_HANDWRITTEN_NOTE', 'nogo', observation_only(), 'E_FINDING_EVIDENCE'),
+    ('CONFIRMED_FORGED_VERIFICATION_FLAG', 'nogo', set_fields('findings', 'F-001',
+        code_refs=[], evidence_ids=[], _verified_refs=True), 'E_FINDING_EVIDENCE'),
+    ('CONFIRMED_ON_STALE_OBSERVATION', 'nogo', observation_only('UI', origin=True, stale=True), 'E_FINDING_EVIDENCE'),
+    ('CONFIRMED_ON_UNSUPPORTED_UI_LABEL', 'nogo', observation_only('UI'), 'E_FINDING_EVIDENCE'),
+    ('CONFIRMED_ON_PREDATED_UI', 'nogo', chain(observation_only('UI', origin=True),
+        set_fields('evidence', 'EV-OBS', captured_at_utc='2020-01-01T00:00:00Z')), 'E_FINDING_EVIDENCE'),
+    ('STATIC_FINDING_WITHOUT_BASELINE', 'nogo', chain(set_fields('findings', 'F-001', evidence_ids=[]),
+        unlink('evidence/baseline/baseline-start.json')), 'E_FINDING_EVIDENCE'),
+    ('CONFIRMED_ON_LOG_WITHOUT_ORIGIN', 'nogo', chain(set_fields('findings', 'F-001', evidence_ids=['EV-001'], code_refs=[]),
+        lambda d, r, p: write_text_file(r / 'evidence/logs/CHK-002.meta.json', json.dumps({
+            'log_sha256': d['evidence'][0]['sha256'], 'exit_code': 1}))), 'E_FINDING_EVIDENCE'),
+    ('COMPLETE_T1_ON_MANUAL_NOTE', 'go', observation_only(), 'E_COMPLETE_T1'),
+    ('REPORT_SECURITY_SECTION_MISSING', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\n'), 'E_FINAL_CONTENT'),
+    ('REPORT_SECURITY_ONLY_IN_PROSE', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\nSecurity review pending.\n'), 'E_FINAL_CONTENT'),
+]
 
 
 def run_state_authorization(value: Any, missing: bool = False) -> Mutation:
@@ -3368,23 +4151,38 @@ def refuted_required_investigation(data: dict[str, Any], run: Path, project: Pat
 
 
 POSITIVE_CONTROLS: list[tuple[str, str, Mutation | None]] = [
+    ('VALID_SECURITY_FINDING_CATEGORY', 'nogo', set_fields('findings', 'F-001', category='SECURITY')),
     ('VALID_NO_GO_EXAMPLE', 'nogo', None),
     ('VALID_GO_EXAMPLE', 'go', None),
     ('LEGIT_CONVENTIONS_ACCEPTED', 'nogo', legit_variations),
     ('GO_WITH_REFUTED_REQUIRED_INVESTIGATION', 'go', refuted_required_investigation),
+    ('VALID_INTERIM_PENDING_EXAMPLE', 'interim', None),
+    ('STATIC_FINDING_VERIFIED_CODE_REFS', 'nogo', set_fields('findings', 'F-001', evidence_ids=[])),
+    ('GENUINE_MANUAL_UI_OBSERVATION', 'nogo', observation_only('UI', origin=True)),
+    ('RUN_BACKED_OBSERVATION', 'nogo', set_fields('findings', 'F-001', code_refs=[], evidence_ids=['EV-001'])),
+    ('RELEASE_CONTROL_MALFUNCTION_BLOCKER', 'nogo', release_control_defect),
+    ('VALID_SECURITY_NOT_APPLICABLE', 'go', valid_security_na),
+    ('VALID_SECURITY_NOT_PERFORMED', 'interim', valid_not_performed),
+    ('VALID_REVIEW_UNAVAILABLE', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(
+        method='COMMENT_ONLY', outcome='UNAVAILABLE', reason='No independent reviewer available.')),
+    ('VALID_REVIEW_DISPUTED_COUNTERCHECK', 'nogo', lambda d, r, p: d['findings'][0]['review'].update(
+        outcome='DISPUTED', countercheck_evidence_ids=['EV-001'])),
+    ('VALID_NECESSITY_TARGET', 'nogo', set_fields('findings', 'F-001', target={
+        'necessity': {'actor': 'Local user', 'reachable_path': 'save then restart', 'harm': 'Persisted note lost'}})),
+    ('VALID_DOC_CLAIM_TARGET', 'nogo', set_fields('findings', 'F-001', target={'doc_claim_ids': ['DC-001']})),
 ]
 
 
 def run_validator_controls(root: Path) -> list[dict[str, Any]]:
     results = []
-    for control_id, variant, mutation in POSITIVE_CONTROLS:
+    for control_id, variant, mutation in POSITIVE_CONTROLS + WORKFLOW_POSITIVE_CONTROLS:
         run_dir, project, data = write_example_run(root / control_id.lower(), variant)
         if mutation is not None:
             mutation(data, run_dir, project)
         issues, _ = validate_audit(data, run_dir, project, final=True)
         results.append({'id': control_id, 'kind': 'POSITIVE_CONTROL', 'result': 'PASS' if not issues.errors else 'FAIL',
                         'observed_errors': sorted(issues.codes()), 'warnings': sorted({w['code'] for w in issues.warnings})})
-    for control_id, variant, mutation, expected in VALIDATOR_CONTROLS:
+    for control_id, variant, mutation, expected in VALIDATOR_CONTROLS + CORE2_CONTROLS + WORKFLOW_NEGATIVE_CONTROLS:
         run_dir, project, data = write_example_run(root / control_id.lower(), variant)
         mutation(data, run_dir, project)
         try:
@@ -3413,6 +4211,476 @@ def run_cli(*arguments: str, env: dict[str, str] | None = None, timeout: float =
     proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), *arguments], env=env, timeout=timeout,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return proc.returncode, proc.stdout.decode('utf-8', 'replace')
+
+
+def run_core2_controls(root: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for link in ('audit', 'state', 'none'):
+        run, project, data = write_example_run(root / ('init-supersession-' + link), 'interim')
+        initialized_supersession(data, run, project, link)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        info = describe_run(run, inspect_live=False)
+        expected = 'OPEN' if link == 'none' else 'CLOSED'
+        control(results, 'INIT_SUPERSESSION_' + link.upper() + '_DISCOVERY',
+                info is not None and info['status'] == expected)
+    for status in ('PENDING', 'IN_PROGRESS', 'SUPERSEDED', 'DONE'):
+        closed, original, closed_data = write_example_run(root / ('closed-' + status.lower()),
+                                                        'go' if status == 'DONE' else 'interim')
+        (superseded_review_run if status == 'SUPERSEDED' else close_review_run)(closed_data, closed, original)
+        if status == 'IN_PROGRESS':
+            started_security(closed_data, closed, original)
+            closed_data['security_review']['status'] = status
+        write_text_file(closed / 'audit.json', json.dumps(closed_data))
+        expected = 'OPEN' if status in ('PENDING', 'IN_PROGRESS') else 'CLOSED'
+        for inspect in (False, True):
+            info = describe_run(closed, inspect_live=inspect)
+            control(results, 'CLOSED_REVIEW_' + status + ('_INSPECTED' if inspect else '_LISTED'),
+                    info is not None and info['status'] == expected)
+    run, project, data = write_example_run(root / 'checkpoint', 'interim')
+    write_text_file(run / 'findings/F-001-notes-not-persistent.md', '# F-001\n[Details](../evidence/detail.txt)\n')
+    write_text_file(run / 'evidence/detail.txt', 'Referenced detail.\n')
+    created = create_checkpoint(run, project)
+    snapshot = run / 'checkpoints/interim/files'
+    control(results, 'CHECKPOINT_ROUNDTRIP_REFERENCES', created['state'] == 'VALID'
+            and (snapshot / 'evidence/detail.txt').is_file()
+            and (snapshot / 'evidence/logs/CHK-002-2.meta.json').is_file())
+    try:
+        create_checkpoint(run, project)
+        refused = False
+    except ToolError:
+        refused = True
+    control(results, 'CHECKPOINT_REFUSES_OVERWRITE', refused)
+    write_text_file(run / 'audit.json', '{interrupted')
+    info = describe_run(run)
+    control(results, 'INTERRUPTED_LIVE_STATE_CHECKPOINT_GUIDANCE', info is not None
+            and info['checkpoint']['state'] == 'VALID' and info['live_state'] == 'INVALID_OR_INCOMPLETE'
+            and 'Offer the verified interim checkpoint' in info['resume_guidance'])
+    write_text_file(run / 'audit.json', json.dumps({'schema_version': SCHEMA_VERSION}))
+    info = describe_run(run)
+    control(results, 'INVALID_LIVE_STATE_CHECKPOINT_GUIDANCE', info is not None
+            and 'Offer the verified interim checkpoint' in info['resume_guidance'])
+    write_text_file(snapshot / 'REPORT.md', 'tampered\n')
+    control(results, 'CHECKPOINT_TAMPER_REJECTED', verify_checkpoint(run)['state'] == 'INVALID')
+    run2, project2, data2 = write_example_run(root / 'checkpoint-inventory', 'interim')
+    create_checkpoint(run2, project2)
+    manifest_path = run2 / 'checkpoints/interim/manifest.json'
+    manifest = read_json(manifest_path)
+    manifest['sha256'].pop('tasks/T-001-persistence.md')
+    write_text_file(manifest_path, json.dumps(manifest))
+    control(results, 'CHECKPOINT_INVENTORY_ENFORCED', verify_checkpoint(run2)['state'] == 'INVALID')
+    run3, project3, _ = write_example_run(root / 'checkpoint-invalid', 'go')
+    try:
+        create_checkpoint(run3, project3)
+        refused = False
+    except ToolError:
+        refused = True
+    control(results, 'CHECKPOINT_REQUIRES_INTERIM_PENDING', refused)
+    invalid, invalid_project, _ = write_example_run(root / 'checkpoint-final-invalid', 'interim')
+    write_text_file(invalid / 'REPORT.md', '')
+    try:
+        create_checkpoint(invalid, invalid_project)
+        refused = False
+    except ToolError:
+        refused = True
+    control(results, 'CHECKPOINT_REQUIRES_FINAL_VALIDATION', refused)
+    incompatible = {'schema_version': 'audit-core/1'}
+    issues, counts = validate_audit(incompatible, root / 'absent', None, final=True)
+    control(results, 'SCHEMA_MISMATCH_CHECKED_FIRST', [e['code'] for e in issues.errors] == ['E_SCHEMA_VERSION']
+            and not issues.warnings and counts == {})
+    legacy = root / 'discover' / 'old-open'
+    write_json_new(legacy / 'audit.json', incompatible)
+    write_json_new(legacy / 'RUN-STATE.json', {'prompt_version': PROMPT_VERSION, 'closed_at_utc': None})
+    code, output = run_cli('runs', '--results-dir', str(legacy.parent))
+    listing = json_head(output)
+    old = next((r for r in listing.get('runs', []) if r['dir'] == 'old-open'), {})
+    control(results, 'INCOMPATIBLE_OPEN_RUN_DISCOVERABLE', code == 0 and old.get('status') == 'OPEN'
+            and old.get('resumable_with_package') is False and 'new linked' in old.get('resume_guidance', '')
+            and listing.get('latest_resumable') is None)
+    data2['prompt_version'] = 'different-prompt'
+    issues, _ = validate_audit(data2, run2, project2, final=True)
+    control(results, 'COMPATIBLE_PROMPT_DRIFT_WARNING_ONLY', not issues.errors
+            and 'W_PROMPT_VERSION' in {w['code'] for w in issues.warnings})
+    run4, project4, data4 = write_example_run(root / 'counters', 'nogo')
+    open_critical_suspicion(data4, run4, project4)
+    _, counts = validate_audit(data4, run4, project4, final=True)
+    control(results, 'CONFIRMED_AND_UNCONFIRMED_OPEN_COUNTS', counts['findings']['confirmed_open'] == {'HIGH': 1}
+            and counts['findings']['unconfirmed_open'] == 1)
+    data4['findings'][0].update(target=None, review=None)
+    issues, _ = validate_audit(data4, run4, project4, final=False)
+    control(results, 'FINDING_TARGET_REVIEW_SOFT_UNTIL_FINAL', not issues.errors
+            and {'W_FINDING_TARGET', 'W_FINDING_REVIEW'} <= {w['code'] for w in issues.warnings})
+    return results
+
+
+def report_reference(text: str) -> Mutation:
+    return lambda data, run, project: write_text_file(run / 'REPORT.md',
+        (run / 'REPORT.md').read_text(encoding='utf-8') + '\n' + text + '\n')
+
+
+def run_checkpoint_workflow_controls(root: Path) -> list[dict[str, Any]]:
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    cases = [
+        ('CHECKPOINT_IGNORES_EXTENSION_PATH', lambda d, r, p: d['components'][0].update(path='src/store.py'),
+         None, None, None),
+        ('CHECKPOINT_NORMALIZES_QUALIFIED_TRAVERSAL', chain(
+            overwrite('evidence/only.txt', 'Current-run observation.\n'),
+            lambda d, r, p: d['previous_run_ids'].append('prior-run'),
+            lambda d, r, p: d['sources'].append({'id': 'SRC-TRAVERSAL',
+                'ref': 'run:prior-run/../evidence/only.txt', 'authority': 'Current run'})),
+         None, None, 'evidence/only.txt'),
+        ('CHECKPOINT_NORMALIZES_ENCODED_TRAVERSAL', chain(
+            overwrite('evidence/only.txt', 'Current-run observation.\n'),
+            lambda d, r, p: d['previous_run_ids'].append('prior-run'),
+            lambda d, r, p: d['sources'].append({'id': 'SRC-TRAVERSAL',
+                'ref': 'run:prior-run%5C..%5Cevidence%2Fonly.txt', 'authority': 'Current run'})),
+         None, None, 'evidence/only.txt'),
+        ('CHECKPOINT_PREVIOUS_RUN_REFERENCE', chain(
+            lambda d, r, p: d['previous_run_ids'].append('prior-run'),
+            lambda d, r, p: d['sources'].append({'id': 'SRC-PRIOR', 'ref': 'run:prior-run/VISION.md', 'authority': 'Prior run'})),
+         'run:prior-run/VISION.md', 'previous-run reference', None),
+        ('CHECKPOINT_PROJECT_SOURCE_LINK', report_reference('[Source](../project/src/store.py)'),
+         '../project/src/store.py', 'outside current run', None),
+        ('CHECKPOINT_DIRECTORY_LINK', chain(lambda d, r, p: (r / 'empty-directory').mkdir(),
+            report_reference('[Directory](empty-directory)')), 'empty-directory', 'directory', None),
+        ('CHECKPOINT_URL_ENCODED_LINK', chain(overwrite('evidence/capture one.txt', 'Captured observation.\n'),
+            report_reference('[Capture](evidence/capture%20one.txt)')), None, None, 'evidence/capture one.txt'),
+        ('CHECKPOINT_FENCED_PLACEHOLDER', report_reference(
+            '```text\n[Template](missing-template.txt)\n```\n~~~text\n[Template](missing-template.txt)\n~~~'), None, None, None),
+        ('CHECKPOINT_INLINE_PLACEHOLDER', report_reference('Example: `[Template](missing-template.txt)`.'), None, None, None),
+        ('CHECKPOINT_ABSOLUTE_PATH', lambda d, r, p: report_reference(f'[Absolute]({(r / "VISION.md").resolve().as_posix()})')(d, r, p),
+         None, 'absolute path', None),
+        ('CHECKPOINT_ENCODED_ABSOLUTE_PATH', lambda d, r, p: report_reference('[Absolute](' +
+            (r / 'VISION.md').resolve().as_posix().replace(':', '%3A').replace('/', '%2F') + ')')(d, r, p),
+         None, 'absolute path', None),
+        ('CHECKPOINT_URL_REFERENCE', report_reference('[Reference](https://example.invalid/reference)'),
+         'https://example.invalid/reference', 'URL or external scheme', None),
+        ('CHECKPOINT_CURRENT_QUALIFIED_REFERENCE', lambda d, r, p: d['sources'].append(
+            {'id': 'SRC-CURRENT', 'ref': f'run:{d["run_id"]}/VISION.md', 'authority': 'Current run'}), None, None, 'VISION.md'),
+        ('CHECKPOINT_DOT_EVIDENCE_PATH', set_fields('evidence', 'EV-003', path='./evidence/logs/CHK-002-2.log'),
+         None, None, 'evidence/logs/CHK-002-2.log'),
+        ('CHECKPOINT_BACKSLASH_EVIDENCE_PATH', set_fields('evidence', 'EV-003', path='evidence\\logs\\CHK-002-2.log'),
+         None, None, 'evidence/logs/CHK-002-2.log'),
+    ]
+    for control_id, mutation, reference, reason, stored in cases:
+        run, project, data = write_example_run(root / control_id.lower(), 'interim')
+        mutation(data, run, project)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        try:
+            result = create_checkpoint(run, project)
+            manifest = read_json(run / 'checkpoints/interim/manifest.json')
+            omitted = manifest['not_snapshotted']
+            ok = result['state'] == 'VALID' and verify_checkpoint(run)['state'] == 'VALID'
+            if reason is not None:
+                ok = ok and any(item['reason'] == reason and (reference is None or item['reference'] == reference) for item in omitted)
+            if stored is not None:
+                ok = ok and stored in manifest['sha256']
+            if control_id == 'CHECKPOINT_DIRECTORY_LINK':
+                ok = ok and (run / 'checkpoints/interim/files/empty-directory').is_dir()
+            if 'PLACEHOLDER' in control_id:
+                ok = ok and not any('missing-template' in item['reference'] for item in omitted)
+            control(results, control_id, ok, result)
+        except Exception as exc:
+            control(results, control_id, False, str(exc))
+
+    run, project, _ = write_example_run(root / 'missing-local', 'interim')
+    report_reference('[Missing](evidence/missing-file.txt)')({}, run, project)
+    try:
+        create_checkpoint(run, project)
+        missing_rejected = False
+    except ToolError as exc:
+        missing_rejected = 'missing inside current run' in str(exc)
+    control(results, 'CHECKPOINT_MISSING_IN_RUN_REJECTED', missing_rejected)
+
+    for failure in ('validation', 'copy'):
+        run, project, _ = write_example_run(root / ('failed-' + failure), 'interim')
+        if failure == 'validation':
+            write_text_file(run / 'REPORT.md', '')
+        failed = False
+        try:
+            if failure == 'copy':
+                with patch.object(shutil, 'copyfile', side_effect=OSError('Synthetic copy failure')):
+                    create_checkpoint(run, project)
+            else:
+                create_checkpoint(run, project)
+        except (ToolError, OSError):
+            failed = True
+        control(results, 'CHECKPOINT_CLEANS_FAILED_' + failure.upper(), failed
+                and not list((run / 'checkpoints').glob('.interim-*')) and not (run / 'checkpoints/interim').exists())
+
+    run, project, data = write_example_run(root / 'live-progress', 'interim')
+    create_checkpoint(run, project)
+    data['findings'][0].update(state='OPEN', review=None)
+    data['release_status'] = 'NO_GO'
+    data['release_gates'][0].update(status='VIOLATED', finding_ids=['F-001'])
+    state = read_json(run / 'RUN-STATE.json')
+    state['phase'] = 'P8'
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    write_text_file(run / 'audit.json', json.dumps(data))
+    info = describe_run(run)
+    control(results, 'MID_P8_UNREVIEWED_FINDING_CONTINUES', info is not None and info['live_state'] == 'VALID'
+            and 'Continue' in info['resume_guidance'] and 'Offer' not in info['resume_guidance'])
+    write_text_file(project / 'src/store.py', EXAMPLE_SOURCE + '# changed since checkpoint\n')
+    info = describe_run(run)
+    control(results, 'PROJECT_DRIFT_NEVER_RESTORES_CHECKPOINT', info is not None
+            and 'project changed since checkpoint: follow re-audit rules' in info['resume_guidance']
+            and 'Offer' not in info['resume_guidance'])
+
+    run, project, data = write_example_run(root / 'pre-interim', 'interim')
+    create_checkpoint(run, project)
+    state = read_json(run / 'RUN-STATE.json')
+    state['phase'] = 'P2'
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    write_text_file(run / 'audit.json', json.dumps({'schema_version': SCHEMA_VERSION}))
+    info = describe_run(run)
+    control(results, 'PRE_P7_CONTINUES_WITHOUT_RESTORE', info is not None
+            and 'Continue' in info['resume_guidance'] and 'Offer' not in info['resume_guidance'])
+    state['phase'] = 'P8'
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    data['schema_version'] = 'broken-schema'
+    write_text_file(run / 'audit.json', json.dumps(data))
+    info = describe_run(run)
+    control(results, 'SCHEMA_INVALID_LIVE_CHECKPOINT_RESTORE', info is not None
+            and 'Offer the verified interim checkpoint' in info['resume_guidance'])
+
+    run, project, data = write_example_run(root / 'archive-scan', 'interim')
+    issues_before, counts_before = validate_audit(data, run, project, final=True)
+    write_text_file(run / 'checkpoints/interim/files/copied.py', FAKE_LIVE_KEY)
+    write_text_file(run / 'checkpoints/.interim-interrupted/files/staging.py', FAKE_LIVE_KEY)
+    issues_after, counts_after = validate_audit(data, run, project, final=True)
+    control(results, 'VALIDATE_IGNORES_CHECKPOINT_COPIES_AND_STAGING', not issues_before.errors
+            and not issues_after.errors and counts_before == counts_after)
+
+    run, project, data = write_example_run(root / 'original-checkpoint', 'interim')
+    create_checkpoint(run, project)
+    other, _, other_data = write_example_run(root / 'other-run', 'interim')
+    other_data['run_id'] = 'different-run'
+    state = read_json(other / 'RUN-STATE.json')
+    state['run_id'] = other_data['run_id']
+    write_text_file(other / 'RUN-STATE.json', json.dumps(state))
+    write_text_file(other / 'audit.json', json.dumps(other_data))
+    shutil.copytree(run / 'checkpoints', other / 'checkpoints')
+    control(results, 'CHECKPOINT_FROM_OTHER_RUN_REJECTED', verify_checkpoint(other)['state'] == 'INVALID')
+    for name in ('RUN-STATE.json', 'audit.json'):
+        live = read_json(run / name)
+        changed = dict(live, run_id='different-run')
+        write_text_file(run / name, json.dumps(changed))
+        control(results, 'CHECKPOINT_BINDS_' + ('RUN_STATE' if name == 'RUN-STATE.json' else 'AUDIT_ID'),
+                verify_checkpoint(run)['state'] == 'INVALID')
+        write_text_file(run / name, json.dumps(live))
+
+    run, project, data = write_example_run(root / 'null-security-duty', 'go')
+    extra = copy.deepcopy(EXTRA_REQUIRED_CHECK)
+    extra.update(required_for_audit=None, required_for_release=None, security=True)
+    data['checks'].append(extra)
+    issues, _ = validate_audit(data, run, project, final=True)
+    control(results, 'NULL_SECURITY_OBLIGATIONS_USE_EXISTING_ERRORS', issues.codes() == {
+        'E_COMPLETE_REQUIRED_NULL', 'E_GO_REQUIRED_NULL'})
+    stamp = utc_stamp('2026-01-01T03:00:00+03:00')
+    control(results, 'UTC_STAMP_NORMALIZES_OFFSET', stamp is not None and stamp.isoformat() == '2026-01-01T00:00:00+00:00')
+    control(results, 'CANONICAL_EVIDENCE_PATH_RESOLUTION', canonical_run_path('./evidence\\capture.txt') == 'evidence/capture.txt')
+
+    run, project, data = write_example_run(root / 'pending-only', 'go')
+    pending_security(data, run, project)
+    issues, _ = validate_audit(data, run, project, final=True)
+    control(results, 'GO_PENDING_ONLY_SECURITY_VERDICT_ERRORS', issues.codes() == {
+        'E_GO_SECURITY_PENDING', 'E_COMPLETE_SECURITY_PENDING'})
+
+    results_dir = root / 'performance-runs'
+    for index in range(4):
+        run, _, _ = write_example_run(root / f'performance-fixture-{index}', 'interim')
+        state = read_json(run / 'RUN-STATE.json')
+        state.update(created_at_utc=f'2026-01-0{index + 1}T00:00:00Z', closed_at_utc='2026-01-05T00:00:00Z' if index < 2 else None)
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        shutil.copytree(run, results_dir / f'run-{index}')
+    for inspect_all in (False, True):
+        with patch(__name__ + '.validate_audit', wraps=validate_audit) as validation, patch(
+                __name__ + '.verify_checkpoint', wraps=verify_checkpoint) as verification, contextlib.redirect_stdout(io.StringIO()):
+            cmd_runs(argparse.Namespace(project=str(root), results_dir=str(results_dir), inspect_all=inspect_all))
+        expected_count = 4 if inspect_all else 1
+        control(results, 'RUNS_INSPECTS_ALL_ON_REQUEST' if inspect_all else 'RUNS_INSPECTS_ONLY_LATEST_OPEN',
+                validation.call_count == expected_count and verification.call_count == expected_count
+                and all(call.kwargs.get('final') is False for call in validation.call_args_list))
+    return results
+
+
+def run_recovery_integrity_controls(root: Path) -> list[dict[str, Any]]:
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    for kind in ('dangling-ref', 'record-field', 'record-type', 'malformed', 'non-object', 'top-field-type', 'both-unreadable'):
+        run, project, data = write_example_run(root / kind, 'interim')
+        create_checkpoint(run, project)
+        state = read_json(run / 'RUN-STATE.json')
+        state['phase'] = 'P8'
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        if kind == 'dangling-ref':
+            data['findings'][0]['task_ids'].append('T-MISSING')
+        elif kind == 'record-field':
+            data['findings'][0].pop('title')
+        elif kind == 'record-type':
+            data['findings'][0]['task_ids'] = [['T-001']]
+        elif kind == 'top-field-type':
+            data['residual_risks'] = 'interrupted list'
+        write_text_file(run / 'audit.json', '{interrupted' if kind in ('malformed', 'both-unreadable')
+                        else '[]' if kind == 'non-object' else json.dumps(data))
+        if kind == 'both-unreadable':
+            write_text_file(run / 'RUN-STATE.json', '{interrupted')
+        info = describe_run(run) or {}
+        guidance = info.get('resume_guidance', '')
+        if kind in ('dangling-ref', 'record-field', 'record-type'):
+            expected = {'dangling-ref': 'E_REF', 'record-field': 'E_MISSING_FIELD', 'record-type': 'E_TYPE'}[kind]
+            control(results, 'MID_P8_' + kind.replace('-', '_').upper() + '_REPAIR',
+                    info.get('live_validation_errors') == [expected] and 'repair live state, then revalidate' in guidance.lower()
+                    and 'Offer' not in guidance, info)
+        else:
+            restore = ('Offer the verified interim checkpoint' in guidance
+                       and 'restoring discards all progress since the interim checkpoint' in guidance.lower())
+            control_id = {'malformed': 'MALFORMED_RESTORE_DISCARD_WARNING', 'non-object': 'TOP_LEVEL_TYPE_RESTORE_DISCARD_WARNING',
+                          'top-field-type': 'TOP_LEVEL_FIELD_TYPE_RESTORE_DISCARD_WARNING',
+                          'both-unreadable': 'CORRUPT_RUN_RECOVERY_CONSISTENT'}[kind]
+            control(results, control_id,
+                    restore and info.get('checkpoint', {}).get('state') == 'VALID'
+                    and (kind != 'both-unreadable' or info.get('status') == 'CORRUPT'
+                         and info.get('live_state') == 'CORRUPT' and info.get('resumable_with_package') is True), info)
+        if kind == 'both-unreadable':
+            results_dir = root / 'listing'
+            shutil.copytree(run, results_dir / 'corrupt')
+            code, output = run_cli('runs', '--results-dir', str(results_dir))
+            listing = json_head(output)
+            sole = next(iter(listing.get('runs', [])), {})
+            control(results, 'RUNS_RECOVERS_SOLE_CORRUPT_RUN', code == 0 and sole.get('status') == 'CORRUPT'
+                    and sole.get('resumable_with_package') is True and listing.get('latest_resumable') == 'corrupt'
+                    and 'restoring discards all progress since the interim checkpoint' in sole.get('resume_guidance', '').lower(), sole)
+            other, _, _ = write_example_run(root / 'other-open', 'interim')
+            shutil.copytree(other, results_dir / 'open')
+            code, output = run_cli('runs', '--results-dir', str(results_dir))
+            listing = json_head(output)
+            corrupt = next((r for r in listing.get('runs', []) if r['dir'] == 'corrupt'), {})
+            control(results, 'RUNS_LISTS_CORRUPT_WITH_OTHER_OPEN', code == 0 and len(listing.get('runs', [])) == 2
+                    and corrupt.get('status') == 'CORRUPT' and corrupt.get('resumable_with_package') is not False
+                    and 'Cannot resume' not in corrupt.get('resume_guidance', ''), corrupt)
+
+    for reason in ('directory', 'previous-run reference'):
+        run, project, _ = write_example_run(root / reason.replace(' ', '-'), 'interim')
+        write_text_file(run / 'evidence/only.txt', 'Current-run observation.\n')
+        report_reference('[Observation](evidence/only.txt)')({}, run, project)
+        create_checkpoint(run, project)
+        directory = run / 'checkpoints/interim'
+        manifest = read_json(directory / 'manifest.json')
+        # Reference-collection mutants can omit this file before the relabelling control.
+        (directory / 'files/evidence/only.txt').unlink(missing_ok=True)
+        manifest['sha256'].pop('evidence/only.txt', None)
+        manifest['not_snapshotted'].append({'source': 'REPORT.md', 'reference': 'evidence/only.txt', 'reason': reason})
+        manifest['not_snapshotted'].sort(key=lambda item: (item['source'], item['reference'], item['reason']))
+        write_text_file(directory / 'manifest.json', json.dumps(manifest))
+        control(results, 'CHECKPOINT_RELABELLED_' + ('DIRECTORY' if reason == 'directory' else 'PREVIOUS_RUN') + '_INVALID',
+                verify_checkpoint(run)['state'] == 'INVALID')
+
+    for location, suffix in (('files/extra.txt', 'SNAPSHOT_FILE'), ('extra.txt', 'ENVELOPE_FILE'),
+                             ('../extra.txt', 'ROOT_FILE'), ('empty-directory', 'DIRECTORY')):
+        run, project, _ = write_example_run(root / location.replace('/', '-'), 'interim')
+        create_checkpoint(run, project)
+        if suffix == 'DIRECTORY':
+            (run / 'checkpoints/interim' / location).mkdir()
+        else:
+            write_text_file(run / 'checkpoints/interim' / location, 'Added after creation.\n')
+        control(results, 'CHECKPOINT_EXTRA_' + suffix + '_INVALID',
+                verify_checkpoint(run)['state'] == 'INVALID')
+
+    native_datetime = datetime
+
+    class Python310Datetime(datetime):
+        @classmethod
+        def fromisoformat(cls, value: str) -> datetime:
+            if re.search(r'[+-]\d{4}$', value):
+                raise ValueError('Python 3.10 requires a colon in UTC offsets.')
+            return native_datetime.fromisoformat(value)
+
+    # Exercise the 3.10 parser boundary even when selftest runs on a newer interpreter.
+    for portable in (False, True):
+        def stamps() -> bool:
+            return all(utc_stamp(value) == datetime(2026, 1, 1, tzinfo=timezone.utc) for value in (
+                '2026-01-01T00:00:00+0000', '2026-01-01T03:00:00+0300', '2025-12-31T21:30:00-0230'))
+        if portable:
+            with patch(__name__ + '.datetime', Python310Datetime):
+                ok = stamps()
+        else:
+            ok = stamps()
+        control(results, 'UTC_COMPACT_OFFSET_' + ('PY310_BOUNDARY' if portable else 'NATIVE'), ok)
+    return results
+
+
+def run_checkpoint_input_controls(root: Path) -> list[dict[str, Any]]:
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    cases = [
+        ('CHECKPOINT_NULL_TEST_ASSESSMENTS', lambda d: d.update(test_assessments=None)),
+        ('CHECKPOINT_NULL_DOC_CLAIMS', lambda d: d.update(doc_claims=None)),
+        ('CHECKPOINT_NULL_EVIDENCE_CODE_REFS', lambda d: d['evidence'][0].update(code_refs=None)),
+        ('CHECKPOINT_NULL_FINDING_CODE_REFS', lambda d: d['findings'][0].update(code_refs=None)),
+    ]
+    for control_id, mutate in cases:
+        run, project, data = write_example_run(root / control_id.lower(), 'interim')
+        mutate(data)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        issues, _ = validate_audit(data, run, project, final=True)
+        try:
+            result = create_checkpoint(run, project)
+            ok = not issues.errors and result['state'] == 'VALID'
+            detail = {'validation_errors': sorted(issues.codes()), 'checkpoint': result}
+        except (ToolError, TypeError, KeyError) as exc:
+            ok, detail = False, str(exc)
+        control(results, control_id, ok, detail)
+
+    run, _, _ = write_example_run(root / 'cli-errors', 'interim')
+    for error_type in (TypeError, KeyError):
+        stderr = io.StringIO()
+        try:
+            with patch(__name__ + '.create_checkpoint', side_effect=error_type('Synthetic malformed checkpoint input')), contextlib.redirect_stderr(stderr):
+                code = main(['checkpoint', 'create', str(run)])
+            ok = code == 2 and 'Checkpoint input unreadable' in stderr.getvalue() and 'Traceback' not in stderr.getvalue()
+        except (TypeError, KeyError):
+            ok = False
+        control(results, 'CHECKPOINT_CLI_' + error_type.__name__.upper() + '_CLEAN_ERROR', ok, stderr.getvalue())
+
+    for checkpoint in ('ABSENT', 'INVALID'):
+        run, _, _ = write_example_run(root / ('malformed-' + checkpoint.lower()), 'interim')
+        state = read_json(run / 'RUN-STATE.json')
+        state['phase'] = 'P8' if checkpoint == 'ABSENT' else 'P9'
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        write_text_file(run / 'audit.json', '{interrupted')
+        if checkpoint == 'INVALID':
+            write_text_file(run / 'checkpoints/interim/manifest.json', '{}')
+        info = describe_run(run) or {}
+        control(results, 'MALFORMED_LIVE_' + checkpoint + '_CHECKPOINT_REPAIR', info.get('checkpoint', {}).get('state') == checkpoint
+                and 'Repair live state, then revalidate' in info.get('resume_guidance', '')
+                and 'Offer' not in info.get('resume_guidance', ''), info)
+
+    for saved in (False, True):
+        run, project, _ = write_example_run(root / ('staging-saved' if saved else 'staging-first'), 'interim')
+        if saved:
+            create_checkpoint(run, project)
+        staging = run / 'checkpoints/.interim-interrupted'
+        write_text_file(staging / 'files/extra.txt', 'Interrupted copy.\n')
+        if saved:
+            control(results, 'CHECKPOINT_IGNORES_LEFTOVER_STAGING', verify_checkpoint(run)['state'] == 'VALID')
+        try:
+            create_checkpoint(run, project)
+            refused, detail = False, 'Creation was not refused.'
+        except ToolError as exc:
+            detail = str(exc)
+            refused = str(staging) in detail and 'remove' in detail.lower()
+        control(results, 'CHECKPOINT_CREATE_REFUSES_LEFTOVER_STAGING' if saved else 'CHECKPOINT_CREATE_REFUSES_STAGING_BEFORE_FIRST_SNAPSHOT',
+                refused and (staging / 'files/extra.txt').read_text() == 'Interrupted copy.\n'
+                and (run / 'checkpoints/interim').exists() is saved, detail)
+        if saved:
+            write_text_file(run / 'checkpoints/interim/files/REPORT.md', 'Tampered checkpoint.\n')
+            control(results, 'CHECKPOINT_STAGING_DOES_NOT_MASK_TAMPER', verify_checkpoint(run)['state'] == 'INVALID')
+    return results
 
 
 def json_head(output: str) -> dict[str, Any]:
@@ -3729,8 +4997,8 @@ def run_tool_controls(root: Path) -> list[dict[str, Any]]:
     return results
 
 
-def run_v32_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Controls for the rules added in 3.2 after the self-audit and the independent review."""
+def run_workspace_safeguard_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Controls for baseline, workspace, masking, environment and cleanup safeguards."""
     results = [] if results is None else results
     # Check before dependent fixtures: TEMP can live in an ignored parent repository.
     if git_available():
@@ -3770,7 +5038,6 @@ def run_v32_controls(root: Path, results: list[dict[str, Any]] | None = None) ->
     # masking: passwords with $ ( ) # * are masked whole, also after dotted names and `=>`, in webhook URLs, dotted
     # tokens, generated paths and Authorization headers; test IDs, file:line, status words, code, connection targets
     # and endpoints stay readable; ordinary config values are not recorded, passphrases are; long lines stay fast
-    # (second and third review)
     secrets = ['Kx9(' + 'mP2)zQw', 'Pa$$' + 'w0rd!2024', 'abcd#' + 'efgh77', '*Rt5' + 'yU8iO', 'Zq9!' + 'kL2m',
                'q8Zr2LmN' + '5vXc7TbW', 'sk.eyJ1Ijoi' + 'YWNtZSJ9.Q7wErTy8', 'hunter2' + '.Backup', 'Lm4!' + 'nB7v',
                'dXNlcjpL' + 'eDltUDJ6', 'k9x2' + 'm7q4', '$Kx9' + 'mP2zQ', 'Def' + 'ault', '4829' + '1375',
@@ -3838,7 +5105,7 @@ def run_v32_controls(root: Path, results: list[dict[str, Any]] | None = None) ->
             and not missing and elapsed < 5, {'leaked': len(leaked), 'altered': altered, 'recorded': recorded,
                                               'not_recorded': len(missing), 'seconds': round(elapsed, 2)})
 
-    # workspace --expect-baseline applies the excludes of init (second review, same class as F-007)
+    # workspace --expect-baseline applies the exclusions recorded by init.
     excl_project = root / 'excl-project'
     write_text_file(excl_project / 'app.py', 'print(1)\n')
     write_text_file(excl_project / 'data' / 'big.bin', 'x' * 100)
@@ -3972,7 +5239,7 @@ def run_v32_controls(root: Path, results: list[dict[str, Any]] | None = None) ->
     return results
 
 
-def run_v13_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def run_environment_process_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     results = [] if results is None else results
     workspace, evidence = root / 'copy', root / 'logs'
     write_json_new(workspace / WORKSPACE_MARKER, {})
@@ -4167,7 +5434,7 @@ def run_v13_controls(root: Path, results: list[dict[str, Any]] | None = None) ->
     if os.name == 'nt':
         drive_refused = False
         try:
-            resolve_executable('Z:' + name, copy, {'PATH': '', 'PATHEXT': '.EXE'})
+            resolve_executable(copy.drive + name, copy, {'PATH': '', 'PATHEXT': '.EXE'})
         except ToolError as exc:
             drive_refused = 'Drive-relative' in str(exc)
         control(results, 'EXECUTABLE_REFUSES_DRIVE_RELATIVE', drive_refused)
@@ -4252,19 +5519,21 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     root = Path(tempfile.gettempdir()) / ('audit-tools-selftest-' + os.urandom(8).hex())
     root.mkdir()
     try:
-        results = run_validator_controls(root / 'validator') + run_tool_controls(root / 'tools')
-        v32: list[dict[str, Any]] = []
+        results = (run_validator_controls(root / 'validator') + run_tool_controls(root / 'tools')
+                   + run_core2_controls(root / 'core2') + run_checkpoint_workflow_controls(root / 'checkpoint-workflow')
+                   + run_recovery_integrity_controls(root / 'recovery-integrity') + run_checkpoint_input_controls(root / 'checkpoint-input'))
+        workspace_controls: list[dict[str, Any]] = []
         try:
-            run_v32_controls(root / 'v32', v32)
+            run_workspace_safeguard_controls(root / 'workspace-safeguards', workspace_controls)
         except Exception as exc:
-            control(v32, 'V32_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
-        results += v32
-        v13: list[dict[str, Any]] = []
+            control(workspace_controls, 'WORKSPACE_SAFEGUARD_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
+        results += workspace_controls
+        environment_controls: list[dict[str, Any]] = []
         try:
-            run_v13_controls(root / 'v13', v13)
+            run_environment_process_controls(root / 'environment-process', environment_controls)
         except Exception as exc:
-            control(v13, 'V13_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
-        results += v13
+            control(environment_controls, 'ENVIRONMENT_PROCESS_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
+        results += environment_controls
     finally:
         remove_tree(root)
     summary = {
@@ -4287,8 +5556,8 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if not summary['summary']['failed'] else 1
 
 
-def cmd_example(_args: argparse.Namespace) -> int:
-    print_json(example_audit())
+def cmd_example(args: argparse.Namespace) -> int:
+    print_json({'nogo': example_audit, 'go': example_go_audit, 'interim': example_interim_audit}[args.variant]())
     return 0
 
 
@@ -4318,6 +5587,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('runs', help='List existing runs with version, phase and closure status')
     p.add_argument('--project', default='.', help='Project root (default: current directory)')
     p.add_argument('--results-dir', help='Results directory (default: <project>/audit-results)')
+    p.add_argument('--inspect-all', action='store_true', help='Validate live state and rehash checkpoints for every run')
     p = sub.add_parser('baseline', help='Capture or compare project state')
     add_snapshot_options(p)
     p.add_argument('--out', help='Save state as a new JSON file (never overwrites)')
@@ -4360,9 +5630,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--project', help='Original project (default: from the start baseline)')
     p.add_argument('--final', action='store_true', help='Final check: verdict, artifacts and contents required')
     p.add_argument('--json', action='store_true', help='Print result as JSON')
+    p = sub.add_parser('checkpoint', help='Create or verify the immutable interim checkpoint')
+    p.add_argument('action', choices=['create', 'verify'])
+    p.add_argument('run_dir')
+    p.add_argument('--project', help='Original project (create; default from baseline)')
     p = sub.add_parser('selftest', help='Run positive and negative controls of the tools')
     p.add_argument('--out', help='Save result as a new JSON file')
-    sub.add_parser('example', help='Print minimal valid audit.json')
+    p = sub.add_parser('example', help='Print fictional audit.json (materialize referenced artifacts before validating)')
+    p.add_argument('--variant', choices=['go', 'nogo', 'interim'], default='go')
     return parser
 
 
@@ -4380,7 +5655,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(arguments)
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         'init': cmd_init, 'runs': cmd_runs, 'cleanup': cmd_cleanup, 'baseline': cmd_baseline, 'workspace': cmd_workspace, 'stop': cmd_stop,
-        'envkeys': cmd_envkeys, 'validate': cmd_validate, 'selftest': cmd_selftest, 'example': cmd_example,
+        'envkeys': cmd_envkeys, 'validate': cmd_validate, 'checkpoint': cmd_checkpoint, 'selftest': cmd_selftest, 'example': cmd_example,
     }
     try:
         if args.command == 'run':

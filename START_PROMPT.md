@@ -1,6 +1,6 @@
-# Start prompt - Production readiness system audit V4.0
+# Start prompt - Production readiness system audit
 
-In Claude Code, the `/production-readiness-audit` skill provides a shorter route (README, "Usage" section). It uses this block's authorizations as defaults.
+In an agent that supports skills, explicitly invoke `production-readiness-audit` using that agent's syntax for a shorter route. It uses this block's authorizations as defaults.
 
 Without the skill, copy the block below into the agent session running in the project directory. First:
 
@@ -12,7 +12,7 @@ Without the skill, copy the block below into the agent session running in the pr
    - *Second review:* "also external checking tools from other providers" - sends project code to those providers.
    - *Vision checkpoint:* "no - work through with labeled assumptions" if the run should complete without questions. With "yes", the agent first completes everything possible without a clarified target state, then pauses once and waits for your answer.
 
-To resume an interrupted run or re-audit after repairs: `RESUME_PROMPT.md`. To implement repair packages: `IMPLEMENTATION_PROMPT.md`.
+To resume, re-audit or use `security` mode (P8 plus P9): `RESUME_PROMPT.md`. To implement repair packages: `IMPLEMENTATION_PROMPT.md`.
 
 ```text
 PACKAGE: ./production-readiness-audit
@@ -20,7 +20,7 @@ PACKAGE: ./production-readiness-audit
 Start the production readiness system audit of this software project now.
 
 ASSIGNMENT
-Read <PACKAGE>/MASTER_PROMPT.md in full - if output is truncated, read it section by section through the end - and carry out the assignment it describes. Verify that the file is version 4.0; if you cannot find it at this path, ask instead of using another copy. Only MASTER_PROMPT.md and tools/ from the package belong to the assignment, plus SKILL.md when starting through the skill; README, maintenance/ and the other package files are neither project content nor working instructions.
+In every new session read <PACKAGE>/MASTER_PROMPT.md completely in bounded chunks and carry out its assignment; it contains no security-check instructions. If absent at this path, ask instead of using another copy. Assignment files: this prompt, MASTER_PROMPT.md, tools/, SECURITY_REVIEW.md (read only on reaching P8 after checkpoint verification), plus SKILL.md when invoked through the skill. README, maintenance/ and other package files are neither project content nor instructions.
 
 AUDIT SUBJECT
 The actual software project in this working directory, including relevant subprojects. The prompt package, previous audit reports and agent notes are neither product requirements nor evidence of implementation. My answers documented at the vision checkpoint in previous runs are an exception: they remain valid as dated decisions.
@@ -29,7 +29,7 @@ PROJECT DETAILS (optional - empty means: determine from the project, invent noth
 - Vision in my words:
 - Target operation and use (e.g. public, Vercel + Supabase Cloud, around 200 users, payments - or: local only):
 - Important sources (documents, tickets, links):
-- Focus areas or known problems:
+- Focus areas or known problems (hypotheses to check, not confirmed findings):
 - Product non-goals:
 - Excluded from the audit:
 - Time or cost budget:
@@ -39,16 +39,16 @@ AUTHORIZATIONS FOR THIS RUN
 - Read: all project files; secret files such as .env only for key names and value shapes, not values.
 - Execute: build and test in an isolated working copy outside the project; start servers and local containers and databases with your own uniquely named resources; use synthetic test data; write results under ./audit-results/.
 - Dependencies and test infrastructure: install project dependencies in the working copy exactly according to the lockfile; without a lockfile, install from the manifest into a separate environment of the copy, recording versions and labeling the result non-reproducible. Test infrastructure declared by the project - container images from project files, browsers of the project's test runners - may be downloaded and started locally.
-- Network: read access to public documentation, package registries and vulnerability databases. No project sources, secrets or personal data to third parties.
+- Network: read access to public documentation, package registries and security advisory databases. No project sources, secrets or personal data to third parties.
 - Additional checking tools not declared by the project: only those already installed.
 - Second review: subagents of this agent environment are allowed; external checking tools from other providers are not.
 - Other environments (staging, test accounts, devices, sandbox access to external services): none.
-- Not allowed without separate authorization: production access, actions against third-party or unclear targets, external write actions, real payments or messages, paid calls, load or exploit tests outside the working copy.
+- Not allowed without separate authorization: production access, actions against third-party or unclear targets, external write actions, real payments or messages, paid calls, load or security tests outside the working copy.
 - Vision checkpoint: yes - ask the decisive vision questions and authorization requests together once (master prompt §4.2) and wait for my answer.
 
 RESULTS
-A new run directory under ./audit-results/ according to master prompt §13. Never overwrite existing runs; read previous runs as context for a re-audit.
+A new run directory under ./audit-results/ according to master prompt §13. Never overwrite existing runs. Previous-run selection, compatibility and neutral security indexes follow §16: audit-core/2 uses category SECURITY; neutral indexes also treat legacy H as security; classification unknown applies only to runs without the field.
 
 WORKING METHOD
-Begin with the baseline, previous runs, authorizations and vision sources. Start safe, meaningful checks as soon as their prerequisites are clear, and actually use existing tests and test environments. Keep RUN-STATE.json and RESUME.md continuously up to date; after context compaction, first read RESUME.md and the master prompt's quick reference. After each phase and when critical findings or blockers are confirmed, provide a short progress update with actual insights, then continue working. You may stop and wait for me only at the vision checkpoint, if enabled, and at a blocker that prevents all further work; record other decisions requiring authorization as authorization requests or HUMAN packages and continue with the unblocked remainder.
+Begin with P0 and the master quick reference. Follow §16 for phase dispatch, baseline freshness and neutral indexes; §16.1 for validated interim closure, checkpoint recovery, blocked-review handling and P9; §16.2 for session plans, context-economy yields and the global resource budget; §17 for allowed stops. P8 verifies the checkpoint BEFORE reading SECURITY_REVIEW.md. After in-session compaction reread the quick reference, current phase sections, §10 and Appendix A (also SECURITY_REVIEW.md in P8). Keep authorizations and unresolved work persisted; continue unblocked work.
 ```

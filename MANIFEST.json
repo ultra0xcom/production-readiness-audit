@@ -1,8 +1,8 @@
 {
   "package": "production-readiness-audit",
-  "prompt_version": "4.0",
-  "previous_prompt_version": "3.2",
-  "previous_prompt_sha256": "1cadd17c12e36c7f8c7970de1c5c00449d8053c2437e0fce1d0ade5c66adfcb4",
+  "prompt_version": "5.0",
+  "tool_version": "3.0.0",
+  "schema_version": "audit-core/2",
   "scope": "Prompt package files and helper tools; not a software audit or model benchmark.",
   "files": [
     {
@@ -12,18 +12,13 @@
     },
     {
       "name": ".gitignore",
-      "size_bytes": 368,
-      "sha256": "353a8263472b34e27999c4a5595b039efa8c5f3ebd090a95cea2855296d02330"
-    },
-    {
-      "name": "CHANGELOG.md",
-      "size_bytes": 6681,
-      "sha256": "6bf0b8ca7f456174c70cfd61b89f85113606ff2f2b650d9115db1c2f88ed38f4"
+      "size_bytes": 336,
+      "sha256": "f785773eacc15d7015e7d3d367addf887a4c2cc0e4ca88f80317a244395f53f4"
     },
     {
       "name": "IMPLEMENTATION_PROMPT.md",
-      "size_bytes": 5789,
-      "sha256": "522cfb20ef8bf0f4998dcda355dc854cca797abacac9add6eaded5931bf3403f"
+      "size_bytes": 8314,
+      "sha256": "468387e74673a3f0608d4463bbbfea8e1f678b417edd2deb9436f049e7caa00d"
     },
     {
       "name": "LICENSE",
@@ -32,53 +27,58 @@
     },
     {
       "name": "maintenance/build_manifest.py",
-      "size_bytes": 2908,
-      "sha256": "03c31ab5b97843b80c0c2179eda3fa83c230957b1ccc5159f91172de604b1873"
+      "size_bytes": 4506,
+      "sha256": "b58b46d0098a1f92db9d9268dbb0e78da8a1946cdef48ec6b204d540836dd8bb"
     },
     {
       "name": "maintenance/check_prompt_structure.py",
-      "size_bytes": 28997,
-      "sha256": "b92ae303cae5b7ca26afbf765c0fa60aee874e4382a7db47cd80be2cbc44a43b"
+      "size_bytes": 80334,
+      "sha256": "89d280d356d55e0a1a9aea06b919cfe067cfd94047774995af9c0a5273c22e26"
     },
     {
       "name": "maintenance/EVAL_PLAN.md",
-      "size_bytes": 21551,
-      "sha256": "253e2f083aef7675b32e383d8b7a0835491797f9f95f79baf700e85470c160bc"
+      "size_bytes": 38754,
+      "sha256": "dcfe0cb5b96825a3c0d18e55955338cad0ad56cbdc06f3cc3374244762169bab"
     },
     {
       "name": "maintenance/mutation_probe.py",
-      "size_bytes": 19650,
-      "sha256": "016948a148095bde2064ba8d6f73ad97f02e506fd25ba3baca22be0ecb2239ac"
+      "size_bytes": 43861,
+      "sha256": "e232a6ebd39d1cac98356d6fc18713176052f33ead59d0949d81548906a73231"
     },
     {
       "name": "MASTER_PROMPT.md",
-      "size_bytes": 109342,
-      "sha256": "fc6086425a1910091eab0746e6464789e2239e7eb683ff2d121b7605a236c71c"
+      "size_bytes": 118663,
+      "sha256": "c69b650edd6870d3b4b4112769d6fc5c2ccd5ed543a9bdfbab9220369d97d989"
     },
     {
       "name": "README.md",
-      "size_bytes": 26372,
-      "sha256": "2e6b39c64351c0b466fc4efb9a21d88011ee753eb0a130f4e716192bddfb4a2f"
+      "size_bytes": 23880,
+      "sha256": "d3f0552b19c7c9e0694843a3e83a977c182dd24cf424d5770ef4df585c7aaa6b"
     },
     {
       "name": "RESUME_PROMPT.md",
-      "size_bytes": 3117,
-      "sha256": "e1a8fe9d3ecbb7620ef76c2e607c56360d55d81dfeeccbcb6c6e6fbf7878c340"
+      "size_bytes": 6191,
+      "sha256": "99cb8ced4e993ca1abe1ff1839dd15327f1c22ba432d85ea9c50941ea6ae3a16"
+    },
+    {
+      "name": "SECURITY_REVIEW.md",
+      "size_bytes": 10947,
+      "sha256": "3aae1ec920e360f80469fd6ea0c7394fce3b872db7ea40f4542e9f63d384d794"
     },
     {
       "name": "SKILL.md",
-      "size_bytes": 8716,
-      "sha256": "4ea971291e2ac7f8f9ae6c0cfae99226d6bf50afd056493ea412da4715cd0e5a"
+      "size_bytes": 9818,
+      "sha256": "c7fe766ed43510a711c3a307006f17b9e9f45dbea858ccc2b56a0559cb492560"
     },
     {
       "name": "START_PROMPT.md",
-      "size_bytes": 6075,
-      "sha256": "c3cd0b0f2a21b0a213615250588edda39624842b66b1ac8724aedc7c43ec00e3"
+      "size_bytes": 6156,
+      "sha256": "ef471d028e49bd7766f854f52449208010d4cd87d67da2117595e123d67d5daf"
     },
     {
       "name": "tools/audit_tools.py",
-      "size_bytes": 261725,
-      "sha256": "b908acca26a81bd321f0a2a4bc490b9f77a2edac29f8f23484697d0d6c70ecdf"
+      "size_bytes": 348080,
+      "sha256": "50ff0d108801a8f0b49a855c0a28c35b6f6dd942053ec0316ff5dd375585cb7e"
     }
   ],
   "note": "This manifest does not hash itself. Hashes establish byte identity, not truth."

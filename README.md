@@ -6,15 +6,11 @@ This is an audit-and-plan workflow, not deployment authorization, a guarantee of
 
 ## Install
 
-Install the whole package, including the prompts, `SECURITY_REVIEW.md` and `tools/`:
-
 ```bash
-npx skills add ultra0xcom/production-readiness-audit -a <agent>
-npx skills add ultra0xcom/production-readiness-audit -a <agent> -g
-npx skills add ultra0xcom/production-readiness-audit -a '*'
+npx skills add ultra0xcom/production-readiness-audit
 ```
 
-Without `-g`, installation is project-local; with it, installation is global. Replace `<agent>` with a flag from the table below. The CLI normally links agent destinations to a canonical copy; `--copy` requests copies. A manually placed package must include the whole folder. Tools exclude a project-local package from the baseline and working copy, but project linters and Git still see it; consider a local `.git/info/exclude` entry.
+The installer asks which agents to install to. Add `-g` to install globally (user-level) instead of into the current project, or `-a <agent>` (repeatable, e.g. `-a claude-code -a codex`) to choose agents without the prompt; the flags are listed in the table below. The whole package is installed, including the prompts, `SECURITY_REVIEW.md` and `tools/`. The CLI normally links agent destinations to a canonical copy; `--copy` requests copies. A manually placed package must include the whole folder. Tools exclude a project-local package from the baseline and working copy, but project linters and Git still see it; consider a local `.git/info/exclude` entry.
 
 The workflow is portable across capable agents; harness-specific loading and invocation controls are documented as verified, documented-only or unverified. Installer discovery (`skills add --list`) establishes that the installer recognizes the package, not that a harness loads it, invokes it correctly or honors its controls.
 

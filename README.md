@@ -57,7 +57,7 @@ Use your harness's explicit invocation syntax followed by a mode and any details
 | `security` | Resume P8 **and** P9; requires a valid P7 interim checkpoint. |
 | `status` | Read-only overview including phase, closure, compatibility, security, live validation and checkpoint state. |
 
-For example, in a slash-command harness: `/production-readiness-audit start Vision: ... Target operation: ...`. Replace the prefix for other harnesses using the table. A run is long and potentially costly; invoke it deliberately. With no mode, the skill asks about a supported resumable run or ambiguity; if loaded implicitly, it asks before creating a run.
+For example, in a slash-command harness: `/production-readiness-audit start Vision: ... Target operation: ...`. Replace the prefix for other harnesses using the table. A run is long and potentially costly; invoke it deliberately. When earlier runs exist, the skill asks before doing anything: resume the open run or start a new one; with only closed runs, re-audit the latest one or start a new independent audit. `start` also asks when an open run could be resumed instead.
 
 For a complete state inspection:
 

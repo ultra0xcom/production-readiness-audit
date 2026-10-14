@@ -266,7 +266,9 @@ SKILL_TEXT = ('${CLAUDE_SKILL_DIR}', 'MASTER_PROMPT.md', 'START_PROMPT.md', 'RES
               FINAL_LINE, 'audit_tools.py\" runs', 'audit_tools.py\" cleanup',
               'P5 reviews non-security findings; P8 reviews security findings',
               'In P9 remove the copy', 'In every new session, including resume, security, re-audit and implementation',
-              'neutral indexes also treat legacy H as security')
+              'neutral indexes also treat legacy H as security',
+              'Never continue or start silently when earlier runs exist',
+              're-audit the latest closed run (Variant B, checks repairs) or start a new independent run')
 SKILL_MAX_BYTES = 14_000  # retained entry-point/context budget; not a harness behavior test
 MASTER_MAX_WORDS = 16_000
 IMPLEMENTATION_TEXT = ('candidate_complete', 'IMPLEMENTATION.md', 'Decisions', 'RESUME_PROMPT.md, Variant B',

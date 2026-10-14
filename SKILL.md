@@ -32,7 +32,7 @@ Run only on explicit user request; no skill controls grant additional permission
 | `security` | `PACKAGE/RESUME_PROMPT.md`, Variant C | P8 AND P9; valid interim checkpoint required |
 | `status` | run `python -B "<PACKAGE>/tools/audit_tools.py" runs --project . --inspect-all`; summarize phase, closure, compatibility, `security_review.status`, live validation and checkpoint state, then end | read-only |
 
-Without a mode word: if `latest_resumable` exists, ask once with your question tool or plain text whether to resume it (recommended) or start a new run. For an incompatible open run, offer only a new linked run; preserve artifacts, never change its schema identifier. Otherwise use `start`; ask if selection or inferred closure (`LEGACY_*`) is ambiguous. Compatible differing prompt identifiers are warnings only. Recovery: master prompt §13.1.
+Never continue or start silently when earlier runs exist; ask once with your question tool or plain text before creating anything. Without a mode word: if `latest_resumable` exists, ask whether to resume it (recommended) or start a new run; if only closed runs exist, ask whether to re-audit the latest closed run (Variant B, checks repairs) or start a new independent run. With `start` while `latest_resumable` exists, ask whether to resume it or start the new run as requested. For an incompatible open run, offer only a new linked run; preserve artifacts, never change its schema identifier. Without earlier runs use `start`; ask if selection or inferred closure (`LEGACY_*`) is ambiguous. Compatible differing prompt identifiers are warnings only. Recovery: master prompt §13.1.
 
 ## 2. Form the assignment
 

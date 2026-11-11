@@ -32,7 +32,7 @@ PROJECT DETAILS (optional - empty means: determine from the project, invent noth
 - Focus areas or known problems (hypotheses to check, not confirmed findings):
 - Product non-goals:
 - Excluded from the audit:
-- Time or cost budget:
+- Time or cost budget (empty means no limit; the mandatory check program is then completed across sessions):
 
 AUTHORIZATIONS FOR THIS RUN
 - Mode AUDIT_AND_PLAN. The product remains unchanged: no product corrections, refactoring, dependency upgrades or lockfile changes; no commits, pushes or deployments; no changes to Git state. Existing user changes remain intact.
@@ -50,5 +50,5 @@ RESULTS
 A new run directory under ./audit-results/ according to master prompt §13. Never overwrite existing runs. Previous-run selection, compatibility and neutral security indexes follow §16: audit-core/2 uses category SECURITY; neutral indexes also treat legacy H as security; classification unknown applies only to runs without the field.
 
 WORKING METHOD
-Begin with P0 and the master quick reference. Follow §16 for phase dispatch, baseline freshness and neutral indexes; §16.1 for validated interim closure, checkpoint recovery, blocked-review handling and P9; §16.2 for session plans, context-economy yields and the global resource budget; §17 for allowed stops. P8 verifies the checkpoint BEFORE reading SECURITY_REVIEW.md. After in-session compaction reread the quick reference, current phase sections, §10 and Appendix A (also SECURITY_REVIEW.md in P8). Keep authorizations and unresolved work persisted; continue unblocked work.
+Begin with P0 and the master quick reference. Pre-register the check program in P2 (§3.2) and begin P7 only when every mandatory non-security check is PASS, FAIL, BLOCKED with evidence or deferred by my recorded decision (§13.2); my checkpoint answer starts the clarified investigation, not a finish line. Follow §16 for phase dispatch, baseline freshness and neutral indexes; §16.1 for validated interim closure, checkpoint recovery, blocked-review handling and P9; §16.2 for session plans, context-economy yields and the global resource budget; §17 for allowed stops. P8 verifies the checkpoint BEFORE reading SECURITY_REVIEW.md. After in-session compaction reread the quick reference, current phase sections, §10 and Appendix A (also SECURITY_REVIEW.md in P8). Keep authorizations and unresolved work persisted; continue unblocked work.
 ```

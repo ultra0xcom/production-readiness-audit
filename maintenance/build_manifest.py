@@ -41,9 +41,19 @@ def package_paths() -> list[Path]:
         candidates = [path for path in PACKAGE.rglob('*') if not any(
             audit_tools.is_excluded(path.relative_to(PACKAGE).as_posix(), [pattern])
             or '/' not in pattern and audit_tools.is_excluded(path.name, [pattern]) for pattern in ignores)]
-    return sorted(path for path in candidates if path.is_file() and path.name != '.git'
+    return sorted(path for path in candidates if readable_file(path) and path.name != '.git'
                   and path.relative_to(PACKAGE).as_posix() != '.audit-workspace.json'
                   and not SKIPPED_DIRS & set(path.relative_to(PACKAGE).parts))
+
+
+def readable_file(path: Path) -> bool:
+    """Whether a candidate is a regular file; one that cannot be examined (for example a broken link left in the
+    package folder) stops the build with its name instead of a traceback."""
+    try:
+        return path.is_file()
+    except OSError as exc:
+        raise SystemExit(f'Cannot examine {path.relative_to(PACKAGE).as_posix()} ({exc.strerror or exc}): remove it '
+                         'from the package folder or add it to .gitignore, then build again.') from exc
 
 
 def package_files() -> list[dict[str, object]]:

@@ -2,7 +2,7 @@
 """Tools for the Production Readiness System Audit.
 
 Commands:
-  init       create a run directory with a unique RUN_ID and capture the start baseline
+  init       create a run directory with a unique RUN_ID, capture the start baseline and write the audit.json skeleton
   runs       list existing runs under audit-results/ with version, phase and closure status
   baseline   capture project state or compare it with an earlier state (including side effects)
   workspace  create and check an isolated working copy outside the project
@@ -11,7 +11,8 @@ Commands:
   cleanup    remove a working copy; only with a marker, no overlap with the original, without following links
   envkeys    show keys and value shapes of .env files without printing values
   validate   check audit.json against the audit-core/2 core data contract
-  checkpoint create or verify the immutable interim checkpoint
+  checkpoint create, verify or restore the immutable interim checkpoint
+  close      record the closure of a run after final validation, or its supersession by a linked run
   selftest   run positive and negative controls of these tools
   example    print a minimal valid audit.json
 
@@ -24,11 +25,22 @@ strength of evidence or completeness of an audit.
 """
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 10):
+    sys.stderr.write(f'audit_tools.py requires Python 3.10 or newer, found {sys.version.split()[0]}; '
+                     'run it with python3 or py -3.10.\n')
+    sys.exit(2)
+
 import argparse
+import base64
+import bisect
 import codecs
 import copy
 import fnmatch
 import hashlib
+import html
+import itertools
 import json
 import locale
 import os
@@ -38,23 +50,23 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
+from bisect import bisect_left
 from collections import deque
-from stat import S_ISLNK
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import unquote
+from urllib.parse import quote, quote_plus, unquote
 
 if os.name == 'nt':
     import ctypes
     from ctypes import wintypes
 
-TOOL_VERSION = '3.0.0'
-PROMPT_VERSION = '5.0'
+TOOL_VERSION = '3.1.0'
+PROMPT_VERSION = '5.1'
 SCHEMA_VERSION = 'audit-core/2'
 DEFAULT_RESULTS_DIRNAME = 'audit-results'
 WORKSPACE_MARKER = '.audit-workspace.json'
@@ -80,8 +92,21 @@ CREDENTIAL_FILE_PATTERNS = (
     '.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', '*.jks', '*.keystore', 'id_rsa*', 'id_ed25519*',
     'id_ecdsa*', '*.kdbx', 'credentials*.json', 'service-account*.json', '.npmrc', '.pypirc', '.netrc',
     '.git-credentials', '.htpasswd', '.pgpass', '.my.cnf', 'kubeconfig*', '*.tfstate', '*.tfstate.*', '*.ovpn',
-    '.dockercfg', 'auth.json',
+    '.dockercfg', 'auth.json', '*.env', '.envrc', '_netrc', 'pgpass.conf', 'credentials', 'local.settings.json',
+    '.env-*', '.env_*', '.envrc*', '.dev.vars', 'token.json', '*adminsdk*.json', 'application_default_credentials.json',
+    'id_dsa*', 'id_xmss*', '*.p8', '*.ppk', '.vault-token', '.s3cfg', '.boto', '.terraformrc', 'terraform.rc',
+    'htpasswd', '.yarnrc.yml', '.yarnrc',
 )
+CREDENTIAL_PATH_SUFFIXES = ('/.docker/config.json', '/.kube/config')  # matched against '/' + the project-relative path
+# Names above that are credentials only with this content (when the file can be read): certificates and CA bundles
+# are .pem files without a private key (PEM, PGP, or SSH2/RFC 4716 armour); .yarnrc.yml and .yarnrc hold settings
+# unless they carry a registry credential.
+CREDENTIAL_CONTENT_RULES = (('*.pem', re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----'
+                                                 r'|---- BEGIN SSH2 [A-Z0-9 ]*PRIVATE KEY ----')),
+                            ('.yarnrc.yml', re.compile(r'npmAuth(?:Token|Ident)')),
+                            ('.yarnrc', re.compile(r'_auth(?:Token)?')))
+# Public keys and templates are never credentials, whatever pattern above their name matches.
+PUBLIC_FILE_SUFFIXES = ('.pub', '.example', '.sample', '.template', '.dist', '.schema')
 SECRET_HINT_PATTERNS = ('*secret*', '*credential*', '*.tfvars')
 SECRET_FILE_ALLOWED = frozenset({'.env.example', '.env.sample', '.env.template', '.env.dist', '.env.defaults'})
 SENSITIVE_ENV_NAME = re.compile(
@@ -97,14 +122,41 @@ STRIPPED_ENV_PREFIXES = (
     'SUPABASE_', 'FIREBASE_', 'SENTRY_', 'STRIPE_', 'TWILIO_', 'SENDGRID_', 'OPENAI_', 'ANTHROPIC_', 'MISTRAL_',
     'COHERE_', 'GROQ_', 'HF_', 'HUGGING', 'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASS', 'PGSERVICE',
     'MYSQL_', 'MONGO', 'REDIS_', 'DATABASE_', 'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN',
-    'GITLAB_', 'CI_JOB_TOKEN',
+    'GITLAB_', 'CI_JOB_TOKEN', 'SSH_AUTH_SOCK', 'GPG_AGENT_INFO',
 )
+# Repository-local Git variables of the caller (git rev-parse --local-env-vars, plus GIT_NAMESPACE and the numbered
+# GIT_CONFIG_KEY_n/VALUE_n): an exported GIT_DIR would point the tool's own Git calls and every Git call of a command
+# in the copy at another repository. Removed from both, also with --inherit.
+GIT_REPOSITORY_ENV = frozenset({
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_OBJECT_DIRECTORY',
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_GRAFT_FILE', 'GIT_INDEX_FILE', 'GIT_NO_REPLACE_OBJECTS',
+    'GIT_REPLACE_REF_BASE', 'GIT_PREFIX', 'GIT_SHALLOW_FILE', 'GIT_COMMON_DIR', 'GIT_NAMESPACE',
+})
+GIT_CONFIG_ENTRY_ENV = re.compile(r'^GIT_CONFIG_(?:KEY|VALUE)_\d+$', re.IGNORECASE)
+
+
+def git_repository_variable(name: str) -> bool:
+    return name.upper() in GIT_REPOSITORY_ENV or bool(GIT_CONFIG_ENTRY_ENV.match(name))
 NEVER_STRIPPED_ENV = frozenset({'PATH', 'PATHEXT', 'SYSTEMROOT', 'COMSPEC', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
                                 'APPDATA', 'LOCALAPPDATA', 'PWD', 'SHELL', 'LANG'})
 # Environment only: do not broaden the assignment scanner's name grammar.
 SENSITIVE_ENV_ONLY_NAME = re.compile(r'(?:^|[._-])AUTH$|^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$'
-                                     r'|^DOCKER_AUTH_CONFIG$|^BUNDLE_\w*__',  # Bundler: BUNDLE_<HOST>=user:pass
+                                     r'|^DOCKER_AUTH_CONFIG$|^BUNDLE_\w*__'  # Bundler: BUNDLE_<HOST>=user:pass
+                                     # pre-shared keys, seeds and recovery words, peppers, refresh and bearer tokens,
+                                     # mesh VPN keys, licence keys, OpenTelemetry headers (they carry API keys)
+                                     r'|(?:^|[._-])(?:PSK|(?:SEED|MNEMONIC)(?:_PHRASE)?|RECOVERY_CODE|PEPPER|REFRESH)$'
+                                     r'|AUTHKEY$|BEARER|^OTEL_EXPORTER_OTLP_HEADERS$|(?:^|[._-])LICEN[CS]E$'
+                                     # password managers, Sonar, .NET connection strings, short credential suffixes
+                                     r'|^BW_SESSION$|^OP_SESSION_|^SONAR_LOGIN$|_PW$|_CREDS$|^CONNECTIONSTRINGS__|_SALT$',
                                      re.IGNORECASE)
+# A licence name is no secret (LICENSE=Apache-2.0); a licence key looks generated.
+LICENSE_NAME = re.compile(r'(?:^|[._-])LICEN[CS]E$', re.IGNORECASE)
+# A connection string with a password (ADO.NET, ODBC, JDBC URL) under any name.
+CONNECTION_PASSWORD = re.compile(r'(?:^|[;?&\s"\'])(?:password|pwd)[ \t]*=[ \t]*[^;\s]', re.IGNORECASE)
+# The password of a connection string or URL query, recorded from env files as a value of its own.
+CONNECTION_PASSWORD_VALUE = re.compile(r'(?:^|[;?&])[ \t]*(?:password|pwd)[ \t]*=[ \t]*([^;&\s]+)', re.IGNORECASE)
+# The same up to the next `;`, blanks inside included (ADO.NET: `Password=correct horse;User=sa`).
+CONNECTION_PASSWORD_PHRASE = re.compile(r'(?:^|;)[ \t]*(?:password|pwd)[ \t]*=[ \t]*([^;]+)', re.IGNORECASE)
 ENV_SWITCH_VALUES = frozenset({'0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'})
 # Count and key names of GIT_CONFIG_* are stripped together with their values but are no secrets themselves.
 GIT_CONFIG_STRUCTURE_NAME = re.compile(r'^GIT_CONFIG_(?:COUNT|KEY_\d+)$', re.IGNORECASE)
@@ -124,20 +176,98 @@ TOKEN_PATTERNS = (
     ('SLACK_TOKEN', r'\bxox[abposr]-[A-Za-z0-9-]{10,}\b'),
     ('GOOGLE_API_KEY', r'\bAIza[0-9A-Za-z_-]{35}\b'),
     ('JWT', r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'),
+    ('GITLAB_TOKEN', r'\bglpat-[A-Za-z0-9_-]{20,}'),
+    ('NPM_TOKEN', r'\bnpm_[A-Za-z0-9]{36}\b'),
+    ('AGE_SECRET_KEY', r'\bAGE-SECRET-KEY-1[0-9A-Z]{20,}'),
 )
 URL_CREDENTIALS = (r'(?P<prefix>\b[a-zA-Z][a-zA-Z0-9+.-]{0,30}://[^/\s:@\'"]{0,256}:)'
                    r'(?P<secret>[^@\s/\'"]{1,256})(?=@)')
+# User information without a colon (`https://TOKEN@host`) is a token when it is long or looks generated; a short name
+# (`git@github.com`, `ssh://git@host`) is not.
+URL_USERINFO = r'(?P<prefix>\b(?:https?|git|ssh|ftp)://)(?P<token>[^/\s:@\'"?#]{1,256})(?=@)'
+URL_USERINFO_CHARS = 16
 PRIVATE_KEY_BEGIN = re.compile(rb'-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----')  # PEM and PGP
 PRIVATE_KEY_END = re.compile(rb'-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----')
 PRIVATE_KEY_MATERIAL = re.compile(rb'-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]{0,200}?[A-Za-z0-9+/]{40,}')
+# Markers of a private key block in command output: PEM, PGP and ssh.com armor (four dashes and a blank), in any case,
+# also with the dashes escaped as in JSON or code.
+KEY_DASH = rb'(?:-|\\+[uU]002[dD]|\\+x2[dD])'
+KEY_BLOCK_BEGIN = re.compile(KEY_DASH + rb'{4,5} ?BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)? ?' + KEY_DASH + rb'{4,5}',
+                             re.IGNORECASE)
+KEY_BLOCK_END = re.compile(KEY_DASH + rb'{4,5} ?END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)? ?' + KEY_DASH + rb'{4,5}',
+                           re.IGNORECASE)
+# Lines of a private key block in output: armor headers (RFC 1421, RFC 4880) and base64 after a log prefix.
+PEM_ARMOR_HEADER = re.compile(rb'(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset|MessageID):')
+# A base64 run that is no key text: hexadecimal only (a digest), or words separated by `/` (a path).
+KEY_HEX_RUN = re.compile(rb'[0-9A-Fa-f]+')
+KEY_PATH_WORD = rb'(?:(?:[a-z]+(?:[A-Z][a-z]+)*|(?:[A-Z][a-z]+)+|[A-Z]+)[0-9]{0,4}|[0-9]+)?'
+KEY_PATH_RUN = re.compile(KEY_PATH_WORD + rb'(?:/' + KEY_PATH_WORD + rb')+')
+# Key material without armor: PuTTY key files announce their private lines; a JSON Web Key holds its private
+# parameters in the members d, p, q, dp, dq, qi and k (and r, d, t in the entries of `oth`). They are masked wherever
+# `kty` stands in their object: a line with such a member is held back until the object has shown a `kty` or ended,
+# at most JWK_HOLD_LINES lines and JWK_HOLD_BYTES bytes; beyond that only values of JWK_FALLBACK_CHARS or more count.
+PPK_PRIVATE_LINES = re.compile(rb'Private-Lines:[ \t]*(\d{1,4})\b')
+PPK_PRIVATE_LINES_MAX = 200
+JWK_PRIVATE_NAMES = frozenset({b'd', b'p', b'q', b'dp', b'dq', b'qi', b'k', b'r', b't'})
+JWK_TRIGGER = re.compile(rb'\\?"(?:kty|d|p|q|dp|dq|qi|k|r|t)\\?"[ \t]*:')
+JWK_TOKEN = re.compile(rb'"(?:[^"\\\r\n]|\\.)*"|\\"[^"\\\r\n]*\\"|[{}\[\]]')
+JWK_COLON = re.compile(rb'[ \t]*:[ \t]*')
+JWK_SECRET_VALUE = re.compile(rb'\\?"([A-Za-z0-9_+/=-]{16,})\\?"')
+JWK_FALLBACK_CHARS = 32
+JWK_HOLD_LINES = 400
+JWK_HOLD_BYTES = 1 << 18
+JWK_TRACK_LINES = 2000  # lines after which an object that never closes is no longer followed
+# PHP var_dump prints a property name and its value on two lines: `["password":protected]=>` and `string(12) "..."`.
+VAR_DUMP_NAME = re.compile(rb'[ \t]*\["?([A-Za-z_][A-Za-z0-9_-]{0,63})"?(?::[^\]\r\n]{0,128})?\][ \t]*=>[ \t\r\n]*')
+VAR_DUMP_STRING = re.compile(rb'([ \t]*string\(\d+\) ")(.*)("[ \t\r\n]*)$', re.DOTALL)
+PEM_BODY_TOKEN = re.compile(rb'[A-Za-z0-9+/]+={0,2}|=[A-Za-z0-9+/]{4}')
+PEM_BODY_RUN = re.compile(rb'[A-Za-z0-9+/]{32,}')  # base64 key text, wherever a log prefix puts it
+# Text before a short last key line that is a log prefix (`[app] `, `app-1  | `, `INFO:root:`, `msg=`, `> `).
+PEM_LOG_PREFIX = re.compile(rb'[ \t"\'`]*|.*[\]|:>=#)}][ \t"\'`]*')
+PEM_LAST_TOKEN = re.compile(rb'(?:[A-Za-z0-9+/]+={0,2}|=[A-Za-z0-9+/]{4})$')
+# Terminal colour and other CSI sequences, OSC sequences (titles, hyperlinks); removed from the log.
+TERMINAL_CONTROL = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]{0,4096}(?:\x07|\x1b\\)')
+KEY_BLOCK_ORDINARY_LINES = 5  # consecutive ordinary lines that end a key block without its END line
+KEY_BLOCK_AFTERMATH_LINES = 200  # after such an end, lines with key-shaped text stay masked this long
+# Command output: read in chunks, a line ends at \r, \n or \r\n. A line longer than LONG_LINE_BYTES is cut: its
+# beginning is kept up to the last separator in the LONG_LINE_BACK bytes before the bound, the rest is not written.
+READ_CHUNK_BYTES = 65536
+LINE_BREAK = re.compile(rb'\r\n|[\r\n]')
+LONG_LINE_BYTES = 1 << 20
+LONG_LINE_BACK = 1 << 16
+LINE_CUT_SEPARATORS = (b' ', b'\t', b'"', b"'", b',', b';')
+# The omitted rest of such a line is scanned for key block markers; the last OMITTED_SCAN_OVERLAP bytes are kept across
+# chunk borders. The text before a marker in the omitted part is unknown: OMITTED_PREFIX stands for it.
+OMITTED_SCAN_OVERLAP = 1024
+OMITTED_PREFIX = b'\0'
+# Recorded secret values: forms beyond the plain escapes are built up to this length; a value shorter than
+# WHOLE_WORD_BELOW_CHARS (or of letters only) is masked only as a whole word; a line of a multi-line value is recorded
+# on its own from MULTILINE_PART_CHARS characters on.
+SECRET_FORMS_MAX_CHARS = 4096
+WHOLE_WORD_BELOW_CHARS = 12
+ENV_VALUE_MIN_CHARS = 6  # a value given with --env under any name is recorded from this length on
+MULTILINE_PART_CHARS = 8
+# A NAME=VALUE line as .env files, .properties files and shell exports hold it; a quoted value may span lines.
+ENV_FILE_LINE = re.compile(r'[ \t]*(?:export[ \t]+|set[ \t]+)?(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=(?![=>])'
+                           r'[ \t]*(?P<value>.*)')
+ENV_FILE_QUOTED = {'"': re.compile(r'((?:[^"\\]|\\.)*)"', re.DOTALL), "'": re.compile(r"([^']*)'"),
+                   '`': re.compile(r'([^`]*)`')}
+ENV_FILE_VALUE_LINES = 100  # lines a quoted value may span
+ENV_FILE_NESTING = 8  # rounds in which references in the value of a referenced variable are replaced
+ENV_FILE_ESCAPE = re.compile(r'\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|(.))', re.DOTALL)
+ENV_FILE_REFERENCE = re.compile(r'(?<!\\)\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))')
+TAIL_LINE_CHARS = 2000
+SHORT_VALUE_NOTE_NAMES = 20  # names listed in the note on values that are masked only as whole words
+OUTPUT_DRAIN_SECONDS = 600  # after the command ended, output still arriving is read this long
+READER_POLL_SECONDS = 5  # a reader without progress for this long is held up by a background process
 # A name with an assignment, as config dumps, debug output or `docker compose config` print it. The name starts outside
 # paths and words (so `tests/test_token.py::test_x` or `api_key.ts:12:` stay intact), `==` is a comparison and `=>` an
-# assignment (PHP, Ruby). A `:` without a blank or quote after it (`tight`) and a blank before `:` (`gap`) count only in
-# context, see assignment_in_context. A digit, `:` or `/` after a tight `:` never counts (`app.py:12`, `host.test:8443`,
+# assignment (PHP, Ruby; also `[password] => value` as PHP print_r shows it). A `:` without a blank or quote after it
+# (`tight`) and a blank before `:` (`gap`) count only in context, see assignment_in_context. A digit, `:` or `/` after a tight `:` never counts (`app.py:12`, `host.test:8443`,
 # `https://`). A YAML tag (`!!str`) before the value is skipped. Bounded name parts keep long lines linear.
 ASSIGNMENT_NAME = re.compile(
     r'(?<![A-Za-z0-9_./\\])(?P<name>[A-Za-z0-9_][A-Za-z0-9_-]{0,63}(?P<dotted>(?:\.[A-Za-z0-9_-]{1,63}){1,8})?)'
-    r'(?:\\?["\'])?(?P<gap>[ \t]*)(?P<sep>=>|=(?![=>])|:(?=[ \t"\']|\\")|(?P<tight>:(?![\d\s:/\\])))'
+    r'(?:\\?["\']|(?::[A-Za-z_\\][\w\\]{0,127}){0,2}\](?=[ \t]*=>))?(?P<gap>[ \t]*)(?P<sep>=>|=(?![=>])|:(?=[ \t"\']|\\")|(?P<tight>:(?![\d\s:/\\])))'
     r'[ \t]*(?:!!?[A-Za-z0-9_]+[ \t]+)?')
 # Indentation, quotes and list or object starts before a name at the beginning of a line.
 LINE_LEAD = re.compile(r'[ \t"\'{\[,-]*')
@@ -161,7 +291,7 @@ NON_SECRET_VALUES = frozenset({
     'valid', 'missing', 'present', 'refreshed', 'revoked', 'rotated', 'unset', 'found', 'created', 'deleted',
     'updated', 'generated', 'accepted', 'rejected', 'denied', 'granted', 'incorrect', 'success', 'error', 'pending',
     'enabled', 'disabled', 'delivered', 'received', 'skipped', 'redacted', 'hidden', 'masked', 'empty', 'unknown',
-    'bearer', 'basic', 'await', 'lambda', 'function'})
+    'bearer', 'basic', 'await', 'lambda', 'function', 'value'})
 # Kept because they reveal no secret and are evidence: placeholders and variable references, code (calls, subscripts,
 # attributes of known objects, type names), plain URLs under connection names (DATABASE_URL, *_URI) and paths, unless
 # a URL or path part looks generated or the name stands for a password.
@@ -231,7 +361,6 @@ DOMAINS = [chr(code) for code in range(ord('A'), ord('S') + 1)]
 FINDING_CATEGORY = (set(DOMAINS) - {'H'}) | {'SECURITY'}
 RUN_LOG_METHODS = {'UNIT', 'CONTRACT', 'INTEGRATION', 'PRODUCTION_LIKE'}
 END_TO_END_METHODS = {'CONTRACT', 'INTEGRATION', 'E2E', 'PRODUCTION_LIKE', 'MANUAL'}
-UI_EVIDENCE_KINDS = {'UI', 'SCREENSHOT', 'TRACE', 'VIDEO', 'HAR'}
 REVIEW_METHOD = {'READ_CODE', 'RAN_TESTS', 'COMMENT_ONLY'}
 REVIEW_OUTCOME = {'UPHELD', 'LIMITED', 'DISPUTED', 'UNAVAILABLE'}
 SECURITY_STATUS = {'PENDING', 'IN_PROGRESS', 'DONE', 'BLOCKED', 'NOT_APPLICABLE', 'NOT_PERFORMED'}
@@ -316,22 +445,39 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def json_text(data: Any) -> str:
+    """Indented JSON. File names that are not valid UTF-8 (surrogate escapes) make the whole text ASCII with \\u
+    escapes, which read back to the same names."""
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        text = json.dumps(data, ensure_ascii=True, indent=2)
+    return text
+
+
 def write_json_new(path: Path, data: Any) -> None:
-    """Write JSON to a new file; existing evidence is never overwritten."""
+    """Write JSON to a new file; existing evidence is never overwritten. Serialised first, so a failure leaves no
+    empty file."""
+    text = json_text(data) + '\n'
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(path, 'x', encoding='utf-8', newline='\n') as handle:
-            handle.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+            handle.write(text)
     except FileExistsError as exc:
         raise ToolError(f'File already exists and will not be overwritten: {path}') from exc
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding='utf-8-sig'))
+    text = path.read_text(encoding='utf-8-sig')
+    try:
+        return json.loads(text)
+    except RecursionError:  # reported like any other unparsable file
+        raise ValueError('JSON nested too deeply to parse') from None
 
 
 def print_json(data: Any) -> None:
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print(json_text(data))
 
 
 def nonempty(value: Any) -> bool:
@@ -354,9 +500,76 @@ def rel_posix(path: Path, root: Path) -> str | None:
         return None
 
 
+def strip_extended_prefix(text: str) -> str:
+    """Windows: the path without an extended-length prefix (\\\\?\\C:\\x -> C:\\x, \\\\?\\UNC\\s\\x -> \\\\s\\x)."""
+    if os.name != 'nt':
+        return text
+    text = text.replace('/', '\\')
+    if text[:8].upper() == '\\\\?\\UNC\\':
+        return '\\\\' + text[8:]
+    if text[:4] in ('\\\\?\\', '\\??\\'):
+        return text[4:]
+    return text
+
+
+def physical_path(path: Path | str) -> str:
+    """Normalised physical form for containment and equality: extended-length prefix removed, links resolved, case
+    folded on Windows."""
+    text = os.path.realpath(strip_extended_prefix(os.fspath(path)))
+    return os.path.normcase(strip_extended_prefix(text))
+
+
+def cli_path(value: str, option: str) -> Path:
+    """A path from the command line; on Windows without an extended-length prefix. Device and volume paths are
+    refused: the containment guards cannot compare them."""
+    if os.name != 'nt':
+        return Path(value)
+    text = strip_extended_prefix(value)
+    if value.replace('/', '\\').startswith(('\\\\.\\', '\\\\?\\', '\\??\\')) and not re.match(
+            r'^(?:[A-Za-z]:\\|\\\\[^\\?.])', text):
+        raise ToolError(f'{option} {value!r} is a device or volume path; give a drive or UNC path.')
+    return Path(text)
+
+
+def file_identity(path: Path | str) -> os.stat_result | None:
+    """stat of an existing path, or None where it does not exist or the file system reports no file id."""
+    try:
+        info = os.stat(strip_extended_prefix(os.fspath(path)))
+    except (OSError, ValueError):
+        return None
+    return info if info.st_ino else None
+
+
+def same_location(first: Path | str, second: Path | str) -> bool:
+    """The same directory or file: by file identity where both exist (an alias such as a UNC share of a local drive,
+    an extended-length prefix or a link names the same file), else by normalised physical path."""
+    one, two = file_identity(first), file_identity(second)
+    if one is not None and two is not None:
+        return os.path.samestat(one, two)
+    return physical_path(first) == physical_path(second)
+
+
 def is_within(path: Path, root: Path) -> bool:
-    path, root = path.resolve(), root.resolve()
-    return path == root or root in path.parents
+    """path equals root or lies below it. Where root exists, the physical path of path and each of its existing
+    ancestors is compared with root by file identity, so an alias of the root (UNC share of a local drive,
+    extended-length prefix, short name, link) cannot hide containment; a path that does not exist yet is judged by
+    its existing ancestors. The normalised physical text comparison (physical_path) applies as well, and alone where
+    identity is unavailable."""
+    inner, outer = physical_path(path), physical_path(root)
+    if inner == outer or inner.startswith(outer.rstrip(os.sep) + os.sep):
+        return True
+    container = file_identity(root)
+    if container is None:
+        return False
+    current = os.path.realpath(strip_extended_prefix(os.fspath(path)))
+    while True:
+        identity = file_identity(current)
+        if identity is not None and os.path.samestat(identity, container):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
 
 
 def is_excluded(rel: str, patterns: Iterable[str]) -> bool:
@@ -371,24 +584,111 @@ def has_glob_magic(pattern: str) -> bool:
     return any(char in pattern for char in '*?[')
 
 
-def is_credential_file(rel: str) -> bool:
+def project_relative(value: str, project: Path, option: str) -> str:
+    """Project-relative POSIX form of an --include or --exclude value (path or glob); refuses values outside."""
+    text = value.strip()
+    if os.name == 'nt':  # a POSIX file name may contain a backslash
+        text = strip_extended_prefix(text).replace('\\', '/')
+    if re.match(r'^(?:[A-Za-z]:)?/', text):
+        rel = rel_posix(Path(text), project)
+        if rel is None:
+            raise ToolError(f'{option} {value!r} lies outside the project {project}; give a path inside the project.')
+    else:
+        rel = posixpath.normpath(text) if text else ''
+        if rel == '..' or rel.startswith('../'):
+            raise ToolError(f'{option} {value!r} leaves the project; give a path inside the project.')
+    if rel in ('', '.'):
+        raise ToolError(f'{option} {value!r} names no path inside the project; give a relative path or glob.')
+    return rel
+
+
+def is_junction(path: Path) -> bool:
+    """Windows directory junction or mounted folder: os.walk and Git would follow it like a directory."""
+    try:
+        return getattr(os.lstat(path), 'st_reparse_tag', 0) == 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
+def is_link(path: Path) -> bool:
+    """Symbolic link, or a Windows junction: both lead elsewhere when a path goes through them."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return S_ISLNK(info.st_mode) or getattr(info, 'st_reparse_tag', 0) == 0xA0000003
+
+
+def win32_alias(rel: str) -> bool:
+    """Windows: a path component with a trailing dot or space. Win32 opens such a name as the name without it, so
+    reading it would read another file."""
+    return os.name == 'nt' and any(part not in ('.', '..') and part.endswith(('.', ' ')) for part in rel.split('/'))
+
+
+def is_git_name(name: str) -> bool:
+    """Whether a name is the Git directory or gitfile name; Windows compares names without regard to case."""
+    return (name.lower() if os.name == 'nt' else name) == '.git'
+
+
+def is_credential_file(rel: str, path: Path | None = None) -> bool:
+    """Credential file by name. With the path of a readable regular file, names in CREDENTIAL_CONTENT_RULES count only
+    with their content (a .pem certificate is copied, a .pem private key is not)."""
+    lowered = '/' + rel.lower()
+    name = lowered.rsplit('/', 1)[-1]
+    if name in SECRET_FILE_ALLOWED or name.endswith(PUBLIC_FILE_SUFFIXES):
+        return False
+    if path is not None and not is_link(path):
+        for pattern, needle in CREDENTIAL_CONTENT_RULES:
+            if fnmatch.fnmatchcase(name, pattern):
+                text = read_text_file(path)
+                return text is None or bool(needle.search(text))  # unreadable or binary: withheld
+    return (any(fnmatch.fnmatchcase(name, pattern) for pattern in CREDENTIAL_FILE_PATTERNS)
+            or lowered.endswith(CREDENTIAL_PATH_SUFFIXES))
+
+
+def looks_secret(rel: str, path: Path | None = None) -> bool:
     name = rel.rsplit('/', 1)[-1].lower()
     if name in SECRET_FILE_ALLOWED:
         return False
-    return any(fnmatch.fnmatchcase(name, pattern) for pattern in CREDENTIAL_FILE_PATTERNS)
+    return is_credential_file(rel, path) or any(fnmatch.fnmatchcase(name, pattern) for pattern in SECRET_HINT_PATTERNS)
 
 
-def looks_secret(rel: str) -> bool:
-    name = rel.rsplit('/', 1)[-1].lower()
-    if name in SECRET_FILE_ALLOWED:
-        return False
-    return is_credential_file(rel) or any(fnmatch.fnmatchcase(name, pattern) for pattern in SECRET_HINT_PATTERNS)
+def workspace_marker(directory: Path) -> tuple[dict[str, Any] | None, str]:
+    """The working-copy marker in directory and '', or None and why it does not count. A marker counts when it was
+    written for this directory (workspace_root, compared physically), its project_root exists and the directory does
+    not lie inside that project. Markers without workspace_root need only the last two."""
+    path = directory / WORKSPACE_MARKER
+    try:
+        if not S_ISREG(os.lstat(path).st_mode):
+            return None, 'not a regular file'
+        marker = read_json(path)
+    except FileNotFoundError:
+        return None, 'missing'
+    except (OSError, ValueError, RecursionError) as exc:
+        return None, f'unreadable ({exc.__class__.__name__})'
+    project = marker.get('project_root') if isinstance(marker, dict) else None
+    if not isinstance(project, str) or not project:
+        return None, 'project_root is missing'
+    if not Path(project).is_dir():
+        return None, f'its project_root {project} does not exist'
+    if is_within(directory, Path(project)):
+        return None, f'it lies inside its own project {project}'
+    recorded = marker.get('workspace_root')
+    if recorded is not None and (not isinstance(recorded, str) or not same_location(recorded, directory)):
+        return None, f'it was written for {recorded}, not for this directory'
+    return marker, ''
 
 
-def find_workspace_root(start: Path) -> Path | None:
+def find_workspace_root(start: Path, *, invalid: list[str] | None = None) -> Path | None:
+    """Nearest directory at or above start with a valid working-copy marker (workspace_marker). Invalid markers are
+    skipped and, with `invalid`, listed there with the reason."""
     for candidate in (start, *start.parents):
-        if (candidate / WORKSPACE_MARKER).is_file():
-            return candidate
+        if os.path.lexists(candidate / WORKSPACE_MARKER):
+            marker, reason = workspace_marker(candidate)
+            if marker is not None:
+                return candidate
+            if invalid is not None:
+                invalid.append(f'{candidate / WORKSPACE_MARKER}: {reason}')
     return None
 
 
@@ -398,12 +698,85 @@ def git_available() -> bool:
     return shutil.which('git') is not None
 
 
-def run_git(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> bytes:
-    proc = subprocess.run(['git', '--no-optional-locks', *args], cwd=str(cwd), env=env,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def git_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for the tool's own Git calls: env (default: this process's) without repository-local variables."""
+    return {name: value for name, value in (os.environ if env is None else env).items()
+            if not git_repository_variable(name)}
+
+
+# Caller variables that make the tool's Git calls run programs or read configuration from elsewhere (templates with
+# hooks, other config files, another Git installation); GIT_CONFIG_COUNT/KEY/VALUE and GIT_CONFIG_PARAMETERS are in
+# GIT_LOCAL_ENV.
+GIT_PROGRAM_ENV = frozenset({'GIT_TEMPLATE_DIR', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_EXEC_PATH'})
+# Caller variables that make Git append to or create a file the caller names, anywhere: GIT_TRACE, GIT_TRACE2 and their
+# GIT_TRACE_<NAME> / GIT_TRACE2_<NAME> forms, and GIT_REDIRECT_STDIN/STDOUT/STDERR (Git for Windows reads its input from
+# and writes its output and error output to the file named there).
+GIT_TRACE_ENV = re.compile(r'^GIT_TRACE2?(?:_.*)?$|^GIT_REDIRECT_STD(?:IN|OUT|ERR)$')
+# The three trace2 targets also come from Git's configuration (trace2.normalTarget, trace2.eventTarget,
+# trace2.perfTarget); an environment value of 0 wins over it and disables the target.
+GIT_TRACE_OFF = {'GIT_TRACE2': '0', 'GIT_TRACE2_EVENT': '0', 'GIT_TRACE2_PERF': '0'}
+
+
+def git_writes_file_variable(name: str) -> bool:
+    """Whether a caller variable makes Git write a file; names compare case-insensitively where Windows does."""
+    return bool(GIT_TRACE_ENV.match(name.upper() if os.name == 'nt' else name))
+
+
+# Every Git call of the tool only reads the original repository: no optional locks (no index refresh), no
+# file-system monitor (a daemon or hook program), no hooks (the null device as hooks directory).
+GIT_SAFE_OPTIONS = ('--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + os.devnull)
+
+
+def git_command(args: list[str], env: dict[str, str] | None = None, *,
+                filter_drivers: Iterable[str] = ()) -> tuple[list[str], dict[str, str]]:
+    """Command line and environment of one Git call of the tool (run_git and the direct check-ignore call); the
+    filter drivers named are switched off."""
+    # Windows: without core.longpaths, Git skips paths over 260 characters with only a warning.
+    longpaths = ['-c', 'core.longpaths=true'] if os.name == 'nt' else []
+    # A filter driver is a program the configuration names; an empty command and required=false make Git skip it.
+    filters = [item for driver in filter_drivers for variable, value in
+               (('clean', ''), ('smudge', ''), ('process', ''), ('required', 'false'))
+               for item in ('-c', f'filter.{driver}.{variable}={value}')]
+    environment = {name: value for name, value in git_env(env).items()
+                   if name.upper() not in GIT_PROGRAM_ENV and not git_writes_file_variable(name)}
+    return (['git', *GIT_SAFE_OPTIONS, *longpaths, *filters, *args],
+            {**environment, **GIT_TRACE_OFF, 'GIT_OPTIONAL_LOCKS': '0'})
+
+
+# Git commands of the tool that hash file contents through the filter drivers of the configuration.
+GIT_FILTERING_COMMANDS = frozenset({'status', 'add', 'update-index'})
+
+
+def git_filter_drivers(cwd: Path, env: dict[str, str] | None = None) -> list[str]:
+    """Names of the filter drivers the Git configuration seen from cwd defines (reading it runs nothing)."""
+    command, environment = git_command(['config', '-z', '--get-regexp', r'^filter\.'], env)
+    proc = subprocess.run(command, cwd=str(cwd), env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode not in (0, 1):  # 1: no filter defined
+        raise ToolError(f'git config failed: {proc.stderr.decode("utf-8", "replace").strip()}')
+    drivers: dict[str, None] = {}
+    for item in proc.stdout.decode('utf-8', 'surrogateescape').split('\0'):
+        name = item.split('\n', 1)[0][len('filter.'):].rpartition('.')[0]
+        if name:
+            drivers[name] = None
+    for name in drivers:
+        if '=' in name or '\n' in name:
+            raise ToolError(f'The Git filter driver {name!r} cannot be switched off for the tool\'s Git calls. '
+                            'Rename it in the Git configuration or define it without "=" in its name.')
+    return list(drivers)
+
+
+def run_git(args: list[str], cwd: Path, env: dict[str, str] | None = None, *, stdin: bytes | None = None,
+            warnings: list[str] | None = None) -> bytes:
+    """Output of a Git command; with `warnings`, what Git printed on stderr despite success is collected there."""
+    filters = git_filter_drivers(cwd, env) if args and args[0] in GIT_FILTERING_COMMANDS else []
+    command, environment = git_command(args, env, filter_drivers=filters)
+    proc = subprocess.run(command, cwd=str(cwd), env=environment,
+                          input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         message = proc.stderr.decode('utf-8', 'replace').strip()
         raise ToolError(f'git {" ".join(args)} failed: {message}')
+    if warnings is not None:
+        warnings.extend(line for line in proc.stderr.decode('utf-8', 'replace').splitlines() if line.strip())
     return proc.stdout
 
 
@@ -419,21 +792,34 @@ def split_z(raw: bytes) -> list[str]:
 
 
 def walk_files(root: Path, prefix: str, anywhere: frozenset[str], top_level: frozenset[str],
-               excluded: list[str] | None = None) -> list[str]:
-    """Files below root (relative, with prefix); symlinked directories count as entries."""
+               excluded: list[str] | None = None, notes: list[str] | None = None,
+               gaps: list[str] | None = None) -> list[str]:
+    """Files below root (relative, with prefix); symlinked directories and junctions count as entries. Junctions go
+    to notes, directories that cannot be read to gaps."""
     result: list[str] = []
-    for current, dirs, files in os.walk(root):
+
+    def unreadable(exc: OSError) -> None:
+        if gaps is not None:
+            where = Path(exc.filename) if exc.filename else root
+            gaps.append(f'Directory not readable, its files are missing: {prefix}{rel_posix(where, root) or where} '
+                        f'({exc.strerror or exc.__class__.__name__})')
+    for current, dirs, files in os.walk(root, onerror=unreadable):
         current_path = Path(current)
         depth_zero = current_path == root
         kept = []
         for name in dirs:
             rel = (current_path / name).relative_to(root).as_posix()
-            if name in anywhere or (depth_zero and name in top_level):
+            if name in anywhere or (depth_zero and name in top_level) or ('.git' in anywhere and is_git_name(name)):
                 if excluded is not None:
                     excluded.append(prefix + rel)
                 continue
-            if (current_path / name).is_symlink():
+            if (current_path / name).is_symlink() or win32_alias(name):  # never entered; an alias is reported later
                 result.append(prefix + rel)
+                continue
+            if is_junction(current_path / name):
+                result.append(prefix + rel)
+                if notes is not None:
+                    notes.append(f'Junction not followed, recorded as a link: {prefix}{rel}')
                 continue
             kept.append(name)
         dirs[:] = kept
@@ -441,49 +827,137 @@ def walk_files(root: Path, prefix: str, anywhere: frozenset[str], top_level: fro
     return result
 
 
-def collect_git(root: Path, prefix: str, depth: int) -> list[tuple[str, bool]]:
-    """(path, tracked) for tracked and untracked, not ignored files; nested repositories file by file."""
-    tracked = set(split_z(run_git(['ls-files', '-z', '--cached'], root)))
-    others = split_z(run_git(['ls-files', '-z', '--others', '--exclude-standard'], root))
+def link_prefix(root: Path, rel: str, cache: dict[str, bool]) -> str | None:
+    """Outermost symbolic link or junction among the parent directories of rel, or None; one lstat per directory."""
+    parts = rel.rstrip('/').split('/')
+    for index in range(1, len(parts)):
+        prefix = '/'.join(parts[:index])
+        if prefix not in cache:
+            cache[prefix] = is_link(root / prefix)
+        if cache[prefix]:
+            return prefix
+    return None
+
+
+def plural(count: int, word: str) -> str:
+    return f'{count} {word}' + ('' if count == 1 else 's')
+
+
+def collect_git(root: Path, prefix: str, depth: int, notes: list[str] | None = None,
+                gaps: list[str] | None = None) -> list[tuple[str, bool]]:
+    """(path, tracked) for tracked and untracked, not ignored files; nested repositories file by file. Git warnings
+    (unreadable directories) go to gaps. A listed path below a symbolic link or junction (an index entry whose
+    directory became a link) is left out and the link counts as the entry it is. Tracked paths outside a sparse
+    checkout (skip-worktree) that are absent are left out with a count, not reported as deleted."""
+    git_warnings: list[str] = []
+    listing = split_z(run_git(['ls-files', '-z', '-t', '--cached'], root, warnings=git_warnings))
+    tracked = {item[2:] for item in listing}
+    sparse = {item[2:] for item in listing if item[:1] == 'S'}
+    others = split_z(run_git(['ls-files', '-z', '--others', '--exclude-standard'], root, warnings=git_warnings))
+    if gaps is not None:
+        gaps.extend(f'Git ({prefix or "."}): {line}' for line in git_warnings)
     result: list[tuple[str, bool]] = []
+    links: dict[str, bool] = {}
+    skipped: dict[str, int] = {}
+    outside_sparse = 0
     for rel in sorted(tracked | set(others)):
         path = root / rel
         name = prefix + rel.rstrip('/')
-        if path.is_dir() and not path.is_symlink():
-            result.extend(expand_nested(path, name + '/', depth + 1, rel in tracked))
+        link = link_prefix(root, rel, links)
+        if link is not None:
+            if link not in skipped:
+                result.append((prefix + link, False))
+                skipped[link] = 0
+            skipped[link] += 1
+        elif rel in sparse and not os.path.lexists(path):
+            outside_sparse += 1
+        elif path.is_dir() and not path.is_symlink() and not is_junction(path):
+            result.extend(expand_nested(path, name + '/', depth + 1, rel in tracked, notes, gaps))
         else:
             result.append((name, rel in tracked))
+    if notes is not None:
+        for link, count in list(skipped.items())[:50]:
+            kind = 'Junction' if is_junction(root / link) else 'Symbolic link'
+            notes.append(f'{kind} not followed, recorded as a link; {plural(count, "path")} through it left out: '
+                         f'{prefix}{link}')
+        if len(skipped) > 50:
+            notes.append(f'{len(skipped) - 50} more links with paths through them left out ({prefix or "."})')
+        if outside_sparse:
+            notes.append(f'{plural(outside_sparse, "tracked path")} outside the sparse checkout (skip-worktree) not '
+                         f'captured: {prefix or "."}')
     return result
 
 
-def expand_nested(path: Path, prefix: str, depth: int, tracked_parent: bool) -> list[tuple[str, bool]]:
-    """Submodules and untracked nested repositories: list their own tracked/untracked files."""
+def uncommitted_paths(project: Path) -> list[str]:
+    """Tracked paths of the project directory with uncommitted changes (staged or not), project-relative, also below a
+    parent repository. status only reads (diff would refresh and write the original's index); a rename or copy
+    counts with its new path, as diff names it."""
+    prefix = run_git(['rev-parse', '--show-prefix'], project).decode('utf-8', 'surrogateescape').strip()
+    items = run_git(['status', '--porcelain=v1', '-z', '--untracked-files=no', '--ignore-submodules=all', '--', '.'],
+                    project).decode('utf-8', 'surrogateescape').split('\0')
+    changed, index = [], 0
+    while index < len(items):
+        item, index = items[index], index + 1
+        if len(item) < 4:
+            continue
+        if item[0] in 'RC':
+            index += 1  # the source path follows the new path
+        changed.append(item[3 + len(prefix):] if item[3:].startswith(prefix) else item[3:])
+    return changed
+
+
+def expand_nested(path: Path, prefix: str, depth: int, tracked_parent: bool, notes: list[str] | None = None,
+                  gaps: list[str] | None = None) -> list[tuple[str, bool]]:
+    """Submodules and untracked nested repositories: list their own tracked/untracked files. Below the depth limit a
+    nested directory is a gap, not silently empty."""
     if depth > 6:
+        if gaps is not None:
+            gaps.append(f'Nested repository below the depth limit of 6 levels not captured: {prefix}')
         return []
     if (path / '.git').exists() and git_available():
         try:
-            nested = collect_git(path, prefix, depth)
+            nested = collect_git(path, prefix, depth, notes, gaps)
         except ToolError:
             nested = None
         if nested is not None:
             # Files of an untracked nested repository are untracked from the project's point of view.
             return [(rel, tracked and tracked_parent) for rel, tracked in nested]
-    files = walk_files(path, prefix, FS_EXCLUDED_ANYWHERE, frozenset())
+    files = walk_files(path, prefix, FS_EXCLUDED_ANYWHERE, frozenset(), notes=notes, gaps=gaps)
     return [(rel, False) for rel in files]
 
 
+def physically_inside(project: Path) -> Callable[[Path], bool]:
+    """inside(path): the physical directory of path lies in the physical project (one lookup per directory). A regular
+    file reached through a directory link that leaves the project is never read."""
+    cache: dict[str, bool] = {}
+
+    def inside(path: Path) -> bool:
+        parent = os.fspath(path.parent)
+        if parent not in cache:
+            cache[parent] = is_within(Path(parent), project)
+        return cache[parent]
+    return inside
+
+
 def digest_entry(path: Path) -> str:
-    if path.is_symlink():
+    if path.is_symlink() or is_junction(path):
         return 'symlink:' + sha256_bytes(os.readlink(path).encode('utf-8', 'surrogateescape'))
     if path.is_dir():
         return 'dir'
     return sha256_file(path)
 
 
-def stat_signature(path: Path) -> str:
-    """Content-free state of an ignored entry: size and modification time, summarized for big trees."""
+def stat_signature(path: Path, gaps: list[str] | None = None, rel: str = '') -> str:
+    """Content-free state of an ignored entry: size and modification time, summarized for big trees. Dependency
+    directories: entry count, directory time, total size and newest modification time of the files below (one stat
+    walk, no hashing). Entries that cannot be read go to gaps."""
+    def unreadable(exc: OSError) -> None:
+        if gaps is not None:
+            where = os.path.relpath(exc.filename, path).replace(os.sep, '/') if exc.filename else '.'
+            gaps.append(f'Ignored path not readable, its state is missing: {rel or path.name}/{where} '
+                        f'({exc.strerror or exc.__class__.__name__})')
     try:
-        if path.is_symlink():
+        if path.is_symlink() or is_junction(path):
             return 'symlink:' + sha256_bytes(os.readlink(path).encode('utf-8', 'surrogateescape'))
         if path.is_file():
             stat = path.stat()
@@ -491,24 +965,55 @@ def stat_signature(path: Path) -> str:
         if path.is_dir():
             if path.name in DEPENDENCY_DIRS:
                 stat = path.stat()
-                return f'dir-summary:{sum(1 for _ in os.scandir(path))}:{stat.st_mtime_ns}'
+                size = newest = 0
+                for current, dirs, files in os.walk(path, onerror=unreadable):
+                    current_path = Path(current)
+                    dirs[:] = [d for d in dirs if not is_link(current_path / d)]
+                    for name in files:
+                        try:
+                            info = (current_path / name).lstat()
+                        except OSError as exc:
+                            unreadable(exc)
+                            continue
+                        size, newest = size + info.st_size, max(newest, info.st_mtime_ns)
+                return f'dir-summary:{sum(1 for _ in os.scandir(path))}:{stat.st_mtime_ns}:{size}:{newest}'
             digest, count = hashlib.sha256(), 0
-            for current, dirs, files in os.walk(path):
+            for current, dirs, files in os.walk(path, onerror=unreadable):
                 current_path = Path(current)
-                dirs[:] = sorted(d for d in dirs if d not in DEPENDENCY_DIRS and not (current_path / d).is_symlink())
+                dirs[:] = sorted(d for d in dirs if d not in DEPENDENCY_DIRS and not (current_path / d).is_symlink()
+                                 and not is_junction(current_path / d))
                 for name in sorted(files):
                     file_path = current_path / name
                     try:
                         stat = file_path.lstat()
-                    except OSError:
+                    except OSError as exc:
+                        unreadable(exc)
                         continue
                     line = f'{file_path.relative_to(path).as_posix()}\t{stat.st_size}\t{stat.st_mtime_ns}\n'
                     digest.update(line.encode('utf-8', 'surrogateescape'))
                     count += 1
             return f'dir:{count}:{digest.hexdigest()}'
     except OSError as exc:
+        unreadable(exc)
         return f'error:{exc.__class__.__name__}'
     return 'missing'
+
+
+def original_hooks_dir(project: Path) -> Path:
+    """The hooks directory the repository's own configuration names: the tool's calls set core.hooksPath on the
+    command line, which rev-parse --git-path hooks would report instead."""
+    try:
+        lines = run_git(['config', '--show-scope', '--get-all', 'core.hooksPath'], project).decode(
+            'utf-8', 'surrogateescape').splitlines()
+    except ToolError:  # a Git that lacks --show-scope
+        lines = []
+    configured = [line.split('\t', 1)[1] for line in lines if '\t' in line and not line.startswith('command\t')]
+    if configured and configured[-1]:
+        hooks = Path(os.path.expanduser(configured[-1]))
+        top = Path(run_git(['rev-parse', '--show-toplevel'], project).decode('utf-8', 'surrogateescape').strip())
+        return hooks if hooks.is_absolute() else top / hooks
+    common = Path(run_git(['rev-parse', '--git-common-dir'], project).decode('utf-8', 'surrogateescape').strip())
+    return (common if common.is_absolute() else project / common) / 'hooks'
 
 
 def git_state(project: Path) -> dict[str, str]:
@@ -518,9 +1023,7 @@ def git_state(project: Path) -> dict[str, str]:
             return sha256_bytes(run_git(args, project))
         except ToolError:
             return 'unavailable'
-    hooks_dir = Path(run_git(['rev-parse', '--git-path', 'hooks'], project).decode().strip())
-    if not hooks_dir.is_absolute():
-        hooks_dir = project / hooks_dir
+    hooks_dir = original_hooks_dir(project)
     hooks = []
     if hooks_dir.is_dir():
         hooks = [f'{entry.name}\t{sha256_file(entry)}' for entry in sorted(hooks_dir.iterdir()) if entry.is_file()]
@@ -534,6 +1037,24 @@ def git_state(project: Path) -> dict[str, str]:
         'index': digest(['ls-files', '-s', '-z']),
         'hooks': sha256_bytes('\n'.join(hooks).encode('utf-8')),
     }
+
+
+def check_results_dir(project: Path, value: str | None) -> None:
+    """Refuse a results directory (--results-dir value, default <project>/audit-results) that is the project root or
+    contains it, that is a symbolic link, junction or other reparse point, or that lies in the project below such a
+    component: results, the --record file and the baseline exclusion would then land in the sources or elsewhere."""
+    results = cli_path(value, '--results-dir').absolute() if value else project / DEFAULT_RESULTS_DIRNAME
+    remedy = 'Remove the link, or give --results-dir with a real directory outside the sources.'
+    if is_within(project, results):
+        raise ToolError(f'Results directory {results} is the project root or contains it. Give --results-dir with a '
+                        'directory for the results, such as <project>/audit-results.')
+    chain = [results, *results.parents]
+    # Inside the project: every component from the results directory up to the project root; outside: itself only.
+    reached = next((index for index, candidate in enumerate(chain) if same_location(candidate, project)), None)
+    for candidate in chain[:1] if reached is None else chain[:reached + 1]:
+        if is_link_or_junction(candidate):
+            raise ToolError(f'Results directory {results}: {candidate} is a symbolic link, junction or other reparse '
+                            f'point, so results would be written where it leads. {remedy}')
 
 
 def default_excludes(project: Path, results_dir: Path | None) -> list[str]:
@@ -550,11 +1071,14 @@ def take_snapshot(project: Path, *, results_dir: Path | None = None, extra_exclu
                   mode: str = 'auto', fs_default_excludes: bool = True,
                   with_side_effects: bool = True) -> tuple[dict[str, Any], dict[str, bool | None]]:
     """Fingerprint of the product files plus content-free state of ignored files and Git metadata."""
-    project = project.resolve()
+    project = cli_path(os.fspath(project), '--project').resolve()
     if not project.is_dir():
         raise ToolError(f'Project directory not found: {project}')
-    excludes = default_excludes(project, results_dir) + [p.replace('\\', '/') for p in extra_excludes]
+    extra = [project_relative(pattern, project, '--exclude') for pattern in extra_excludes]
+    excludes = default_excludes(project, results_dir) + extra
+    unmatched = set(extra)
     notes: list[str] = []
+    gaps: list[str] = []
     if mode == 'auto':
         marker = find_git_marker(project)
         mode = 'git' if marker and git_available() else 'filesystem'
@@ -562,8 +1086,9 @@ def take_snapshot(project: Path, *, results_dir: Path | None = None, extra_exclu
             notes.append('Git repository detected, but git is unavailable: filesystem mode.')
         if mode == 'git' and marker != project:
             # The project lives inside a repository above it; that repository's ignore rules decide what counts.
-            ignored = subprocess.run(['git', '--no-optional-locks', 'check-ignore', '-q', '.'], cwd=str(project),
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            command, environment = git_command(['check-ignore', '-q', '.'])
+            ignored = subprocess.run(command, cwd=str(project), env=environment, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL).returncode == 0
             if ignored:
                 mode = 'filesystem'
                 notes.append(f'The project is inside a parent Git repository ({marker}) that ignores it: '
@@ -574,13 +1099,12 @@ def take_snapshot(project: Path, *, results_dir: Path | None = None, extra_exclu
     excluded_dirs: list[str] = []
     git_info: dict[str, Any] | None = None
     if mode == 'git':
-        entries = collect_git(project, '', 0)
+        entries = collect_git(project, '', 0, notes, gaps)
         try:
             head: str | None = run_git(['rev-parse', '-q', '--verify', 'HEAD'], project).decode().strip() or None
         except ToolError:
             head = None
-        changed = split_z(run_git(['diff', '--name-only', '-z', 'HEAD'] if head
-                                  else ['diff', '--name-only', '-z', '--cached'], project))
+        changed = uncommitted_paths(project)
         git_info = {
             'head': head,
             'branch': run_git(['rev-parse', '--abbrev-ref', 'HEAD'], project).decode().strip() if head else None,
@@ -590,25 +1114,52 @@ def take_snapshot(project: Path, *, results_dir: Path | None = None, extra_exclu
     else:
         anywhere = FS_EXCLUDED_ANYWHERE if fs_default_excludes else frozenset({'.git', '.hg', '.svn'})
         top_level = FS_EXCLUDED_TOP_LEVEL if fs_default_excludes else frozenset()
-        entries = [(rel, None) for rel in walk_files(project, '', anywhere, top_level, excluded_dirs)]
+        entries = [(rel, None) for rel in walk_files(project, '', anywhere, top_level, excluded_dirs, notes, gaps)]
     files: dict[str, str] = {}
     tracked: dict[str, bool | None] = {}
     deleted: list[str] = []
+    special: list[str] = []
     total = 0
+    inside = physically_inside(project)
     for rel, is_tracked in entries:
         if is_excluded(rel, excludes):
+            unmatched -= {pattern for pattern in unmatched if is_excluded(rel, [pattern])}
             continue
         path = project / rel
-        if not path.exists() and not path.is_symlink():
-            deleted.append(rel)
+        if win32_alias(rel):
+            gaps.append(f'Name that Windows opens as another file (trailing dot or space), not read: {rel}')
             continue
-        files[rel] = digest_entry(path)
+        try:
+            info = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            if is_tracked is True:
+                deleted.append(rel)
+            else:  # just listed by Git or the walk, so not reachable rather than deleted
+                gaps.append(f'Listed but not reachable: {rel}')
+            continue
+        except OSError as exc:
+            raise ToolError(f'Cannot read {rel}: {exc.strerror or exc}. Fix its permissions or leave it out with '
+                            f'--exclude {rel}.') from exc
+        if not (S_ISREG(info.st_mode) or S_ISLNK(info.st_mode) or S_ISDIR(info.st_mode)):
+            special.append(rel)  # FIFO, socket or device: opening a FIFO would block
+            continue
+        if S_ISREG(info.st_mode) and not inside(path):
+            gaps.append(f'Reached through a link that leaves the project, not read: {rel}')
+            continue
+        try:
+            files[rel] = digest_entry(path)
+        except OSError as exc:
+            raise ToolError(f'Cannot read {rel}: {exc.strerror or exc}. Fix its permissions or leave it out with '
+                            f'--exclude {rel}.') from exc
         tracked[rel] = is_tracked
-        if path.is_file() and not path.is_symlink():
-            total += path.stat().st_size
+        if S_ISREG(info.st_mode):
+            total += info.st_size
     if git_info is not None:
         git_info['untracked_files'] = sum(1 for value in tracked.values() if value is False)
         git_info['deleted_tracked_files'] = deleted[:200]
+    if special:
+        notes.append(f'{len(special)} non-regular files (FIFO, socket, device) skipped without opening: '
+                     + ', '.join(special[:20]))
     if not files:
         notes.append('No project files captured: check project root, mode and exclusions before the run '
                      'builds on this baseline.')
@@ -623,13 +1174,29 @@ def take_snapshot(project: Path, *, results_dir: Path | None = None, extra_exclu
             meta_state = git_state(project)
         else:
             ignored = excluded_dirs
+        links: dict[str, bool] = {}
         for raw in ignored:
             rel = raw.rstrip('/')
-            if rel and not is_excluded(rel, excludes):
-                side_state[rel] = stat_signature(project / rel)
+            if not rel or link_prefix(project, rel, links) is not None:
+                continue
+            if is_excluded(rel, excludes):
+                unmatched -= {pattern for pattern in unmatched if is_excluded(rel, [pattern])}
+            elif win32_alias(rel):
+                gaps.append(f'Name that Windows opens as another file (trailing dot or space), not read: {rel}')
+            else:
+                side_state[rel] = stat_signature(project / rel, gaps, rel)
+        if any(value.startswith('dir-summary:') for value in side_state.values()):
+            notes.append('Dependency directories (' + ', '.join(sorted(DEPENDENCY_DIRS)) + ') are summarised by '
+                         'entry count, total size and newest modification time, not hashed.')
+    notes.extend(f'Exclusion matches no path: {pattern}' for pattern in extra if pattern in unmatched)
+    if gaps:
+        notes.append(f'Incomplete: {len(gaps)} directories or paths could not be read and are missing from the '
+                     'state; fix access or exclude them, then capture again.')
+        notes.extend(gaps[:50])
     snapshot = {
         'tool': 'audit_tools.py', 'tool_version': TOOL_VERSION, 'captured_at_utc': utc_now(),
         'project_root': str(project), 'mode': mode, 'git': git_info, 'excludes': excludes,
+        'fs_default_excludes': fs_default_excludes, 'incomplete': bool(gaps),
         'excluded_dirs': excluded_dirs[:200], 'notes': notes, 'file_count': len(files), 'total_bytes': total,
         'content_fingerprint': fingerprint,
         'lockfiles': [{'path': rel, 'sha256': files[rel]} for rel in sorted(files)
@@ -649,8 +1216,20 @@ def snapshot_summary(snap: dict[str, Any]) -> dict[str, Any]:
         'uncommitted_changes': git_info.get('uncommitted_changes'), 'untracked_files': git_info.get('untracked_files'),
         'ignored_entries_tracked': len(snap.get('ignored_state') or {}), 'excluded_dirs': snap.get('excluded_dirs', []),
         'lockfiles': [item['path'] for item in snap['lockfiles']], 'excludes': snap['excludes'],
-        'notes': snap.get('notes', []),
+        'incomplete': snap.get('incomplete', False), 'notes': snap.get('notes', []),
     }
+
+
+def same_signature(old: Any, new: Any) -> bool:
+    """Equal ignored-entry states. A dependency summary of an older baseline has fewer fields: only the fields both
+    have are compared."""
+    if old == new:
+        return True
+    if isinstance(old, str) and isinstance(new, str) and old.startswith('dir-summary:') and new.startswith('dir-summary:'):
+        old_fields, new_fields = old.split(':'), new.split(':')
+        common = min(len(old_fields), len(new_fields))
+        return old_fields[:common] == new_fields[:common]
+    return False
 
 
 def compare_snapshots(old: dict[str, Any], new: dict[str, Any], limit: int = 50) -> dict[str, Any]:
@@ -676,7 +1255,8 @@ def compare_snapshots(old: dict[str, Any], new: dict[str, Any], limit: int = 50)
     if old_ignored is None or new_ignored is None:
         side['ignored_files'] = 'not comparable (older baseline without side effect data)'
     else:
-        ignored_changes = sorted(k for k in set(old_ignored) | set(new_ignored) if old_ignored.get(k) != new_ignored.get(k))
+        ignored_changes = sorted(k for k in set(old_ignored) | set(new_ignored)
+                                 if not same_signature(old_ignored.get(k), new_ignored.get(k)))
         if ignored_changes:
             side['ignored_files'] = ignored_changes[:limit]
     old_git, new_git = old.get('git_state'), new.get('git_state')
@@ -697,16 +1277,20 @@ def snapshot_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], dict[s
 
 
 def inherit_reference_options(args: argparse.Namespace, reference: dict[str, Any]) -> None:
-    """Compare like with like: without own options, use the excludes and mode of the reference (init --exclude)."""
+    """Compare like with like: without own options, use the excludes, mode and --no-default-excludes of the reference
+    (init --exclude)."""
     if not args.exclude:
         results = Path(args.results_dir).resolve() if args.results_dir else None
         defaults = default_excludes(Path(args.project).resolve(), results)
         args.exclude = [e for e in reference.get('excludes', []) if isinstance(e, str) and e not in defaults]
     if args.mode == 'auto' and reference.get('mode') in ('git', 'filesystem'):
         args.mode = reference['mode']
+    if not args.no_default_excludes and reference.get('fs_default_excludes') is False:
+        args.no_default_excludes = True
 
 
 def cmd_baseline(args: argparse.Namespace) -> int:
+    check_results_dir(cli_path(args.project, '--project').resolve(), args.results_dir)
     old = None
     if args.compare:
         try:
@@ -730,8 +1314,9 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    project = Path(args.project).resolve()
-    results = Path(args.results_dir).resolve() if args.results_dir else project / DEFAULT_RESULTS_DIRNAME
+    project = cli_path(args.project, '--project').resolve()
+    check_results_dir(project, args.results_dir)
+    results = cli_path(args.results_dir, '--results-dir').resolve() if args.results_dir else project / DEFAULT_RESULTS_DIRNAME
     snap, _ = take_snapshot(project, results_dir=results, extra_excludes=args.exclude, mode=args.mode,
                             fs_default_excludes=not args.no_default_excludes)
     head = (snap.get('git') or {}).get('head')
@@ -741,35 +1326,100 @@ def cmd_init(args: argparse.Namespace) -> int:
     while (results / run_id).exists():
         run_id, counter = f'{stamp}_{short}-{counter}', counter + 1
     run_dir = results / run_id
+    results_existed = results.exists()
     run_dir.mkdir(parents=True, exist_ok=False)
-    for sub in ('findings', 'tasks', 'evidence/baseline', 'evidence/logs', 'evidence/audit-tests', 'evidence/ui'):
+    try:
+        init_run_dir(run_dir, run_id, project, snap, head)
+    except (OSError, ValueError, ToolError) as exc:
+        # Leave no half-made run behind: remove what init created a moment ago, and nothing else.
+        remove_tree(run_dir)
+        if not results_existed:
+            try:
+                results.rmdir()
+            except OSError:
+                pass
+        left = f' Not everything could be removed: {run_dir}' if run_dir.exists() else ' The run directory was removed.'
+        raise ToolError(f'init failed ({exc}).{left}') from exc
+    baseline_rel = 'evidence/baseline/baseline-start.json'
+    print_json({'run_id': run_id, 'run_dir': str(run_dir), 'baseline': str(run_dir / baseline_rel),
+                'audit_json': str(run_dir / 'audit.json'), **snapshot_summary(snap)})
+    return 0
+
+
+def init_run_dir(run_dir: Path, run_id: str, project: Path, snap: dict[str, Any], head: str | None) -> None:
+    for sub in ('findings', 'tasks', 'evidence/baseline', 'evidence/logs', 'evidence/audit-tests', 'evidence/ui',
+                'evidence/inventory'):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
     baseline_rel = 'evidence/baseline/baseline-start.json'
     write_json_new(run_dir / baseline_rel, snap)
     now = utc_now()
     write_json_new(run_dir / 'RUN-STATE.json', {
-        'run_id': run_id, 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'phase': 'P0',
-        'created_at_utc': now, 'updated_at_utc': now, 'closed_at_utc': None, 'project_root': str(project),
+        'run_id': run_id, 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'tool_version': TOOL_VERSION,
+        'phase': 'P0', 'created_at_utc': now, 'updated_at_utc': now, 'closed_at_utc': None, 'project_root': str(project),
         'baseline': {'content_fingerprint': snap['content_fingerprint'], 'head': head, 'file': baseline_rel},
-        'run_type': None, 'previous_run_ids': [], 'authorization': None, 'workspace': None, 'size_profile': None,
+        'run_type': 'INITIAL', 'previous_run_ids': [], 'authorization': None, 'workspace': None, 'size_profile': None,
         'checks': {'done': [], 'open': [], 'blocked': []}, 'running_resources': [], 'invalidations': [],
         'next_steps': ['Record authorizations from the start request verbatim',
-                       'Check previous runs in audit-results/ and determine the run type',
-                       'Record capabilities, tools and size profile'],
+                       'Check previous runs in audit-results/; run_type is INITIAL: for a re-audit or upgrade run set '
+                       'run_type and previous_run_ids in RUN-STATE.json and audit.json first',
+                       'Record capabilities, tools and size profile',
+                       'Fill the registers in audit.json incrementally and validate after each work package'],
     })
-    print_json({'run_id': run_id, 'run_dir': str(run_dir), 'baseline': str(run_dir / baseline_rel),
-                **snapshot_summary(snap)})
-    return 0
+    write_json_new(run_dir / 'audit.json', audit_skeleton(run_id, snap, head))
+
+
+def audit_skeleton(run_id: str, snap: dict[str, Any], head: str | None) -> dict[str, Any]:
+    """Valid interim audit.json with empty registers; the run fills it incrementally."""
+    return {
+        'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'run_id': run_id, 'run_type': 'INITIAL',
+        'previous_run_ids': [],
+        'baseline': {'fingerprint': snap['content_fingerprint'], 'captured_at_utc': snap['captured_at_utc'], 'head': head},
+        'scope': {'in_scope': [], 'out_of_scope': [], 'scope_gaps': [], 'size_profile': None},
+        'sources': [],
+        'vision': {'status': 'PARTIAL', 'statement': 'Unknown: the vision has not been determined yet.',
+                   'open_questions': ['Vision not yet assessed.']},
+        'objectives': [], 'invariants': [], 'environments': [], 'components': [], 'requirements': [], 'journeys': [],
+        'domain_matrix': [{'domain': domain, 'applicability': 'UNKNOWN', 'reason': 'Not yet assessed.', 'check_ids': []}
+                          for domain in DOMAINS],
+        'claims': [], 'checks': [], 'evidence': [], 'findings': [], 'tasks': [], 'release_gates': [],
+        'audit_status': 'PARTIAL', 'release_status': 'NOT_DEMONSTRATED', 'residual_risks': [], 'next_actions': [],
+        'security_review': {'status': 'PENDING', 'reason': 'Security review not yet started.', 'started_at_utc': None,
+                            'completed_at_utc': None, 'executed_by': None},
+        'security_scope': [],
+    }
 
 
 # --------------------------------------------------------------------------- workspace
 
 def symlink_is_safe(link: Path, target: str, project: Path) -> bool:
-    """Only relative links that stay inside the project can be recreated without reaching the original."""
-    if os.path.isabs(target) or re.match(r'^[A-Za-z]:', target) or target.startswith(('\\\\', '//')):
-        return False
-    resolved = Path(os.path.normpath(link.parent / target))
-    return is_within(resolved, project)
+    """Only relative links that stay inside the project can be recreated without reaching the original. The target is
+    resolved physically in the original, one component at a time with every link on the way followed; it must never
+    leave the project (self -> . plus self/../<project name>/x would reach the original from a copy)."""
+    root = project.resolve()
+    current = link.parent.resolve()
+    pending = [target]
+    hops = 0
+    while pending:
+        text = pending.pop()
+        if os.path.isabs(text) or re.match(r'^[A-Za-z]:', text) or text.startswith(('\\', '/')):
+            return False
+        parts = [part for part in re.split(r'[\\/]' if os.name == 'nt' else '/', text) if part not in ('', '.')]
+        for index, part in enumerate(parts):
+            step = current.parent if part == '..' else current / part
+            if part != '..' and (step.is_symlink() or is_junction(step)):
+                hops += 1
+                if hops > 40:
+                    return False
+                pending.append('/'.join(parts[index + 1:]) or '.')  # the rest, after the link's own target
+                try:
+                    pending.append(os.readlink(step))
+                except OSError:
+                    return False
+                break
+            current = step
+            if current != root and root not in current.parents:
+                return False
+    return True
 
 
 def scan_secret_content(path: Path) -> list[str]:
@@ -950,6 +1600,10 @@ def sensitive_assignments(text: str) -> Iterator[tuple[str, int, int]]:
             end = value.end(group)
             if group == 'uvalue':
                 end = unclosed_end(text, value.start(group), end, opened)
+                if start and text[start - 1] in '?&':  # a query parameter ends at the next `&` or `#`
+                    query_end = re.search('[&#]', text[value.start(group):end])
+                    if query_end and query_end.start():
+                        end = value.start(group) + query_end.start()
             if is_sensitive_assignment(name, text[value.start(group):end]):
                 skip = end
                 yield name, value.start(group), end
@@ -1017,6 +1671,12 @@ def mask_sensitive_assignments(text: str) -> tuple[str, int]:
     return ''.join(parts) + text[last:], count
 
 
+REFERENCE_NAME = re.compile(r'(?:HEADER|PARAM|PARAMETER|PREFIX|VAR|VARIABLE)S?$', re.IGNORECASE)
+PLACEHOLDER_SECRET_WORDS = frozenset({'changeme', 'changethis', 'replaceme', 'placeholder', 'password', 'passwords',
+                                      'example', 'notasecret', 'notsecret', 'yoursecret', 'yourpassword', 'yourtoken',
+                                      'secretkey', 'mysecret', 'mypassword', 'secretvalue', 'dummy', 'dummysecret'})
+
+
 def worth_recording(value: str) -> bool:
     """Values that `run` masks wherever they appear: long and mixed enough not to hit words, names or paths."""
     classes = sum(bool(re.search(p, value)) for p in ('[a-z]', '[A-Z]', '[0-9]', '[^A-Za-z0-9]'))
@@ -1024,19 +1684,119 @@ def worth_recording(value: str) -> bool:
 
 
 def recordable(name: str, value: str) -> bool:
-    """Passphrases count under password names; URLs and paths only with a generated part."""
+    """A value under a sensitive name counts from 8 characters on, whatever its character classes (passphrases of
+    words included); placeholders like `changeme` do not; URLs and paths only with a generated part."""
     if (PLAIN_URL_VALUE.fullmatch(value) or LOCAL_PATH_VALUE.fullmatch(value)) and not looks_generated(value):
         return False
-    return worth_recording(value) or bool(PASSWORD_NAME.search(name)) and len(value) >= 12
+    if REFERENCE_NAME.search(name):
+        return worth_recording(value)  # names a header, parameter or variable (API_KEY_HEADER=X-API-Key)
+    if LICENSE_NAME.search(name) and not looks_generated(value):
+        return False
+    return len(value) >= 8 and re.sub(r'[^a-z]', '', value.lower()) not in PLACEHOLDER_SECRET_WORDS
+
+
+def sensitive_name(name: str) -> bool:
+    """Whether a name stands for a credential: one rule for the variables that are not passed on, the keys of env files
+    and the options of a command."""
+    return (bool(SENSITIVE_ENV_NAME.search(name) or SENSITIVE_ENV_ONLY_NAME.search(name))
+            and not GIT_CONFIG_STRUCTURE_NAME.match(name))
+
+
+def env_file_assignments(text: str) -> list[tuple[str, str, str]]:
+    """(name, value, quote) of the NAME=VALUE lines of a file that mostly consists of such lines (.env, .properties,
+    shell exports), read as loaders read them: an unquoted value runs to the end of its line, without a comment after
+    whitespace; a quoted value ends at its closing quote, also on a later line, and has its escapes resolved in double
+    quotes. Empty for other files."""
+    lines = text.lstrip('\ufeff').splitlines()
+    found, other, index = [], 0, 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if not line.strip() or line.lstrip()[0] in '#;[':
+            continue
+        match = ENV_FILE_LINE.fullmatch(line)
+        if match is None:
+            other += 1
+            continue
+        raw = match.group('value').strip()
+        quote_char = raw[:1] if raw[:1] in ENV_FILE_QUOTED else ''
+        value = re.sub(r'[ \t]+#.*$', '', raw).rstrip()
+        if quote_char:
+            for extra in range(ENV_FILE_VALUE_LINES):
+                body = '\n'.join([raw[1:], *lines[index:index + extra]])
+                closed = ENV_FILE_QUOTED[quote_char].match(body)
+                if closed or index + extra >= len(lines):
+                    break
+            if closed:
+                index, value = index + extra, closed.group(1)
+            else:
+                quote_char = ''
+        found.append((match.group('name'), value, quote_char))
+    return found if len(found) >= other else []
+
+
+def resolve_escapes(value: str) -> str:
+    """The escapes of a double-quoted value as loaders resolve them: \\n, \\r, \\t, \\xHH and \\uHHHH, and a backslash before
+    a quote, backslash, `$` or backtick; any other escape stays as written."""
+    def one(match: re.Match[str]) -> str:
+        code = match.group(1) or match.group(2)
+        if code:
+            return chr(int(code, 16)) if not 0xD800 <= int(code, 16) <= 0xDFFF else match.group(0)
+        char = match.group(3)
+        return {'n': '\n', 'r': '\r', 't': '\t'}.get(char, char if char in '"\\$\'`' else match.group(0))
+    return ENV_FILE_ESCAPE.sub(one, value)
+
+
+def expand_references(text: str, defined: dict[str, str]) -> str:
+    """`${VAR}` and `$VAR` replaced from the variables of the same file, also where the value of VAR holds references
+    itself, as dotenv-expand and Docker Compose resolve them (a name that is not defined stays as written); a reference
+    cycle stays unresolved after ENV_FILE_NESTING rounds."""
+    for _ in range(ENV_FILE_NESTING):
+        expanded = ENV_FILE_REFERENCE.sub(lambda m: defined.get(m.group(1) or m.group(2), m.group(0)), text)
+        if expanded == text or len(expanded) > SECRET_FORMS_MAX_CHARS:
+            break
+        text = expanded
+    return text
+
+
+def env_file_secrets(text: str) -> list[tuple[str, str]]:
+    """(name, value) to mask from an env file: the value of each sensitive name as written and as a loader reads it
+    (escapes of a double-quoted value resolved, `${VAR}` and `$VAR` replaced from the same file, also nested, `\\$` as
+    `$`), without a trailing `;`; and of every value the password of a URL or of a connection string (`Password=`,
+    `Pwd=`, a blank inside it included)."""
+    assignments = env_file_assignments(text)
+    defined = {name: value for name, value, _ in assignments}
+    found: list[tuple[str, str]] = []
+    for name, value, quote_char in assignments:
+        spellings = [value]
+        if quote_char == '"':
+            spellings.insert(0, resolve_escapes(value))
+        if quote_char != "'":
+            spellings += [expand_references(spelling, defined).replace('\\$', '$') for spelling in spellings[:1]]
+        if not quote_char:
+            spellings += [spelling.rstrip(';').rstrip() for spelling in list(spellings)]
+        spellings = list(dict.fromkeys(spellings))
+        if sensitive_name(name):
+            found += [(name, spelling) for spelling in spellings
+                      if is_sensitive_assignment(name, spelling) and recordable(name, spelling)]
+        for spelling in spellings[:1]:
+            passwords = [m.group('secret') for m in re.finditer(URL_CREDENTIALS, spelling)
+                         if not is_placeholder_url_credential(m, spelling)]
+            passwords += [unquote(password) for password in passwords]
+            passwords += [m.group(1).strip('"\'') for m in CONNECTION_PASSWORD_VALUE.finditer(spelling)]
+            passwords += [m.group(1).strip().strip('"\'') for m in CONNECTION_PASSWORD_PHRASE.finditer(spelling)]
+            found += [(name, password) for password in passwords if recordable('PASSWORD', password)]
+    return list(dict.fromkeys(found))
 
 
 def assignment_secrets(text: str) -> list[tuple[str, str]]:
     """(name, value) of literal secret values assigned to sensitive names or sent as Authorization header, safe to mask
-    wherever they appear."""
+    wherever they appear; for an env file also its values as a loader reads them (env_file_secrets)."""
     found = [(name, text[start:end]) for name, start, end in sensitive_assignments(text)
              if recordable(name, text[start:end])]
-    return found + [('Authorization', m.group('value')) for m in AUTH_HEADER.finditer(text)
-                    if worth_recording(m.group('value')) and is_secret_header_value(m.group('value'))]
+    found += [('Authorization', m.group('value')) for m in AUTH_HEADER.finditer(text)
+              if worth_recording(m.group('value')) and is_secret_header_value(m.group('value'))]
+    return found + [pair for pair in env_file_secrets(text) if pair not in found]
 
 
 def read_text_file(path: Path, limit: int = 2_000_000) -> str | None:
@@ -1073,13 +1833,18 @@ def mentions_original_path(path: Path, needles: list[re.Pattern[str]]) -> bool:
     return text is not None and any(needle.search(text) for needle in needles)
 
 
-def make_git_snapshot(dest: Path) -> dict[str, Any]:
+def make_git_snapshot(dest: Path, files: Iterable[str]) -> dict[str, Any]:
+    """Snapshot commit of the copy; files are all copied paths, including those a .gitignore of the copy matches."""
     if not git_available():
         return {'created': False, 'reason': 'git unavailable'}
+    if os.path.lexists(dest / '.git'):  # a gitfile or repository from elsewhere: git init would act on that one
+        return {'created': False, 'refused': True,
+                'reason': f'{dest / ".git"} exists before git init; Git in the copy could reach another repository. '
+                          'The copy is not usable: create it again in a new directory.'}
     identity = {'GIT_AUTHOR_NAME': 'audit-workspace', 'GIT_AUTHOR_EMAIL': 'audit-workspace@localhost',
                 'GIT_COMMITTER_NAME': 'audit-workspace', 'GIT_COMMITTER_EMAIL': 'audit-workspace@localhost'}
     try:
-        run_git(['init', '-q'], dest)
+        run_git(['init', '-q', '--template='], dest)  # no template: its hooks would run in the copy
         for key, value in (('core.autocrlf', 'false'), ('core.safecrlf', 'false')):
             run_git(['config', key, value], dest)
         exclude = dest / '.git' / 'info' / 'exclude'
@@ -1087,19 +1852,77 @@ def make_git_snapshot(dest: Path) -> dict[str, Any]:
         with open(exclude, 'a', encoding='utf-8') as handle:
             handle.write(f'\n{WORKSPACE_MARKER}\n.audit-home/\n')
         run_git(['add', '-A'], dest)
+        # Copied files that match an ignore rule (tracked-but-ignored in the original, explicit includes) are added
+        # explicitly, so later changes to them show in git status; via stdin, without a command-line length limit.
+        indexed = set(split_z(run_git(['ls-files', '-z', '--cached'], dest)))
+        missing = [rel for rel in files if rel not in indexed]
+        if missing:
+            run_git(['update-index', '--add', '-z', '--stdin'], dest,
+                    stdin=b''.join(rel.encode('utf-8', 'surrogateescape') + b'\0' for rel in missing))
         tree = run_git(['write-tree'], dest).decode().strip()
         commit = run_git(['commit-tree', tree, '--no-gpg-sign', '-m', 'audit workspace snapshot'], dest,
                          env={**os.environ, **identity}).decode().strip()
         run_git(['update-ref', 'HEAD', commit], dest)
     except ToolError as exc:
         return {'created': False, 'reason': str(exc)}
+    except OSError as exc:
+        return {'created': False, 'reason': f'{exc.__class__.__name__}: {exc}'}
     return {'created': True, 'head': commit,
             'hint': 'Side effects of own runs: git status or git diff in the working copy.'}
 
 
+def link_copy_refusal(src: Path, project: Path, refusal: Callable[[str], str] | None) -> str:
+    """Why a link that cannot be created must not become a copy of its target ('' when it may): the target, resolved
+    physically, has to be a regular file in the project that the copy contains under its own name (refusal names
+    what keeps a project path out of the copy)."""
+    physical = os.path.realpath(src)
+    try:
+        if not S_ISREG(os.stat(physical).st_mode):
+            return 'Link target is not a regular file'
+    except OSError:
+        return 'Link target does not exist'
+    target_rel = rel_posix(Path(physical), project)
+    if target_rel is None or target_rel == '.':
+        return 'Link target lies outside the project'
+    return 'Link target is not part of the copy' if refusal is None else refusal(target_rel)
+
+
 def copy_file_or_link(src: Path, dst: Path, rel: str, project: Path, notes: list[dict[str, str]],
-                      unsafe: list[dict[str, str]]) -> bool:
+                      unsafe: list[dict[str, str]], inside: Callable[[Path], bool] | None = None, *,
+                      refusal: Callable[[str], str] | None = None,
+                      not_created: list[dict[str, str]] | None = None) -> bool:
+    """Copy one entry; links only when symlink_is_safe. With inside (physically_inside), a regular file whose
+    directory physically lies outside the project is not read and is listed like an unsafe link. A junction to a
+    directory of the project is recreated as a junction to the same directory of the copy. A link that this system
+    cannot create becomes a copy of its target only where link_copy_refusal allows it; otherwise nothing is created
+    and it is listed in not_created."""
+    not_created = [] if not_created is None else not_created
+    if inside is not None and not inside(src):
+        unsafe.append({'path': rel, 'target': os.path.realpath(src),
+                       'reason': 'Reached through a link that leaves the project: not read'})
+        return False
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if is_junction(src):  # an absolute target: checked and recreated relative to the copy, never to the original
+        target = os.readlink(src)
+        try:
+            relative = os.path.relpath(strip_extended_prefix(target), strip_extended_prefix(str(src.parent)))
+        except ValueError:  # another drive
+            relative = target
+        if not symlink_is_safe(src, relative, project):
+            unsafe.append({'path': rel, 'target': target})
+            return False
+        mirrored = os.path.normpath(os.path.join(str(dst.parent), relative))
+        if not os.path.isdir(mirrored):
+            not_created.append({'path': rel, 'target': target, 'reason': 'Junction target is not part of the copy'})
+            return False
+        try:
+            import _winapi
+            _winapi.CreateJunction(mirrored, str(dst))
+        except OSError as exc:
+            not_created.append({'path': rel, 'target': target,
+                                'reason': f'Junction cannot be created ({exc.strerror or exc.__class__.__name__})'})
+            return False
+        return True
     if src.is_symlink():
         target = os.readlink(src)
         if not symlink_is_safe(src, target, project):
@@ -1108,26 +1931,104 @@ def copy_file_or_link(src: Path, dst: Path, rel: str, project: Path, notes: list
         try:
             os.symlink(target, dst, target_is_directory=src.is_dir())
         except OSError:
-            if not src.is_file():
-                unsafe.append({'path': rel, 'target': target, 'reason': 'Directory link cannot be created'})
+            if src.is_dir():  # nothing is copied through a directory link
+                not_created.append({'path': rel, 'target': target, 'reason': 'Directory link cannot be created'})
+                return False
+            reason = link_copy_refusal(src, project, refusal)
+            if reason:
+                not_created.append({'path': rel, 'target': target, 'reason': reason})
                 return False
             shutil.copy2(src, dst)
             notes.append({'path': rel, 'note': 'Symlink created as a copy'})
         return True
+    if not S_ISREG(src.lstat().st_mode):  # FIFO, socket, device: opening a FIFO would block
+        notes.append({'path': rel, 'note': 'Not a regular file (FIFO, socket or device): skipped without opening'})
+        return False
     shutil.copy2(src, dst)
     return True
 
 
+def glob_project(project: Path, pattern: str) -> list[Path]:
+    """Matches of a project-relative glob. On Windows a '**' pattern is matched against a walk that does not enter
+    junctions: Path.glob follows them, and a junction to a parent repeats the tree until the path breaks."""
+    wanted = pattern.split('/')
+    if os.name != 'nt' or '**' not in wanted:
+        return sorted(project.glob(pattern))
+
+    def matches(parts: list[str], rest: list[str]) -> bool:
+        if not rest:
+            return not parts
+        if rest[0] == '**':
+            return any(matches(parts[index:], rest[1:]) for index in range(len(parts) + 1))
+        return bool(parts) and fnmatch.fnmatch(parts[0], rest[0]) and matches(parts[1:], rest[1:])
+    found = [project] if matches([], wanted) else []
+    for current, dirs, names in os.walk(project):
+        base = Path(current)
+        entries = dirs + names
+        dirs[:] = [name for name in dirs if not is_junction(base / name)]
+        found.extend(base / name for name in entries if matches(list((base / name).relative_to(project).parts), wanted))
+    return sorted(found)
+
+
+def withheld_reason(rel: str, path: Path) -> str:
+    """Why a file is kept out of the copy, '' when it is not: a credential file by name or content rule, or a public
+    variant (example, template, schema, public key) in which the secret scan finds a real-looking credential."""
+    if is_credential_file(rel, path):
+        return 'credential file'
+    name = rel.rsplit('/', 1)[-1].lower()
+    if (name in SECRET_FILE_ALLOWED or name.endswith(PUBLIC_FILE_SUFFIXES)) and not is_link(path):
+        try:
+            strong, weak = result_secret_hits(path)
+        except OSError:
+            return 'public variant that cannot be scanned'
+        found = strong + [hit for hit in weak if not hit.endswith('(Placeholder?)')]
+        if found:
+            return 'secret content: ' + ', '.join(found)
+    return ''
+
+
+def git_entry(rel: str) -> str | None:
+    """The path up to the first component named .git (a repository, gitfile or link), or None."""
+    parts = rel.split('/')
+    for index, part in enumerate(parts):
+        if is_git_name(part):
+            return '/'.join(parts[:index + 1])
+    return None
+
+
 def cmd_workspace(args: argparse.Namespace) -> int:
-    project = Path(args.project).resolve()
-    dest = Path(args.dest).resolve()
+    project = cli_path(args.project, '--project').resolve()
+    check_results_dir(project, args.results_dir)
+    dest = cli_path(args.dest, '--dest').resolve()
     if is_within(dest, project):
         raise ToolError('The working copy must be outside the project tree so project tools do '
                         'not discover it.')
     if is_within(project, dest):
         raise ToolError('The project must not be inside the destination directory.')
+    if dest.exists() and not dest.is_dir():
+        raise ToolError(f'Destination is not a directory: {dest}. Give a new or empty directory.')
     if dest.exists() and any(dest.iterdir()):
         raise ToolError(f'Destination directory is not empty: {dest}')
+    record = cli_path(args.record, '--record').absolute() if args.record else None
+    if record is not None and (record.exists() or record.is_symlink()):
+        raise ToolError(f'Record file already exists and will not be overwritten: {record}. Give a new file name.')
+    if record is not None:
+        results = cli_path(args.results_dir, '--results-dir') if args.results_dir else project / DEFAULT_RESULTS_DIRNAME
+        if is_within(record, dest):
+            raise ToolError(f'Record file lies inside the working copy: {record}. Write it to the evidence directory '
+                            'of the run, for example <run>/evidence/baseline/workspace.json.')
+        if is_within(record, project) and not is_within(record, results):
+            raise ToolError(f'Record file lies inside the original project: {record}. Only its results directory '
+                            f'{results} may hold it, for example <run>/evidence/baseline/workspace.json.')
+    # Validate all includes before anything is written; matches are taken now.
+    include_matches: list[tuple[str, str, list[Path]]] = []
+    for value in args.include or []:
+        pattern = project_relative(value, project, '--include')
+        try:
+            include_matches.append((value, pattern, glob_project(project, pattern)))
+        except (ValueError, NotImplementedError, OSError) as exc:
+            raise ToolError(f'--include {value!r} cannot be used ({exc}); give a path or glob relative to the '
+                            'project.') from exc
     expected: dict[str, Any] | None = None
     reference: dict[str, Any] | None = None
     if args.expect_baseline:
@@ -1144,41 +2045,106 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         expected = {'file': str(Path(args.expect_baseline).resolve()), 'matches': diff['identical'],
                     'changed': diff['changed'][:20], 'added': diff['added'][:20], 'removed': diff['removed'][:20],
                     'excludes_differ': diff['excludes_differ']}
-    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f'Destination cannot be created: {dest} ({exc.strerror or exc}). Give a new or empty '
+                        'directory.') from exc
     withheld: set[str] = set()
-    errors, notes, unsafe, copied, included = [], [], [], [], []
-    for rel, digest in snap['files'].items():
-        if is_credential_file(rel) and tracked.get(rel) is not True:
+    git_entries: set[str] = set()  # never copied: Git in the copy would act on the original repository
+    marker_files: set[str] = set()  # never copied: a marker decides where run counts as inside a working copy
+    errors, notes, unsafe, copied, included, not_created = [], [], [], [], [], []
+    withheld_content: dict[str, str] = {}  # public variants withheld for their content, with the reason
+    inside = physically_inside(project)
+    attempted: set[str] = set()  # membership tests on sets: include walks can be large
+
+    def left_out(rel: str) -> bool:
+        if git_entry(rel) is not None:
+            git_entries.add(git_entry(rel) or rel)
+        elif rel.rsplit('/', 1)[-1] == WORKSPACE_MARKER:
+            marker_files.add(rel)
+        else:
+            return False
+        return True
+
+    def withhold(rel: str, path: Path) -> bool:
+        reason = withheld_reason(rel, path)
+        if reason.startswith('secret content') or reason.startswith('public variant'):
+            withheld_content[rel] = reason
+        return bool(reason)
+
+    def not_in_copy(rel: str) -> str:
+        """Why a project file reached through a link that cannot be created is not copied in its place ('' when the
+        copy contains it under its own name)."""
+        if rel not in snap['files'] or git_entry(rel) is not None or rel.rsplit('/', 1)[-1] == WORKSPACE_MARKER:
+            return 'Link target is not part of the copy (excluded, ignored or left out)'
+        reason = withheld_reason(rel, project / rel)
+        return f'Link target is withheld ({reason})' if reason else ''
+    link_options = {'refusal': not_in_copy, 'not_created': not_created}
+    # links last: a junction is recreated only to a directory the copy already holds
+    for rel, digest in sorted(snap['files'].items(), key=lambda item: item[1].startswith('symlink:')):
+        if left_out(rel):
+            continue
+        if tracked.get(rel) is not True and withhold(rel, project / rel):
             withheld.add(rel)
             continue
         if digest == 'dir':
             (dest / rel).mkdir(parents=True, exist_ok=True)
             continue
+        attempted.add(rel)
         try:
-            if copy_file_or_link(project / rel, dest / rel, rel, project, notes, unsafe):
+            if copy_file_or_link(project / rel, dest / rel, rel, project, notes, unsafe, inside, **link_options):
                 copied.append(rel)
         except OSError as exc:
             errors.append({'path': rel, 'error': str(exc)})
-    for pattern in args.include or []:
+    link_cache: dict[str, bool] = {}
+    for _value, pattern, matches in include_matches:
         explicit = not has_glob_magic(pattern)
-        for src in sorted(project.glob(pattern)):
+        for src in matches:
             if not is_within(src, project):
                 continue
-            candidates = [src] if not src.is_dir() or src.is_symlink() else [
-                Path(current) / name for current, _dirs, names in os.walk(src) for name in names]
+            src_rel = src.relative_to(project).as_posix()
+            if link_prefix(project, src_rel, link_cache) is not None:
+                continue  # reached through a link or junction; the link itself is handled as a link
+            if left_out(src_rel):
+                continue
+            candidates = [src] if not src.is_dir() or src.is_symlink() or is_junction(src) else []
+            if not candidates:
+                for current, dirs, names in os.walk(src):
+                    # Directory links and junctions are entries (recreated through the safety check), never entered;
+                    # .git directories and names Windows would open as another directory are not entered either.
+                    links = [name for name in dirs if (Path(current) / name).is_symlink() or is_junction(Path(current) / name)]
+                    aliases = [name for name in dirs if win32_alias(name)]
+                    dirs[:] = [name for name in dirs if name not in links and name not in aliases and not left_out(
+                        (Path(current) / name).relative_to(project).as_posix())]
+                    candidates.extend(Path(current) / name for name in names + links)
+                    candidates.extend(Path(current) / name for name in aliases)
             for path in candidates:
                 rel = path.relative_to(project).as_posix()
-                if rel in copied or rel in included:
+                if rel in attempted or left_out(rel):
                     continue
-                if is_credential_file(rel) and not (explicit and path == src):
+                if win32_alias(rel):
+                    notes.append({'path': rel, 'note': 'Name that Windows opens as another file (trailing dot or '
+                                                       'space): not copied'})
+                    attempted.add(rel)
+                    continue
+                if not (explicit and path == src) and withhold(rel, path):
                     withheld.add(rel)
                     continue
+                attempted.add(rel)
                 try:
-                    if copy_file_or_link(path, dest / rel, rel, project, notes, unsafe):
+                    if copy_file_or_link(path, dest / rel, rel, project, notes, unsafe, inside, **link_options):
                         included.append(rel)
                         withheld.discard(rel)
+                        withheld_content.pop(rel, None)
                 except OSError as exc:
                     errors.append({'path': rel, 'error': str(exc)})
+    # .git entries of nested repositories and worktrees, also of one without files: a walk that enters no link or
+    # junction lists every one in both modes (Git and the snapshot never list them, they are left out all the same)
+    git_dirs: list[str] = []
+    for rel in [*walk_files(project, '', frozenset({'.git'}), frozenset(), git_dirs), *git_dirs]:
+        if not is_git_name(rel) and git_entry(rel) == rel:
+            git_entries.add(rel)
     mismatches = []
     for rel in copied:
         digest = snap['files'][rel]
@@ -1203,27 +2169,38 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     write_json_new(dest / WORKSPACE_MARKER, {
         'tool_version': TOOL_VERSION, 'created_at_utc': utc_now(), 'project_root': snap['project_root'],
         'baseline_fingerprint': snap['content_fingerprint'],
-        # run masks the values assigned to sensitive names in these files; the marker holds paths only
-        'secret_value_files': value_files[:1000],
+        # the marker counts only in this directory (workspace_marker); the identifier tells copies apart
+        'workspace_root': str(dest), 'workspace_id': os.urandom(16).hex(),
+        # run masks the values assigned to sensitive names in these files (all of them); the marker holds paths only
+        'secret_value_files': value_files,
     })
+    git_snapshot = ({'created': False, 'reason': 'disabled'} if args.no_git_snapshot
+                    else make_git_snapshot(dest, [*copied, *included]))
     unsafe_paths = {item['path'] for item in unsafe}
-    copy_ok = not errors and not mismatches and not unsafe_paths and (expected is None or expected['matches'])
+    copy_ok = (not errors and not mismatches and not unsafe_paths and (expected is None or expected['matches'])
+               and not git_snapshot.get('refused'))
     summary = {
         'dest': str(dest), 'project_root': snap['project_root'], 'mode': snap['mode'],
         'baseline_fingerprint': snap['content_fingerprint'], 'files_copied': len(copied),
         'expected_baseline': expected,
-        'matches_baseline': copy_ok and not withheld,
+        'matches_baseline': copy_ok and not withheld and not not_created,
         'matches_baseline_except_withheld': copy_ok,
         'mismatches': mismatches[:50], 'errors': errors[:50],
-        'withheld_credential_files': sorted(withheld), 'unsafe_symlinks_not_created': unsafe[:50],
+        'withheld_credential_files': sorted(withheld),
+        'withheld_secret_content': [{'path': rel, 'reason': withheld_content[rel]} for rel in sorted(withheld_content)
+                                    if rel in withheld][:100],
+        'unsafe_symlinks_not_created': unsafe[:50], 'links_not_created': not_created[:100],
         'explicitly_included': included[:200],
-        'secret_like_files_copied': sorted(rel for rel in {*copied, *included} if looks_secret(rel)),
+        'secret_like_files_copied': sorted(rel for rel in {*copied, *included} if looks_secret(rel, dest / rel)),
         'secret_content_hits': content_hits[:100], 'secret_value_files': value_files[:100],
+        'secret_value_files_total': len(value_files),
         'original_path_refs': original_refs[:100],
-        'excluded_dirs': snap.get('excluded_dirs', []),
+        'include_unmatched': [value for value, _pattern, matches in include_matches if not matches],
+        'excluded_dirs': snap.get('excluded_dirs', []), 'incomplete': snap['incomplete'],
+        'snapshot_notes': snap['notes'][:50],
         'notes': notes[:50], 'lockfiles': [item['path'] for item in snap['lockfiles']],
-        'git_snapshot': {'created': False, 'reason': 'disabled'} if args.no_git_snapshot
-        else make_git_snapshot(dest),
+        'git_entries_not_copied': sorted(git_entries)[:100], 'marker_files_not_copied': sorted(marker_files)[:100],
+        'git_snapshot': git_snapshot,
         'marker': str(dest / WORKSPACE_MARKER), 'created_at_utc': utc_now(),
     }
     hints = []
@@ -1234,8 +2211,15 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         hints.append('Without --expect-baseline, only the copy is verified against the current project state, not against '
                      'the start baseline of the run.')
     if withheld:
-        hints.append('Credential files were not copied. Create synthetic values for tests or '
-                     'deliberately include non-secret files with --include.')
+        hints.append('Credential files were not copied (withheld_credential_files; withheld_secret_content names public '
+                     'variants withheld for their content). Create synthetic values for tests. A withheld file that '
+                     'holds no secret is copied when named exactly with --include <path> (a glob never copies it); it '
+                     'is then listed in explicitly_included.')
+    if not_created:
+        hints.append('Links that this system cannot create were not recreated (links_not_created): their files or '
+                     'directories are missing in the copy. A file link becomes a copy of its target only when the copy '
+                     'holds that target under its own name. Allow symbolic links (Windows: Developer Mode or the '
+                     'Create symbolic links privilege) and create the copy again if they are needed.')
     if unsafe:
         hints.append('Symlinks targeting paths outside the project were not created so writes cannot reach the '
                      'original.')
@@ -1249,9 +2233,24 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     if snap.get('excluded_dirs'):
         hints.append('Directories were excluded in filesystem mode (excluded_dirs); include them if needed with '
                      '--include.')
+    if snap['incomplete']:
+        hints.append('The copy is incomplete: paths of the project could not be read (snapshot_notes). Fix access or '
+                     'exclude them and create the copy again.')
+    if summary['include_unmatched']:
+        hints.append('Some --include values matched nothing (include_unmatched); check spelling and path.')
+    if git_entries:
+        hints.append('Git metadata (.git directories, gitfiles of worktrees and submodules) was not copied '
+                     '(git_entries_not_copied): nested repositories and worktrees are plain directories in the copy, so '
+                     'Git commands there never reach the original repository.')
+    if marker_files:
+        hints.append(f'Project files named {WORKSPACE_MARKER} were not copied (marker_files_not_copied); they are '
+                     'ignored, only the marker workspace writes for this copy counts.')
+    if git_snapshot.get('refused'):
+        hints.append('No snapshot repository was created because the copy already had a .git entry (git_snapshot): '
+                     'the copy is not usable; create it again in a new directory.')
     summary['hints'] = hints
-    if args.record:
-        write_json_new(Path(args.record), summary)
+    if record is not None:
+        write_json_new(record, summary)
     print_json(summary)
     return 0 if summary['matches_baseline_except_withheld'] else 1
 
@@ -1424,9 +2423,10 @@ def terminate_aborted_command(info: dict[str, Any]) -> str:
     return 'unverified'
 
 class ProcessReaper:
-    """Terminates a command's whole process tree, including detached leftovers.
+    """Terminates a command's process tree, including leftovers detached from their parent.
 
-    Windows: a job object with KILL_ON_JOB_CLOSE; POSIX: the command's own session/process group.
+    Windows: a job object with KILL_ON_JOB_CLOSE. POSIX: the command's own process group; a descendant that starts
+    its own session or process group (setsid, a daemonizing service) leaves the group and is not terminated.
     """
 
     def __init__(self, proc: subprocess.Popen) -> None:
@@ -1479,6 +2479,7 @@ class ProcessReaper:
             return
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
+            self.proc.poll()  # reap the leader: an unreaped zombie keeps its group alive for the whole grace period
             try:
                 os.killpg(self.proc.pid, 0)
             except (ProcessLookupError, PermissionError):
@@ -1516,7 +2517,7 @@ def workspace_secret_values(workspace_root: Path | None) -> dict[str, str]:
 
 def sensitive_env_value(value: str) -> bool:
     return bool(re.search(URL_CREDENTIALS, value) or PRIVATE_KEY_BEGIN.search(value.encode('utf-8', 'replace'))
-                or JSON_AUTH_VALUE.search(value)
+                or JSON_AUTH_VALUE.search(value) or CONNECTION_PASSWORD.search(value)
                 or any(re.search(pattern, value) for _, pattern in TOKEN_PATTERNS))
 
 
@@ -1543,55 +2544,528 @@ def sensitive_values(env: dict[str, str], forced: Iterable[str], min_length: int
         elif len(value) >= min_length and (sensitive_env_value(value) or upper not in NEVER_STRIPPED_ENV
                                            and not GIT_CONFIG_STRUCTURE_NAME.match(upper) and (
                 SENSITIVE_ENV_ONLY_NAME.search(upper)
-                or SENSITIVE_ENV_NAME.search(upper) and value.lower() not in ENV_SWITCH_VALUES | {'null', 'none'})):
+                or SENSITIVE_ENV_NAME.search(upper) and value.lower() not in ENV_SWITCH_VALUES | {'null', 'none'})
+                and not (LICENSE_NAME.search(upper) and not looks_generated(value))):
             values[name] = value
     return values
 
 
+def pem_line_end(raw: bytes) -> bytes:
+    """A line without trailing blanks, quotes and string-literal punctuation (`\\n" +`, `",`)."""
+    while True:
+        trimmed = raw.rstrip(b' \t\r\n"\'`,;+\\')
+        if trimmed.endswith((b'\\n', b'\\r')):
+            trimmed = trimmed[:-2]
+        if trimmed == raw:
+            return raw
+        raw = trimmed
+
+
+def key_body_run(line: bytes) -> bool:
+    """Whether a line holds base64 key text: a run of 32 or more base64 characters with upper case, lower case and a
+    digit or `+`, that is neither hexadecimal only nor a path (words separated by `/`)."""
+    for match in PEM_BODY_RUN.finditer(line):
+        run = match.group()
+        if (re.search(rb'[A-Z]', run) and re.search(rb'[a-z]', run) and re.search(rb'[0-9+]', run)
+                and not KEY_HEX_RUN.fullmatch(run) and not KEY_PATH_RUN.fullmatch(run)):
+            return True
+    return False
+
+
+class KeyBlockMasker:
+    """Which output lines belong to a private key block. A BEGIN marker anywhere in a line starts a block: the text
+    before the marker stays, the marker and the rest of the line are replaced. In a block a line is key text when it
+    holds base64 key text (key_body_run), is an armor header before the first such line, or, directly after key text,
+    is one short base64 token or a checksum after a log prefix; key text is replaced by the marker. A blank line is
+    written as it is and, directly after key text, does not interrupt it. Other lines are written as they are and do
+    not end the block; it ends at its END line, after KEY_BLOCK_ORDINARY_LINES ordinary lines in a row, or with the
+    output. After an end without END line and with key text seen, the same tests go on for
+    KEY_BLOCK_AFTERMATH_LINES lines."""
+
+    def __init__(self) -> None:
+        self.in_block = self.body_seen = False
+        self.prefix = b''
+        # the last key line: 'begin', 'long' (base64 run, armor header) or the length of a short token line
+        self.last_key: str | int = 'begin'
+        self.gap = 0  # ordinary lines since the last key line
+        self.recent = self.header = b''  # the last ordinary line; the one right before the last key line
+        self.ordinary = self.aftermath = 0
+
+    def begin_block(self, prefix: bytes, closed: bool) -> None:
+        """A BEGIN marker was seen after the text prefix; closed: its END marker stood in the same line."""
+        self.in_block = not closed
+        self.prefix, self.last_key, self.gap, self.header = prefix, 'begin', 0, b''
+        self.ordinary = self.aftermath = 0
+        self.body_seen = False
+
+    def masks(self, raw: bytes) -> int | None:
+        """From which byte on this line (terminal control sequences already removed) is replaced by the key marker;
+        None for a line that is written as it is."""
+        begin = KEY_BLOCK_BEGIN.search(raw)
+        if begin:
+            self.begin_block(raw[:begin.start()].strip(), KEY_BLOCK_END.search(raw, begin.end()) is not None)
+            return begin.start()
+        if not self.in_block and not self.aftermath:
+            return None
+        if KEY_BLOCK_END.search(raw):
+            self.in_block, self.aftermath = False, 0
+            return 0
+        if self.aftermath:
+            self.aftermath -= 1
+        line = pem_line_end(raw).lstrip()
+        kind = self.key_text(line)
+        if kind == 'blank':
+            return None
+        if kind is not None:
+            self.header = self.recent if self.gap == 1 else b''
+            self.body_seen = self.body_seen or kind != 'header'
+            self.last_key, self.gap, self.ordinary = 'long' if kind == 'header' else kind, 0, 0
+            return 0
+        self.recent, self.gap, self.ordinary = re.sub(rb'[0-9]', b'0', line), self.gap + 1, self.ordinary + 1
+        if self.in_block and self.ordinary >= KEY_BLOCK_ORDINARY_LINES:
+            self.in_block, self.aftermath = False, KEY_BLOCK_AFTERMATH_LINES if self.body_seen else 0
+        return None
+
+    def key_text(self, line: bytes) -> str | int | None:
+        """The kind of key text this line is ('long', 'header', a token length), 'blank' for a blank line directly
+        after key text, None for an ordinary line."""
+        if key_body_run(line):
+            return 'long'
+        size = len(self.prefix)
+        # the BEGIN line's prefix, also with other digits (timestamps, counters)
+        same_prefix = bool(size) and re.sub(rb'[0-9]', b'0', line[:size]) == re.sub(rb'[0-9]', b'0', self.prefix)
+        rest = (line[size:] if same_prefix else line).strip(b' \t"\'`')
+        if not rest:
+            return 'blank' if self.gap == 0 else None
+        # before the first key text, at the start of the line; after a BEGIN line with other text before the marker
+        # (prose) only behind that same text
+        if (not self.body_seen and PEM_ARMOR_HEADER.match(rest)
+                and (same_prefix or not self.prefix.strip(b' \t"\'`'))):
+            return 'header'
+        # directly after key text, or after a repeated logger header line (`info: App[0]` before each key line)
+        if not (self.gap == 0 or self.gap == 1 and self.header and self.recent == self.header):
+            return None
+        token = rest if PEM_BODY_TOKEN.fullmatch(rest) else None
+        if token is None and not same_prefix and self.last_key != 'begin':
+            last = PEM_LAST_TOKEN.search(rest)
+            if last is not None and PEM_LOG_PREFIX.fullmatch(rest[:last.start()]) is not None:
+                token = last.group()
+        if token is None:
+            return None
+        if self.last_key == 'begin':
+            # a bare token right after the BEGIN line counts only when that line has no prefix text (prose)
+            ok = same_prefix or not self.prefix.strip(b' \t"\'`')
+        elif self.last_key == 'long':
+            ok = True
+        else:  # after a short key line: a narrow block keeps its width; the last line has digits or padding
+            ok = len(token) == self.last_key or re.search(rb'[0-9+/=]', token) is not None
+        return len(token) if ok else None
+
+
+class ContextMasker:
+    """Secrets that only the lines around them reveal: the private lines of a PuTTY key file (after
+    `Private-Lines: <n>`) and the value line after a PHP var_dump property with a sensitive name."""
+
+    def __init__(self) -> None:
+        self.private_lines = 0
+        self.dumped_name = b''
+        self.name_line = False  # the line just examined is such a property line: a name, written as it is
+
+    def mask(self, raw: bytes) -> tuple[bytes, int]:
+        """The line with such secrets replaced, and their number."""
+        self.name_line = False
+        if self.private_lines:
+            self.private_lines -= 1
+            line = pem_line_end(raw).strip()
+            last = PEM_LAST_TOKEN.search(line)
+            if last is not None and PEM_LOG_PREFIX.fullmatch(line[:last.start()]) is not None:
+                return b'[REDACTED:PRIVATE_KEY]' + raw[len(raw.rstrip(b'\r\n')):], 1
+            self.private_lines = 0
+        announced = PPK_PRIVATE_LINES.search(raw)
+        if announced:
+            self.private_lines = min(int(announced.group(1)), PPK_PRIVATE_LINES_MAX)
+        hits = 0
+        name, self.dumped_name = self.dumped_name, b''
+        value = VAR_DUMP_STRING.match(raw) if name else None
+        if value and len(value.group(2)) >= 4 and is_sensitive_assignment(name.decode('ascii'),
+                                                                          value.group(2).decode('utf-8', 'replace')):
+            raw, hits = value.group(1) + b'[REDACTED:' + name + b']' + value.group(3), hits + 1
+        dumped = VAR_DUMP_NAME.fullmatch(raw)
+        if dumped and SENSITIVE_ENV_NAME.search(dumped.group(1).decode('ascii')):
+            self.dumped_name, self.name_line = dumped.group(1), True
+        return raw, hits
+
+
+class JsonFrame:
+    """An open JSON object or array of JwkMasker: its name (the member it is the value of), whether the object has shown
+    a `kty`, and the private members seen in it before that."""
+    __slots__ = ('array', 'name', 'kty', 'candidates')
+
+    def __init__(self, array: bool, name: bytes | None) -> None:
+        self.array, self.name, self.kty = array, name, False
+        self.candidates: list[tuple[list[Any], tuple[int, int]]] = []
+
+
+class JwkMasker:
+    """The private members of a JSON Web Key in output lines (see JWK_PRIVATE_NAMES): masked in every JSON object with a
+    `kty` member, wherever that member stands. A line with such a member is held back while its object has shown no
+    `kty` and is still open; the lines are released in order, with the spans to mask, as soon as the object has shown
+    its `kty` or has ended. Members of the entries of `oth` belong to the key that holds `oth`. More than JWK_HOLD_LINES
+    lines or JWK_HOLD_BYTES bytes held, or a line that ends the output: only values of JWK_FALLBACK_CHARS or more are
+    masked then. Objects that began on an earlier line are followed from the first line with a member of interest."""
+
+    def __init__(self) -> None:
+        self.stack: list[JsonFrame] = []
+        self.held: list[list[Any]] = []  # [raw line, spans to mask] of the lines held back
+        self.size = self.tracked = 0
+        self.overflow = False
+
+    def push(self, view: bytes, raw: bytes, last: bool = False) -> list[tuple[bytes, list[tuple[int, int]]]]:
+        """Takes a line (view: as masked, raw: as read); returns the lines that are final now, with their spans."""
+        if not self.stack and not self.held and JWK_TRIGGER.search(view) is None:
+            return [(raw, [])]
+        entry: list[Any] = [raw, []]
+        self.held.append(entry)
+        self.size += len(raw)
+        self.tracked += 1
+        self.scan(view, entry)
+        if self.tracked > JWK_TRACK_LINES:
+            last = True
+        elif self.size > JWK_HOLD_BYTES or len(self.held) > JWK_HOLD_LINES:
+            self.overflow = True
+            self.fall_back()
+        if last:
+            self.flush_state()
+        return self.release()
+
+    def flush(self) -> list[tuple[bytes, list[tuple[int, int]]]]:
+        """The lines still held back, final: the output ends or a line of another kind follows."""
+        self.flush_state()
+        return self.release()
+
+    def flush_state(self) -> None:
+        self.fall_back()
+        self.stack.clear()
+        self.tracked, self.overflow = 0, False
+
+    def scan(self, view: bytes, entry: list[Any], start: int = 0, end: int | None = None) -> None:
+        """Follows the objects and arrays in view[start:end]; the text of a string with escaped quotes is followed too
+        (JSON inside a JSON string)."""
+        stack, name = self.stack, None
+        for match in JWK_TOKEN.finditer(view, start, len(view) if end is None else end):
+            token = match.group()
+            if token[:1] == b'"' and b'\\"' in token:
+                self.scan(view, entry, match.start() + 1, match.end() - 1)
+                name = None
+            elif token in (b'{', b'['):
+                stack.append(JsonFrame(token == b'[', name))
+                name = None
+            elif token in (b'}', b']'):
+                self.close(token == b']')
+                name = None
+            else:
+                colon = JWK_COLON.match(view, match.end())
+                name = token.strip(b'\\"') if colon else None
+                if name is None:
+                    continue
+                if not stack:  # an object that began on an earlier line
+                    stack.append(JsonFrame(False, None))
+                top = stack[-1]
+                if top.array:
+                    continue
+                if name == b'kty':
+                    top.kty = True
+                    for held, span in top.candidates:
+                        held[1].append(span)
+                    top.candidates = []
+                elif name in JWK_PRIVATE_NAMES:
+                    value = JWK_SECRET_VALUE.match(view, colon.end())
+                    if value:
+                        self.add(top, (entry, value.span(1)))
+        if not stack and end is None:
+            self.tracked, self.overflow = 0, False
+
+    def add(self, frame: JsonFrame, candidate: tuple[list[Any], tuple[int, int]]) -> None:
+        """A private member of the object: masked at once when the object has a `kty`; when the hold limits are used up,
+        by the fallback rule; otherwise it waits."""
+        entry, span = candidate
+        if frame.kty or self.overflow and span[1] - span[0] >= JWK_FALLBACK_CHARS:
+            entry[1].append(span)
+        elif not self.overflow:
+            frame.candidates.append(candidate)
+
+    def close(self, array: bool) -> None:
+        """The end of an array or object: what its object has not shown a `kty` for is dropped, except the members of
+        an entry of `oth`, which go to the key."""
+        while self.stack:
+            frame = self.stack.pop()
+            target = self.stack[-1] if self.stack else None
+            if target is not None and (frame.array and frame.name == b'oth'
+                                       or not frame.array and target.array and target.name == b'oth'):
+                for candidate in frame.candidates:
+                    self.add(target, candidate)
+            if frame.array == array:
+                return
+
+    def fall_back(self) -> None:
+        for frame in self.stack:
+            for entry, span in frame.candidates:
+                if span[1] - span[0] >= JWK_FALLBACK_CHARS:
+                    entry[1].append(span)
+            frame.candidates = []
+
+    def release(self) -> list[tuple[bytes, list[tuple[int, int]]]]:
+        waiting = {id(entry) for frame in self.stack for entry, _ in frame.candidates}
+        done = 0
+        while done < len(self.held) and id(self.held[done]) not in waiting:
+            done += 1
+        released, self.held = self.held[:done], self.held[done:]
+        self.size -= sum(len(raw) for raw, _ in released)
+        return [(raw, spans) for raw, spans in released]
+
+
+class OmittedMarkers:
+    """Key block markers in the omitted rest of an over-long line, found chunk by chunk: only the last
+    OMITTED_SCAN_OVERLAP bytes are kept across chunk borders, so a marker that a border splits is found too.
+    found: a BEGIN marker occurred; closed: its END marker followed in the same line."""
+
+    def __init__(self, kept: bytes) -> None:
+        self.tail = kept[-OMITTED_SCAN_OVERLAP:]  # the end of the written part: a marker may begin there
+        self.found = self.closed = False
+
+    def feed(self, data: bytes) -> None:
+        window = self.tail + data
+        self.tail = window[-OMITTED_SCAN_OVERLAP:]
+        if b'private key' not in window.lower():
+            return
+        seen = len(window) - len(data)  # markers that end before this are known already
+        events = [(match.end(), True) for match in KEY_BLOCK_BEGIN.finditer(window) if match.end() > seen]
+        events += [(match.end(), False) for match in KEY_BLOCK_END.finditer(window) if match.end() > seen]
+        for _, opening in sorted(events):
+            if opening:
+                self.found, self.closed = True, False
+            else:
+                self.closed = self.found
+
+
+def utf16_line(raw: bytes) -> tuple[str, bytes, bytes, str] | None:
+    """(text, bytes before it, bytes after it, encoding) of an output line in UTF-16: lines are split at the bytes of
+    \\r and \\n, so a little-endian line starts with the second byte of the line break before it and a big-endian
+    line ends with the first byte of its own."""
+    if len(raw) < 8 or raw.count(b'\0') * 3 < len(raw):
+        return None
+    end = len(raw.rstrip(b'\r\n'))
+    for encoding, lead, tail in (('utf-16-le', raw[:1] == b'\0', 0), ('utf-16-be', False, int(raw[end - 1:end] == b'\0'))):
+        start = int(lead) + (2 if raw[int(lead):int(lead) + 2] in (b'\xff\xfe', b'\xfe\xff') else 0)
+        body = raw[start:end - tail]
+        high = body[1::2] if encoding == 'utf-16-le' else body[0::2]
+        if len(body) % 2 or len(body) < 8 or high.count(b'\0') * 4 < len(high) * 3:
+            continue
+        try:
+            return body.decode(encoding), raw[:start], raw[end - tail:], encoding
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def console_encodings() -> set[str]:
+    """Windows OEM, ANSI and console output code pages: cmd.exe and older programs print values in them."""
+    if os.name != 'nt':
+        return set()
+    found = set()
+    for page in (_kernel32.GetOEMCP(), _kernel32.GetACP(), _kernel32.GetConsoleOutputCP()):
+        try:
+            if page and page != 65001:
+                found.add(codecs.lookup(f'cp{page}').name)
+        except LookupError:
+            pass
+    return found
+
+
+def secret_forms(value: str) -> list[str]:
+    """A secret as written and in the forms programs print it in: JSON (also with `\\/` and with \\uXXXX for
+    `+ & < > ' "`), Python repr, URL encoding with upper-case and lower-case hex digits, HTML and XML entities,
+    base64, base64url and hexadecimal of the whole value."""
+    forms = [value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1], repr(value)[1:-1],
+             quote(value, safe=''), quote_plus(value, safe='')]
+    if len(value) <= SECRET_FORMS_MAX_CHARS:
+        forms += secret_escape_forms(value) + secret_encoded_forms(value)
+    return [form for index, form in enumerate(forms) if form and form not in forms[:index]]
+
+
+def secret_escape_forms(value: str) -> list[str]:
+    """Escaped spellings beyond the plain JSON and URL forms; each only where it differs from them."""
+    plain = json.dumps(value)[1:-1]
+    upper = [quote(value, safe=''), quote_plus(value, safe=''), quote(value), quote_plus(value)]
+    forms = upper[2:] + [re.sub(r'%[0-9A-F]{2}', lambda m: m.group().lower(), form) for form in upper]
+    forms.append(plain.replace('/', '\\/'))
+    for chars in ('+&<>\'"', '&<>\''):  # System.Text.Json; PowerShell and Json.NET
+        text = plain.replace('\\"', '\\u0022') if '"' in chars else plain
+        forms += [re.sub('[+&<>\']' if '+' in chars else '[&<>\']', lambda m: template % ord(m.group()), text)
+                  for template in ('\\u%04X', '\\u%04x')]
+    named = html.escape(value, quote=False)
+    forms += [html.escape(value), named, named.replace('"', '&quot;').replace("'", '&apos;')]
+    forms += [re.sub('[&<>"\']', lambda m: template % ord(m.group()), value) for template in ('&#%d;', '&#x%X;', '&#x%x;')]
+    return [form for form in forms if form not in (value, plain, upper[0], upper[1])]
+
+
+def secret_encoded_forms(value: str) -> list[str]:
+    """Base64, base64url (with and without padding) and hexadecimal of the whole value."""
+    data = value.encode('utf-8', 'surrogatepass')
+    encoded = base64.b64encode(data).decode('ascii')
+    safe = encoded.replace('+', '-').replace('/', '_')
+    return [encoded, safe, encoded.rstrip('='), safe.rstrip('='), data.hex(), data.hex().upper()]
+
+
+def userinfo_secret(token: str) -> bool:
+    """Whether the user information of a URL without a colon is a token: long, or generated-looking."""
+    return len(token) >= URL_USERINFO_CHARS or looks_generated(token)
+
+
+def whole_word_value(value: str) -> bool:
+    """A recorded value that is masked only as a whole word: shorter than 12 characters or letters only, so that it
+    does not take pieces out of ordinary words, names and paths."""
+    return len(value) < WHOLE_WORD_BELOW_CHARS or value.isalpha()
+
+
+def literal_pattern(literals: Iterable[Any], empty: Any) -> Any:
+    """A regular expression matching any of the literals (all str or all bytes), the longest one where several match,
+    shaped like a prefix tree so a match is tested in time proportional to its length, not to the number of literals."""
+    trie: dict[Any, Any] = {}
+    for literal in literals:
+        node = trie
+        for unit in literal:
+            node = node.setdefault(unit, {})
+        node[None] = {}
+    join = (lambda units: bytes(units)) if isinstance(empty, bytes) else (lambda units: ''.join(units))
+    as_pattern = (lambda text: text.encode('ascii')) if isinstance(empty, bytes) else (lambda text: text)
+
+    def emit(node: dict[Any, Any]) -> Any:
+        parts = []
+        for unit in sorted(key for key in node if key is not None):
+            units, child = [unit], node[unit]
+            while None not in child and len(child) == 1:
+                (unit, child), = child.items()
+                units.append(unit)
+            parts.append(re.escape(join(units)) + emit(child))
+        if not parts:
+            return empty
+        body = parts[0] if len(parts) == 1 else as_pattern('(?:') + as_pattern('|').join(parts) + as_pattern(')')
+        return as_pattern('(?:') + body + as_pattern(')?') if None in node else body
+    return emit(trie)
+
+
+# A whole word in UTF-16 output: not beside a letter, digit or underscore (the letters of Latin-1 included). Any other
+# output is tested as text, as a command line is: decoded as UTF-8, where a byte that is no UTF-8 is no word character.
+WORD_BYTE = rb'[A-Za-z0-9_\x80-\xff]'
+WORD_EDGES = {'utf-16-le': (rb'(?<!' + WORD_BYTE + rb'\x00)', rb'(?!' + WORD_BYTE + rb'\x00)'),
+              'utf-16-be': (rb'(?<!\x00' + WORD_BYTE + rb')', rb'(?!\x00' + WORD_BYTE + rb')')}
+
+
 class Redactor:
-    """Masks secret values and credential patterns in command lines (text) and output (bytes)."""
+    """Masks secret values and credential patterns in command lines (text) and output (bytes). A value shorter than
+    12 characters or of letters only is masked where it stands as a whole word, any other value wherever it occurs."""
 
     def __init__(self, values: dict[str, str]) -> None:
-        patterns: list[tuple[str, str]] = []
+        # dictionaries keep the first marker of each spelling and make building linear in the number of values
+        self._text_markers: dict[str, str] = {}
+        self._byte_markers: dict[bytes, bytes] = {}
+        self._word_text: dict[str, str] = {}
+        self._word_bytes: dict[str, dict[bytes, bytes]] = {family: {} for family in (*WORD_EDGES, '')}
+        self.whole_word_names: list[str] = []
+        encodings = sorted({'utf-8', 'utf-16-le', 'utf-16-be', locale.getpreferredencoding(False) or 'utf-8'}
+                           | console_encodings())
         for name, value in values.items():
             marker = f'[REDACTED:{name}]'
-            patterns.append((value, marker))
             # Multi-line secrets (e.g. PEM keys) appear line by line in output.
-            patterns.extend((line.strip(), marker) for line in value.splitlines() if len(line.strip()) >= 16)
-        patterns.sort(key=lambda item: -len(item[0]))
-        self._text = patterns
-        encodings = sorted({'utf-8', 'utf-16-le', 'utf-16-be', locale.getpreferredencoding(False) or 'utf-8'})
-        self._bytes: list[tuple[bytes, bytes]] = []
-        for value, marker in patterns:
-            for encoding in encodings:
-                try:
-                    pair = (value.encode(encoding), marker.encode(encoding, 'replace'))
-                except (UnicodeEncodeError, LookupError):
-                    continue
-                if pair[0] and pair not in self._bytes:
-                    self._bytes.append(pair)
+            lines = [line.strip() for line in value.splitlines()] if '\n' in value or '\r' in value else []
+            for part in [value] + [line for line in lines if len(line) >= MULTILINE_PART_CHARS]:
+                word = whole_word_value(part)
+                if word and part == value:
+                    self.whole_word_names.append(name)
+                text_markers = self._word_text if word else self._text_markers
+                for form in secret_forms(part):
+                    text_markers.setdefault(form, marker)
+                    for encoding in encodings:
+                        try:
+                            encoded = form.encode(encoding)
+                        except (UnicodeEncodeError, LookupError):
+                            continue
+                        if encoded:
+                            byte_markers = self._word_bytes[encoding if encoding in WORD_EDGES else ''] if word \
+                                else self._byte_markers
+                            byte_markers.setdefault(encoded, marker.encode(encoding, 'replace'))
+        # one pattern shaped like a prefix tree: each position is tested once, also with thousands of values
+        self._values_text = re.compile(literal_pattern(self._text_markers, '')) if self._text_markers else None
+        self._values_bytes = re.compile(literal_pattern(self._byte_markers, b'')) if self._byte_markers else None
+        self._words_text = (re.compile(r'(?<!\w)(?:' + literal_pattern(self._word_text, '') + r')(?!\w)')
+                            if self._word_text else None)
+        self._words_bytes = [(re.compile(WORD_EDGES[family][0] + b'(?:' + literal_pattern(markers, b'') + b')'
+                                         + WORD_EDGES[family][1]), markers)
+                             for family, markers in self._word_bytes.items() if markers and family in WORD_EDGES]
+        decoded = {spelling.decode('utf-8', 'surrogateescape'): marker.decode('utf-8', 'surrogateescape')
+                   for spelling, marker in self._word_bytes[''].items()}
+        self._words_decoded = (re.compile(r'(?<!\w)(?:' + literal_pattern(decoded, '') + r')(?!\w)'), decoded) \
+            if decoded else None
+        self._spans_decoded = re.compile(literal_pattern(self._word_bytes[''], b'')) if self._word_bytes[''] else None
         self._url_text = re.compile(URL_CREDENTIALS)
         self._url_bytes = re.compile(URL_CREDENTIALS.encode())
+        self._userinfo_text = re.compile(URL_USERINFO, re.IGNORECASE)
+        self._userinfo_bytes = re.compile(URL_USERINFO.encode(), re.IGNORECASE)
         self._tokens_text = [(name, re.compile(pattern)) for name, pattern in TOKEN_PATTERNS]
         self._tokens_bytes = [(name.encode(), re.compile(pattern.encode())) for name, pattern in TOKEN_PATTERNS]
 
+    @property
+    def longest_value(self) -> int:
+        """Length in bytes of the longest secret spelling (read ahead before an over-long line is cut)."""
+        return max((len(spelling) for markers in (self._byte_markers, *self._word_bytes.values()) for spelling in markers),
+                   default=0)
+
+    def match_spans(self, value: bytes) -> list[tuple[int, int]]:
+        """Where secret values, credential URLs and tokens stand in this text (an over-long line is cut before them)."""
+        patterns = [self._url_bytes] + [pattern for _, pattern in self._tokens_bytes]
+        patterns += [pattern for pattern, _ in self._words_bytes]
+        if self._spans_decoded is not None:
+            patterns.append(self._spans_decoded)
+        if self._values_bytes is not None:
+            patterns.append(self._values_bytes)
+        return [m.span() for pattern in patterns for m in pattern.finditer(value)]
+
     def redact_text(self, value: str) -> str:
-        for secret, marker in self._text:
-            value = value.replace(secret, marker)
+        if self._values_text is not None:
+            value = self._values_text.sub(lambda m: self._text_markers[m.group()], value)
+        if self._words_text is not None:
+            value = self._words_text.sub(lambda m: self._word_text[m.group()], value)
         value = self._url_text.sub(lambda m: m.group('prefix') + '[REDACTED]', value)
+        value = self._userinfo_text.sub(lambda m: m.group('prefix') + '[REDACTED]' if userinfo_secret(m.group('token'))
+                                        else m.group(0), value)
         for name, pattern in self._tokens_text:
             value = pattern.sub(f'[REDACTED:{name}]', value)
         return mask_sensitive_assignments(value)[0]
 
     def redact_bytes(self, value: bytes) -> tuple[bytes, int]:
         hits = 0
-        for secret, marker in self._bytes:
-            count = value.count(secret)
+        if self._values_bytes is not None:
+            value, hits = self._values_bytes.subn(lambda m: self._byte_markers[m.group()], value)
+        for pattern, markers in self._words_bytes:
+            value, count = pattern.subn(lambda m: markers[m.group()], value)
+            hits += count
+        if self._words_decoded is not None:
+            pattern, decoded = self._words_decoded
+            text, count = pattern.subn(lambda m: decoded[m.group()], value.decode('utf-8', 'surrogateescape'))
             if count:
-                hits += count
-                value = value.replace(secret, marker)
+                value, hits = text.encode('utf-8', 'surrogateescape'), hits + count
         value, count = self._url_bytes.subn(lambda m: m.group('prefix') + b'[REDACTED]', value)
         hits += count
+        masked_users: list[re.Match[bytes]] = []
+
+        def userinfo(match: re.Match[bytes]) -> bytes:
+            if not userinfo_secret(match.group('token').decode('utf-8', 'replace')):
+                return match.group()
+            masked_users.append(match)
+            return match.group('prefix') + b'[REDACTED]'
+        value = self._userinfo_bytes.sub(userinfo, value)
+        hits += len(masked_users)
         for name, pattern in self._tokens_bytes:
             value, count = pattern.subn(b'[REDACTED:' + name + b']', value)
             hits += count
@@ -1602,11 +3076,341 @@ class Redactor:
         return value, hits
 
 
-def unique_stem(directory: Path, stem: str) -> str:
+def unique_stem(directory: Path, stem: str) -> tuple[str, Any]:
+    """First stem without log, metadata, running or stop marker, reserved by creating its log exclusively; returns the
+    stem and the open log, so parallel runs with the same ID never share log, metadata or markers."""
     candidate, counter = stem, 2
-    while any((directory / f'{candidate}{suffix}').exists() for suffix in ('.log', '.meta.json', '.running.json')):
+    while True:
+        if not any((directory / f'{candidate}{suffix}').exists() for suffix in ('.meta.json', '.running.json', '.stop')):
+            try:
+                return candidate, open(directory / f'{candidate}.log', 'xb')
+            except FileExistsError:
+                pass
         candidate, counter = f'{stem}-{counter}', counter + 1
-    return candidate
+
+
+# cmd.exe takes these literally only inside double quotes; these it interprets even there.
+BATCH_QUOTED = re.compile(r'[\s&|<>^(),;=]')
+BATCH_UNSAFE = re.compile(r'[%"!\r\n]')
+BATCH_POSITIONAL_UNSAFE = re.compile(r'[%"!\r\n&|<>^()]')
+BATCH_LINE_LIMIT = 8191  # characters cmd.exe accepts on a command line
+
+
+def batch_forwards_positional(executable: str) -> bool:
+    """Whether a batch file passes single parameters on (%1 to %9, also %~1): cmd.exe re-parses such a parameter
+    without its quotes. %0, %~dp0 and %* do not count. An unreadable file counts as forwarding."""
+    try:
+        with open(executable, 'rb') as handle:
+            text = handle.read(1_000_000).decode('latin-1')
+    except OSError:
+        return True
+    return re.search(r'(?<!%)(?:%%)*%(?:~[a-zA-Z$:]*)?[1-9]', text) is not None
+
+
+def batch_command_line(executable: str, arguments: list[str], shown: Callable[[str], str]) -> str:
+    """Command line for a .cmd/.bat file: Windows runs it through cmd.exe, which re-parses the arguments. Arguments with
+    cmd.exe operators or blanks are quoted, so each arrives as typed in quotes at a command prompt. A batch file that
+    forwards single parameters (%1) re-parses them unquoted, so operators are refused there too."""
+    remedy = ('nothing was started. Call the underlying program directly (for example node <path to the CLI script>) or '
+              'use --shell deliberately.')
+    if BATCH_UNSAFE.search(executable):
+        raise ToolError(f'Program path {shown(executable)!r} contains %, ", ! or a line break, which cmd.exe interprets '
+                        f'when it runs the batch file; {remedy}')
+    unsafe = BATCH_POSITIONAL_UNSAFE if batch_forwards_positional(executable) else BATCH_UNSAFE
+    for value in arguments:
+        if unsafe.search(value):
+            raise ToolError(f'Argument {shown(value)!r} contains '
+                            + ('%, ", !, a line break or one of & | < > ^ ( ), which cmd.exe interprets when the batch '
+                               'file passes it on as a single parameter (%1)' if unsafe is BATCH_POSITIONAL_UNSAFE else
+                               '%, ", ! or a line break, which cmd.exe interprets')
+                            + f' when it runs the batch file {shown(executable)}; {remedy}')
+    parts = ['"' + executable + '"']
+    for value in arguments:
+        # backslashes before the closing quote are doubled, so the program behind the batch file sees them once
+        parts.append('"' + re.sub(r'(\\+)$', r'\1\1', value) + '"' if not value or BATCH_QUOTED.search(value) else value)
+    comspec = os.environ.get('COMSPEC', '')
+    if not os.path.isabs(comspec):
+        comspec = os.path.join(os.environ.get('SystemRoot', 'C:\\Windows'), 'System32', 'cmd.exe')
+    line = f'"{comspec}" /d /s /c "{" ".join(parts)}"'
+    if len(line) > BATCH_LINE_LIMIT:
+        raise ToolError(f'The command line for the batch file {shown(executable)} has {len(line)} characters; cmd.exe '
+                        f'accepts at most {BATCH_LINE_LIMIT}. Pass fewer or shorter arguments (for example a file list) '
+                        'or call the underlying program directly; nothing was started.')
+    return line
+
+
+def option_secret_values(arguments: list[str]) -> dict[str, str]:
+    """Values given to options with a sensitive name (--password X, --api-key=X, -token X, --auth X) and passwords
+    given as `pass:X` or `password:X` (openssl -passin), masked in the recorded command and in the log like --env
+    values (from 4 characters on)."""
+    values: dict[str, str] = {}
+    for index, argument in enumerate(arguments):
+        given = re.fullmatch(r'(pass|password|passwd|pwd):(.{4,})', argument, re.DOTALL | re.IGNORECASE)
+        if given:
+            values.setdefault(given.group(1).lower() + ':', given.group(2))
+        match = re.fullmatch(r'--?([A-Za-z][\w.-]*)(?:=(.*))?', argument, re.DOTALL)
+        if not match or not sensitive_name(match.group(1).replace('-', '_')):
+            continue
+        value = match.group(2)
+        if value is None:
+            value = arguments[index + 1] if index + 1 < len(arguments) else ''
+            if value.startswith('-'):
+                continue  # the next option, no value
+        if len(value) >= 4 and is_sensitive_assignment(match.group(1), value):
+            values.setdefault('--' + match.group(1), value)
+    return values
+
+
+def file_url_path(url: str) -> str:
+    """The local path of a file: URL (file:///C:/x, file://localhost/x, file://server/share/x)."""
+    rest = unquote(url[5:])
+    if rest.startswith('//'):
+        host, _, path = rest[2:].partition('/')
+        rest = '/' + path if not host or host.lower() == 'localhost' else '//' + rest[2:]
+    if os.name == 'nt' and re.match(r'/[A-Za-z]:', rest):
+        rest = rest[1:]
+    return rest
+
+
+# A path inside a longer string ends at a quote, a list separator, a comma or a shell operator; in a --shell string also
+# at whitespace. On Windows a `:` continues it (drive, stream), elsewhere `:` separates list entries.
+PATH_END = re.compile(r'["\',;&|<>()' + ('' if os.name == 'nt' else ':') + ']')
+PATH_END_SHELL = re.compile(PATH_END.pattern[:-1] + r'\s]')
+# Where a string is split into parts that may each name a path: quotes, `=`, commas, list separators, and `:` unless a
+# slash follows it on Windows (a drive).
+PATH_PART_SPLIT = re.compile(r'["\'=,;]|:' + (r'(?![\\/])' if os.name == 'nt' else ''))
+# A string with more distinct parts is refused, an inherited value of that kind is not passed on: no part is judged
+# unseen. The bound lies above the longest class path or file list a command line can hold (Windows 32767 characters).
+PATH_PARTS_PER_STRING = 8192
+PATH_WORD_BREAK = frozenset(' \t\r\n"\',;&|<>()=:')
+# The entries of a list value: on POSIX a `:` that begins `://` is part of a URL.
+LIST_SEPARATOR = re.compile(';' if os.name == 'nt' else ':(?!//)')
+
+
+def shell_tokens(command: str) -> list[str]:
+    """Words of a --shell string, best effort: quotes removed, split also at redirections and command separators."""
+    try:
+        parts = shlex.split(command, posix=os.name != 'nt')
+    except ValueError:
+        parts = command.split()
+    return [token for part in parts for token in re.split(r'[&|;<>()]+', part.strip('"\'')) if token]
+
+
+class TooManyParts(Exception):
+    """A string has more than PATH_PARTS_PER_STRING distinct parts: the run guard cannot judge them all."""
+
+
+def path_parts(text: str) -> list[str]:
+    """Parts of one argument or value that may each name a path: the whole text; its pieces between quotes, `=`,
+    commas and list separators; and of each piece the text after a leading `@`, after `/name:` or `--name:`, after the
+    letters of an attached option (-Ipath, -isystempath), from its first `..`, a file: URL as a path and the
+    percent-decoded text. More than PATH_PARTS_PER_STRING distinct parts raise TooManyParts."""
+    found = [text] + PATH_PART_SPLIT.split(text)
+    for part in list(found):
+        if part.startswith('@'):
+            found.append(part[1:])
+        option = re.match(r'(?:/|--)[A-Za-z][\w-]+:(?=[\\/])', part)
+        if option:
+            found.append(part[option.end():])
+        attached = re.match(r'-[A-Za-z]{1,16}', part)
+        if attached:
+            found += [part[index:] for index in range(2, attached.end() + 1)]
+        parent = re.search(r'\.\.(?=[\\/]|$)', part)
+        if parent and parent.start():
+            found.append(part[parent.start():])
+        if part[:5].lower() == 'file:':
+            found.append(file_url_path(part))
+        if '%' in part:
+            found.append(unquote(part))
+    parts = [part for part in dict.fromkeys(part.strip() for part in found) if part]
+    if len(parts) > PATH_PARTS_PER_STRING:
+        raise TooManyParts()
+    return parts
+
+
+def kernel_path(path: Path) -> Path:
+    """The path with every link followed before a `..` after it is applied, as the kernel resolves it on POSIX
+    (os.path.normpath removes `link/..` as text)."""
+    current = Path(path.anchor)
+    for part in path.parts[1 if path.anchor else 0:]:
+        current = current.resolve().parent if part == '..' else current / part
+    return current.resolve()
+
+
+class OriginalGuard:
+    """Decides whether a string (argument, program path, environment value, --shell string) points into the original
+    project of a working copy, by two rules that do not depend on option syntax:
+    1. wherever the original's root occurs in the string - as recorded and as resolved, with either slash, on Windows
+       in any case and in the Git Bash and WSL spellings, also percent-decoded - the path that starts there and runs
+       to the next character that cannot continue it is judged;
+    2. every part of the string (see path_parts) is resolved from the working directory, links and junctions
+       followed, `..` applied both as text and after the links before it, and judged.
+    A path is accepted outside the original, inside its results directory and inside the working copy."""
+
+    def __init__(self, workspace_root: Path, cwd: Path, run_dir: Path | None) -> None:
+        self.workspace_root, self.cwd = workspace_root, cwd
+        self.project: Path | None = None
+        self.unjudged: list[str] = []  # inherited variables removed because they have too many parts to be judged
+        try:
+            marker = read_json(workspace_root / WORKSPACE_MARKER)
+        except (OSError, ValueError):
+            return
+        original = marker.get('project_root') if isinstance(marker, dict) else None
+        if not isinstance(original, str) or not original:
+            return
+        self.project = Path(original)
+        self.results = [self.project / DEFAULT_RESULTS_DIRNAME] + ([run_dir.parent] if run_dir is not None else [])
+        self.judged: dict[tuple[str, bool], Path | None] = {}
+        slash = r'[\\/]+' if os.name == 'nt' else '/+'
+        native: set[str] = set()
+        foreign: set[str] = set()
+        for root in {original, self.resolved(original)}:
+            root = (root.replace('\\', '/') if os.name == 'nt' else root).rstrip('/')
+            drive = re.match(r'([A-Za-z]):/(.+)', root) if os.name == 'nt' else None
+            if drive:  # Git Bash and WSL spellings of a Windows path
+                foreign |= {f'/{drive.group(1)}/{drive.group(2)}', f'/mnt/{drive.group(1)}/{drive.group(2)}'}
+            if len(root) > 3 or root and os.name != 'nt':
+                native.add(root)
+        self.root_text = self.resolved(original)
+        flags = re.IGNORECASE if os.name == 'nt' else 0
+
+        def pattern(roots: set[str]) -> re.Pattern[str] | None:
+            return re.compile('|'.join(slash.join(map(re.escape, root.split('/')))
+                                       for root in sorted(roots, key=len, reverse=True)), flags) if roots else None
+        self.native, self.foreign = pattern(native), pattern(foreign)
+
+    @staticmethod
+    def resolved(path: str) -> str:
+        try:
+            return str(Path(path).resolve())
+        except (OSError, ValueError):
+            return path
+
+    def inside(self, named: Path) -> bool:
+        return (is_within(named, self.project) and not is_within(named, self.workspace_root)
+                and not any(is_within(named, results_dir) for results_dir in self.results))
+
+    def named(self, value: str, textual: bool = False) -> Path | None:
+        """The path in the original that this value names from the working directory, None when it names none. A text
+        that holds the original's root and cannot be resolved counts as a path in the original."""
+        if (value, textual) not in self.judged:
+            found = None
+            try:
+                # links and junctions are followed; a name not created yet is judged by its existing directories
+                named = Path(os.path.normpath(self.cwd / value)).resolve()
+                if self.inside(named):
+                    found = named
+                elif '..' in Path(value).parts:
+                    named = kernel_path(self.cwd / value)
+                    found = named if self.inside(named) else None
+            except (OSError, ValueError):
+                found = Path(self.root_text) if textual else None
+            self.judged[(value, textual)] = found
+        return self.judged[(value, textual)]
+
+    def textual(self, text: str, end: re.Pattern[str]) -> Path | None:
+        """Rule 1 for one text."""
+        for pattern, foreign in ((self.native, False), (self.foreign, True)):
+            for match in pattern.finditer(text) if pattern is not None else ():
+                start = match.start()
+                if os.name != 'nt':
+                    # /data/home/u/proj is another path than /home/u/proj: a root in the middle of an absolute path
+                    # is judged as part of that path by rule 2
+                    left = start
+                    while left and start - left < 4096 and text[left - 1] not in PATH_WORD_BREAK:
+                        left -= 1
+                    if re.match(r'/[^/]', text[left:start]):
+                        continue
+                stop = end.search(text, match.end())
+                rest = text[match.end():stop.start() if stop else len(text)]
+                if foreign and rest[:1] not in ('', '/', '\\'):
+                    continue  # a longer name
+                named = self.named((self.root_text if foreign else match.group()) + rest, textual=True)
+                if named is not None:
+                    return named
+        return None
+
+    def reference(self, text: str, shell: bool = False) -> Path | None:
+        """The path in the original project that this string points to, None when it points to none. A word with more
+        than PATH_PARTS_PER_STRING distinct parts raises TooManyParts."""
+        if self.project is None:
+            return None
+        words = shell_tokens(text) if shell else [text]
+        texts = [(text, PATH_END_SHELL if shell else PATH_END)] + ([(word, PATH_END) for word in words] if shell else [])
+        texts += [(unquote(value), end) for value, end in texts if '%' in value]
+        for value, end in texts:
+            named = self.textual(value, end)
+            if named is not None:
+                return named
+        for word in words:
+            for part in path_parts(word):
+                if '/' in part or '\\' in part or part == '..' or os.path.lexists(self.cwd / part):
+                    named = self.named(part)
+                    if named is not None:
+                        return named
+        return None
+
+    def copy_path(self, named: Path) -> Path | str:
+        try:
+            return self.workspace_root / named.relative_to(Path(self.root_text))
+        except ValueError:
+            return 'the matching path in the working copy'
+
+    def filter_environment(self, env: dict[str, str]) -> tuple[list[str], list[str]]:
+        """Inherited variables that point into the original: an entry of a list value is dropped, any other value
+        removed with its variable, and so is a value with too many parts to be judged (listed in self.unjudged). A list
+        is a value with the list separator of the platform; on POSIX a `:` before `//` belongs to a URL. Returns the
+        names of the removed and of the shortened variables."""
+        removed, shortened = [], []
+        self.unjudged = []
+        for name, value in list(env.items()):
+            if not value or self.project is None:
+                continue
+            try:
+                if name.upper() == 'PWD':
+                    env[name] = str(self.cwd)
+                elif os.pathsep in value:
+                    entries = LIST_SEPARATOR.split(value)
+                    kept = [entry for entry in entries if not entry or self.reference(entry) is None]
+                    if not any(kept) and any(entries):
+                        removed.append(name)
+                    elif len(kept) < len(entries):
+                        shortened.append(name)
+                        env[name] = os.pathsep.join(kept)
+                elif self.reference(value) is not None:
+                    removed.append(name)
+            except TooManyParts:
+                removed.append(name)
+                self.unjudged.append(name)
+        for name in removed:
+            del env[name]
+        return sorted(removed), sorted(shortened)
+
+
+def original_project_argument(values: list[tuple[str, str]], guard: OriginalGuard, shown: Callable[[str], str]) -> None:
+    """Refuses a value (argument, program path, --env value, --shell string, evidence directory) that points into the
+    original project outside its results directory, also a file not created yet (judged by its nearest existing
+    directory) and a path through a link or junction: the command would read or change the original instead of the
+    copy. A relative value that stays in the copy is never refused; one with too many parts to be judged is."""
+    numbers: dict[str, int] = {}
+    for label, text in values:
+        numbers[label] = numbers.get(label, 0) + 1
+        try:
+            named = guard.reference(text, shell=label == 'Command')
+        except TooManyParts:
+            raise ToolError(f'{label}{" %d" % numbers[label] if label in ("Argument", "--env value") else ""} has more '
+                            f'than {PATH_PARTS_PER_STRING} path-like parts; the run guard judges every part and refuses '
+                            'the rest unseen. Split the command or pass the list through a file inside the working '
+                            'copy.') from None
+        if named is None:
+            continue
+        if label == '--evidence-dir':
+            raise ToolError(f'--evidence-dir {shown(text)!r} lies in the original project ({named}) outside its '
+                            f'results directory; use the evidence folder of the run ({DEFAULT_RESULTS_DIRNAME}/<run>/'
+                            'evidence) or a folder outside the original project. Nothing was started.')
+        raise ToolError(f'{label} {shown(text)!r} points into the original project ({named}); use the path in '
+                        f'the working copy instead: {guard.copy_path(named)}. Only a read-only command may use the '
+                        'original, with --outside-workspace.')
 
 
 def resolve_executable(command: str, cwd: Path, env: dict[str, str]) -> str | None:
@@ -1616,7 +3420,9 @@ def resolve_executable(command: str, cwd: Path, env: dict[str, str]) -> str | No
     cwd = cwd.resolve()
     names = [command]
     if os.name == 'nt':
-        extensions = [ext for ext in env.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';') if ext]
+        # other PATHEXT types (.JS, .PY, ...) start only through a shell
+        extensions = [ext for ext in env.get('PATHEXT', '.COM;.EXE;.BAT;.CMD').split(';')
+                      if ext.upper() in ('.COM', '.EXE', '.BAT', '.CMD')] or ['.COM', '.EXE', '.BAT', '.CMD']
         if not any(command.lower().endswith(ext.lower()) for ext in extensions):
             names = [command + ext for ext in extensions] or [command]
     if '/' in command or '\\' in command:
@@ -1646,15 +3452,19 @@ def find_run_dir(start: Path) -> Path | None:
     return None
 
 
-def build_run_env(args: argparse.Namespace, workspace_root: Path | None) -> tuple[dict[str, str], list[str],
-                                                                                    dict[str, str]]:
+def build_run_env(args: argparse.Namespace, workspace_root: Path | None, guard: OriginalGuard | None = None
+                  ) -> tuple[dict[str, str], list[str], dict[str, str], list[str], list[str]]:
+    """The command's environment, the names of the variables not passed on, the values set by options, and of the
+    inherited variables that pointed into the original project the removed and the shortened ones."""
     inherit = {name.upper() for name in args.inherit or []}
     env = dict(os.environ)
-    stripped = sorted(name for name, value in env.items() if name.upper() not in inherit and (
-        should_strip(name, value) or workspace_root is not None and args.isolated_home
-        and name.upper() in PROFILE_POINTER_ENV))
+    stripped = sorted(name for name, value in env.items() if git_repository_variable(name)
+                      or name.upper() not in inherit and (should_strip(name, value) or workspace_root is not None
+                                                          and args.isolated_home and name.upper() in PROFILE_POINTER_ENV))
     for name in stripped:
         del env[name]
+    redirected, shortened = guard.filter_environment(env) if guard is not None else ([], [])
+    stripped = sorted(stripped + redirected)
     overrides: dict[str, str] = {}
     if args.ci:
         overrides['CI'] = 'true'
@@ -1674,11 +3484,13 @@ def build_run_env(args: argparse.Namespace, workspace_root: Path | None) -> tupl
                               'GIT_CONFIG_VALUE_0': '', 'GIT_TERMINAL_PROMPT': '0', 'GCM_INTERACTIVE': 'never'})
     for item in args.env or []:
         if '=' not in item:
-            raise ToolError(f'--env expects NAME=VALUE, received: {item!r}')
+            raise ToolError('--env expects NAME=VALUE; an entry has no "=" (its text is not shown, it may be a secret).')
         name, value = item.split('=', 1)
+        if not name:
+            raise ToolError('--env expects NAME=VALUE with a non-empty NAME; an entry starts with "=".')
         overrides[name] = value
     env.update(overrides)
-    return env, stripped, overrides
+    return env, stripped, overrides, redirected, shortened
 
 
 def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
@@ -1694,14 +3506,56 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
         raise ToolError(f'{cwd} is not in a working copy (marker {WORKSPACE_MARKER} is missing). Commands run in the '
                         'working copy (--cwd). Only read-only commands may run outside it with --outside-workspace.')
     evidence_dir = Path(args.evidence_dir).resolve()
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    stem = unique_stem(evidence_dir, args.id)
-    log_path, meta_path = evidence_dir / f'{stem}.log', evidence_dir / f'{stem}.meta.json'
-    running_path, stop_path = evidence_dir / f'{stem}.running.json', evidence_dir / f'{stem}.stop'
-    env, stripped, overrides = build_run_env(args, workspace_root)
-    redactor = Redactor({**workspace_secret_values(workspace_root),
-                         **sensitive_values({**os.environ, **overrides}, args.redact or []),
-                         **sensitive_values(overrides, args.redact or [], min_length=4)})
+    guard = (OriginalGuard(workspace_root, cwd, find_run_dir(evidence_dir))
+             if workspace_root is not None and not args.outside_workspace else None)
+    env, stripped, overrides, redirected, shortened = build_run_env(args, workspace_root, guard)
+    redact = args.redact or []
+    inherited = {name.upper() for name in args.inherit or []}
+    given = dict(item.split('=', 1) for item in args.env or [])
+    unjudged = guard.unjudged if guard is not None else []
+    file_values = workspace_secret_values(workspace_root)
+    inherited_values = sensitive_values({k: v for k, v in os.environ.items() if k.upper() in inherited}, redact,
+                                        min_length=4)
+    # --env and --inherit values of sensitive names are masked from 4 characters on, other ambient ones from 6; a
+    # value given with --env under any name from ENV_VALUE_MIN_CHARS characters on, whatever its shape
+    given_values = {**sensitive_values(given, redact, min_length=4),
+                    **{name: value for name, value in given.items() if len(value) >= ENV_VALUE_MIN_CHARS}}
+    redactor = Redactor({**file_values,
+                         **sensitive_values({**os.environ, **overrides}, redact),
+                         **inherited_values,
+                         **sensitive_values(overrides, redact, min_length=4),
+                         **given_values,
+                         **option_secret_values(shell_tokens(command[0]) if args.shell and len(command) == 1
+                                                else command)})
+    short = sorted(name for name, value in given_values.items() if whole_word_value(value))
+    tiny = sorted(name for name, value in sensitive_values(given, redact, min_length=1).items()
+                  if len(value) < 4 and name not in short)
+    notes = []
+    for origin, names in (('--env', short),
+                          ('Env-file', sorted({name.split('#')[0] for name, value in file_values.items()
+                                               if whole_word_value(value)})),
+                          ('Inherited', sorted(name for name, value in inherited_values.items()
+                                               if whole_word_value(value)))):
+        if names:
+            listed = ', '.join(names[:SHORT_VALUE_NOTE_NAMES]) + (
+                f' and {len(names) - SHORT_VALUE_NOTE_NAMES} more' if len(names) > SHORT_VALUE_NOTE_NAMES else '')
+            notes.append(f'{origin} value{"s" if len(names) > 1 else ""} of {listed} '
+                         f'{"are" if len(names) > 1 else "is"} shorter than 12 characters or of letters only: masked in '
+                         'the log only as a whole word, not inside longer words; a distinctive synthetic value of 12 or '
+                         'more characters with a digit is masked wherever it occurs.')
+    notes += [f'--env value{"s" if len(tiny) > 1 else ""} of {", ".join(tiny)} {"are" if len(tiny) > 1 else "is"} '
+              'shorter than 4 characters and not masked in the log; use a distinctive synthetic value of 12 or more '
+              'characters.'] if tiny else []
+    pointing = [name for name in redirected if name not in unjudged]
+    if pointing or shortened:
+        notes.append('Inherited environment values that point into the original project are not passed on: '
+                     + '; '.join(part for part in (pointing and 'removed ' + ', '.join(pointing),
+                                                   shortened and 'entries dropped from ' + ', '.join(shortened)) if part)
+                     + '. Set a value for the working copy with --env where the command needs one.')
+    if unjudged:
+        notes.append(f'Inherited environment values with more than {PATH_PARTS_PER_STRING} path-like parts cannot be '
+                     'judged and are not passed on: ' + ', '.join(unjudged) + '. Set a value for the working copy with '
+                     '--env where the command needs one.')
     executable = None
     if args.shell:
         shell_command = command[0] if len(command) == 1 else (
@@ -1711,14 +3565,64 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
     else:
         executable = resolve_executable(command[0], cwd, env)
         shown_command = [redactor.redact_text(part) for part in command]
-        if executable is None:
-            meta = {'id': args.id, 'command': shown_command, 'cwd': str(cwd), 'error': 'command_not_found',
-                    'resolved_executable': None,
-                    'started_at_utc': utc_now(), 'exit_code': None, 'tool_version': TOOL_VERSION}
-            write_json_new(meta_path, meta)
-            print_json({**meta, 'meta': str(meta_path)})
-            return 127
         popen_command = [executable, *command[1:]]
+        if executable is not None and os.name == 'nt' and executable.lower().endswith(('.cmd', '.bat')):
+            popen_command = batch_command_line(executable, command[1:], redactor.redact_text)
+            shown_command = redactor.redact_text(popen_command)  # recorded exactly as executed
+    if guard is not None:
+        original_project_argument(
+            ([('Command', shell_command)] if args.shell
+             else [('Program path', command[0])] + [('Argument', value) for value in command[1:]])
+            + [('--env value', item) for item in args.env or []] + [('--evidence-dir', str(evidence_dir))],
+            guard, redactor.redact_text)
+    for note in notes:
+        print(f'Note: {note}', file=sys.stderr)
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f'Evidence directory {evidence_dir} cannot be created ({exc.strerror or exc}); pass a directory '
+                        'path for --evidence-dir. Nothing was started.') from exc
+    stem, log = unique_stem(evidence_dir, args.id)
+    log_path, meta_path = evidence_dir / f'{stem}.log', evidence_dir / f'{stem}.meta.json'
+    running_path, stop_path = evidence_dir / f'{stem}.running.json', evidence_dir / f'{stem}.stop'
+    stop_path.unlink(missing_ok=True)  # a stale stop request never ends this run
+
+    def start_failure(error: str, code: int, message: str) -> int:
+        """The attempt is evidence of a blocked check: a one-line log and metadata like an ordinary run."""
+        started_at_utc = utc_now()
+        with log:
+            log.write(redactor.redact_text(f'audit_tools.py run: {message}').encode('utf-8') + b'\n')
+        log_sha = sha256_file(log_path)
+        meta = {'id': args.id, 'tool': 'audit_tools.py', 'tool_version': TOOL_VERSION, 'command': shown_command,
+                'shell': args.shell, 'cwd': str(cwd), 'workspace_root': str(workspace_root) if workspace_root else None,
+                'resolved_executable': redactor.redact_text(executable) if executable else None, 'error': error,
+                'started_at_utc': started_at_utc, 'ended_at_utc': started_at_utc, 'duration_s': 0.0,
+                'exit_code': None, 'timed_out': False, 'stopped': False, 'stripped_env': stripped,
+                'shortened_env': shortened, 'not_judged_env': dict.fromkeys(unjudged, 'not judged: too many parts'),
+                'log': log_path.name, 'log_sha256': log_sha, 'log_bytes': log_path.stat().st_size, 'log_lines': 1,
+                'redactions': 0, 'log_encoding': 'text written by audit_tools.py; secrets masked',
+                'python': sys.version.split()[0], 'platform': sys.platform, 'notes': notes}
+        write_json_new(meta_path, meta)
+        summary: dict[str, Any] = {'id': args.id, 'exit_code': None, 'error': meta['error'], 'log': str(log_path),
+                                   'meta': str(meta_path), 'log_sha256': log_sha, 'stripped_env': stripped}
+        run_dir = find_run_dir(evidence_dir)
+        if run_dir is not None:
+            summary['evidence_entry'] = {'kind': 'LOG', 'path': log_path.relative_to(run_dir).as_posix(),
+                                         'sha256': log_sha, 'captured_at_utc': started_at_utc, 'freshness': 'CURRENT',
+                                         'limits': '<add limits of the claim>'}
+        print_json(summary)
+        print(f'Error: {redactor.redact_text(message)}', file=sys.stderr)
+        return code
+
+    if not args.shell and executable is None:
+        if (cwd / command[0]).is_file():
+            return start_failure('not_directly_startable', 126,
+                                 f'{command[0]} exists but is not a program that starts directly: call it through its '
+                                 f'runtime (for example node {command[0]} or python {command[0]}) or use --shell '
+                                 'deliberately.')
+        return start_failure('command_not_found', 127,
+                             f'command not found: {command[0]}; check the name and PATH (set PATH with --env), or give '
+                             'the program path.')
     popen_kwargs: dict[str, Any] = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                         cwd=str(cwd), env=env, shell=args.shell)
     if os.name == 'nt':
@@ -1726,15 +3630,23 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
     else:
         popen_kwargs['start_new_session'] = True
     tail: deque[str] = deque(maxlen=max(args.tail, 0))
-    counters = {'lines': 0, 'redactions': 0, 'non_utf8_lines': 0}
+    counters = {'lines': 0, 'redactions': 0, 'non_utf8_lines': 0, 'bytes_read': 0, 'lines_cut': 0, 'bytes_omitted': 0}
     started_at, started = utc_now(), time.monotonic()
-    timed_out = stopped = orphaned_output = False
+    timed_out = stopped = orphaned_output = output_truncated = False
     exit_code: int | None = None
     leftovers: int | None = None
-    # The log keeps the raw output bytes (only secrets masked); decoding is for display only.
-    with open(log_path, 'wb') as log:
+    try:
         proc = subprocess.Popen(popen_command, **popen_kwargs)
+    except (OSError, ValueError) as exc:
+        return start_failure('start_failed: ' + redactor.redact_text(str(exc)), 126,
+                             f'the command could not be started ({exc}); check that the program is executable and '
+                             'that no --env value contains a NUL character.')
+    # The log keeps the raw output bytes (only secrets masked); decoding is for display only.
+    with log:
         reaper = ProcessReaper(proc)
+        # without a Windows job object only the direct child and its current tree are ended; leftovers are not known
+        leftover_check = ('process_group' if os.name != 'nt' else 'job_object' if reaper.job is not None
+                          else 'unavailable')
         try:
             write_json_new(running_path, {'id': args.id, 'stem': stem, 'pid': proc.pid, 'runner_pid': os.getpid(),
                                           'started_at_utc': started_at,
@@ -1744,28 +3656,195 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
         except ToolError:
             pass
 
-        def pump() -> None:
-            in_key = False
+        keys, context, jwk = KeyBlockMasker(), ContextMasker(), JwkMasker()
+        lookahead = min(max(redactor.longest_value, LONG_LINE_BACK), LONG_LINE_BYTES)
+        lock = threading.Lock()
+        # omitted: bytes of the over-long line being read that are not written, None outside such a line; scan: the
+        # key block markers among them
+        reading = {'partial': [], 'size': 0, 'after_cr': False, 'abandoned': False, 'omitted': None, 'kept': '',
+                   'scan': None}
+
+        def plain_line(raw: bytes) -> tuple[bytes, tuple[str, bytes, bytes, str] | None, bytes]:
+            """A line as it is tested: terminal control sequences removed; (the line, its UTF-16 parts, the text)."""
+            if b'\x1b' in raw:
+                raw = TERMINAL_CONTROL.sub(b'', raw)
+            wide = utf16_line(raw) if b'\0' in raw else None
+            return raw, wide, raw if wide is None else wide[0].encode('utf-8')
+
+        def masked_line(raw: bytes, closers: tuple[bytes, ...] = (),
+                        members: Iterable[tuple[int, int]] = ()) -> tuple[bytes, int]:
+            """One line with its secrets replaced, and their number. A line in UTF-16 is tested as text and written
+            in its encoding. With closers (the kept beginning of a cut line), a quoted value that the cut left open
+            is masked like a closed one. members: the spans of the text that hold private key members of a JSON Web
+            Key (JwkMasker)."""
+            raw, wide, line = plain_line(raw)
+            if wide is None and b'\0' in raw and not raw.strip(b'\0\r\n'):
+                return raw, 0  # the rest of a UTF-16 line break
+            hits = 0
+            if members:
+                pieces, last = [], 0
+                for start, end in sorted(members):
+                    pieces += [line[last:start], b'[REDACTED:JWK_PRIVATE_KEY]']
+                    last = end
+                line, hits = b''.join(pieces) + line[last:], len(members)
+            line, found = context.mask(line)
+            hits += found
+            cut = keys.masks(line)
+            if context.name_line:
+                masked = line
+            elif cut is not None:
+                # the text before a BEGIN marker stays
+                masked, count = redactor.redact_bytes(line[:cut]) if cut else (b'', 0)
+                masked, hits = masked + b'[REDACTED:PRIVATE_KEY]' + line[len(line.rstrip(b'\r\n')):], hits + count + 1
+            else:
+                masked, count = redactor.redact_bytes(line)
+                for closer in closers:
+                    closed, closed_count = redactor.redact_bytes(line + closer)
+                    if closed_count > count and closed.endswith(closer):
+                        masked, count = closed[:len(closed) - len(closer)], closed_count
+                        break
+                hits += count
+            if wide is not None:
+                if not hits:
+                    return raw, 0
+                masked = wide[1] + masked.decode('utf-8', 'replace').encode(wide[3], 'replace') + wide[2]
+            return masked, hits
+
+        def display(masked: bytes) -> str:
+            """A written line as the summary shows it among the last lines."""
             try:
-                for raw in iter(proc.stdout.readline, b''):
-                    if in_key or PRIVATE_KEY_BEGIN.search(raw):
-                        in_key = not PRIVATE_KEY_END.search(raw)
-                        ending = b'\r\n' if raw.endswith(b'\r\n') else (b'\n' if raw.endswith(b'\n') else b'')
-                        masked, hits = b'[REDACTED:PRIVATE_KEY]' + ending, 1
+                shown = masked.decode('utf-8')
+            except UnicodeDecodeError:
+                counters['non_utf8_lines'] += 1
+                shown = masked.decode('utf-8', 'replace')
+            shown = shown.rstrip('\r\n')
+            return shown if len(shown) <= TAIL_LINE_CHARS else shown[:TAIL_LINE_CHARS] + ' [line cut for display]'
+
+        def write_line(raw: bytes, members: Iterable[tuple[int, int]] = ()) -> None:
+            masked, hits = masked_line(raw, (), members)
+            log.write(masked)
+            counters['lines'] += 1
+            counters['redactions'] += hits
+            tail.append(display(masked))
+
+        def emit(raw: bytes) -> None:
+            for line, members in jwk.push(plain_line(raw)[2], raw):
+                write_line(line, members)
+
+        def release_held() -> None:
+            """The lines the JWK masker holds back are written (the output ends or a cut line follows)."""
+            for line, members in jwk.flush():
+                write_line(line, members)
+
+        def cut_point(data: bytes) -> int:
+            """Where an over-long line is cut: after the last separator in the LONG_LINE_BACK bytes before the bound,
+            LONG_LINE_BACK bytes before the bound without one; and before a secret found by value or pattern that
+            would cross the cut."""
+            floor = LONG_LINE_BYTES - LONG_LINE_BACK
+            at = max(data.rfind(separator, floor, LONG_LINE_BYTES) for separator in LINE_CUT_SEPARATORS) + 1 or floor
+            for _ in range(8):
+                low = max(0, at - lookahead)
+                window, inner = data[low:at + lookahead], at - low
+                crossing = [start for start, end in redactor.match_spans(window) if start < inner < end]
+                if not crossing:
+                    break
+                at = low + min(crossing)
+            return at
+
+        def cut_line(data: bytes) -> None:
+            """The beginning of an over-long line is written, masked like any line; its rest is counted and scanned for
+            key block markers, not kept."""
+            release_held()
+            at = cut_point(data)
+            (kept, members), = jwk.push(plain_line(data[:at])[2], data[:at], last=True)
+            masked, hits = masked_line(kept, (b'"', b"'", b'\\"'), members)
+            log.write(masked)
+            counters['redactions'] += hits
+            reading['omitted'], reading['kept'] = len(data) - at, display(masked)
+            reading['scan'] = OmittedMarkers(data[:at])
+            reading['scan'].feed(data[at:])
+
+        def end_cut_line(line_break: bytes) -> None:
+            marker = b'[LINE CUT: %d bytes omitted]' % reading['omitted']
+            log.write(marker + line_break)
+            counters['lines'] += 1
+            counters['lines_cut'] += 1
+            counters['bytes_omitted'] += reading['omitted']
+            tail.append(reading['kept'] + ('' if len(reading['kept']) > TAIL_LINE_CHARS else ' ' + marker.decode('ascii')))
+            if reading['scan'].found:  # the key block that the omitted part begins goes on in the lines after it
+                keys.begin_block(OMITTED_PREFIX, reading['scan'].closed)
+            reading['omitted'], reading['kept'], reading['scan'] = None, '', None
+
+        def end_output() -> None:
+            """What was read of a last line without a line break is written."""
+            data, reading['partial'], reading['size'] = b''.join(reading['partial']), [], 0
+            if reading['omitted'] is None and len(data) > LONG_LINE_BYTES:
+                cut_line(data)
+            elif data:
+                emit(data)
+            release_held()
+            if reading['omitted'] is not None:
+                end_cut_line(b'')
+
+        def omit(piece: bytes) -> None:
+            reading['omitted'] += len(piece)
+            reading['scan'].feed(piece)
+
+        def feed(chunk: bytes) -> None:
+            start = 0
+            if reading['after_cr'] and chunk.startswith(b'\n'):
+                if jwk.held:
+                    jwk.held[-1][0] += b'\n'
+                else:
+                    log.write(b'\n')  # the \n of a \r\n pair that arrived in two reads
+                start = 1
+            for match in LINE_BREAK.finditer(chunk, start):
+                if reading['omitted'] is not None:
+                    omit(chunk[start:match.start()])
+                else:
+                    line = chunk[start:match.end()]
+                    if reading['partial']:
+                        line, reading['partial'], reading['size'] = b''.join(reading['partial']) + line, [], 0
+                    if len(line) - len(match.group()) > LONG_LINE_BYTES:
+                        cut_line(line[:len(line) - len(match.group())])
                     else:
-                        masked, hits = redactor.redact_bytes(raw)
-                    log.write(masked)
-                    counters['lines'] += 1
-                    counters['redactions'] += hits
-                    try:
-                        shown = masked.decode('utf-8')
-                    except UnicodeDecodeError:
-                        counters['non_utf8_lines'] += 1
-                        shown = masked.decode('utf-8', 'replace')
-                    tail.append(shown.rstrip('\r\n'))
+                        emit(line)
+                if reading['omitted'] is not None:
+                    end_cut_line(match.group())
+                start = match.end()
+            reading['after_cr'] = start == len(chunk) and chunk.endswith(b'\r')
+            if start < len(chunk) and reading['omitted'] is not None:
+                omit(chunk[start:])
+            elif start < len(chunk):
+                reading['partial'].append(chunk[start:])
+                reading['size'] += len(chunk) - start
+                if reading['size'] > LONG_LINE_BYTES + lookahead:
+                    data, reading['partial'], reading['size'] = b''.join(reading['partial']), [], 0
+                    cut_line(data)
+
+        def pump() -> None:
+            """Reads in bounded chunks; \\r and \\n end a line; the log is flushed after each chunk, so a service's
+            readiness line is visible at once."""
+            try:
+                while True:
+                    chunk = proc.stdout.read1(READ_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    with lock:
+                        if reading['abandoned']:
+                            return
+                        counters['bytes_read'] += len(chunk)
+                        feed(chunk)
+                        log.flush()
             except (OSError, ValueError):
                 pass
-
+            with lock:
+                if not reading['abandoned']:
+                    try:
+                        end_output()
+                    except (OSError, ValueError):
+                        pass
+                    reading['abandoned'] = True
         reader = threading.Thread(target=pump, daemon=True)
         reader.start()
         deadline = started + args.timeout if args.timeout and args.timeout > 0 else None
@@ -1790,10 +3869,22 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
         if leftovers:
             reaper.kill_all()
         reaper.close()
-        reader.join(timeout=10)
-        if reader.is_alive():
-            orphaned_output = True
-            reader.join(timeout=5)
+        # the reader keeps going while output arrives (up to OUTPUT_DRAIN_SECONDS); a silent open pipe is a holder
+        drain_end, progress = time.monotonic() + OUTPUT_DRAIN_SECONDS, -1
+        while True:
+            reader.join(timeout=READER_POLL_SECONDS)
+            if not reader.is_alive() or counters['bytes_read'] == progress or time.monotonic() > drain_end:
+                break
+            progress = counters['bytes_read']
+        with lock:
+            if not reading['abandoned']:
+                orphaned_output = counters['bytes_read'] == progress
+                output_truncated = not orphaned_output
+                reading['abandoned'] = True
+                try:
+                    end_output()  # what was read is written; later output is not read
+                except (OSError, ValueError):
+                    pass
     for control in (running_path, stop_path):
         try:
             control.unlink()
@@ -1806,15 +3897,21 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
         'shell': args.shell, 'cwd': str(cwd), 'workspace_root': str(workspace_root) if workspace_root else None,
         'resolved_executable': redactor.redact_text(executable) if executable else None,
         'outside_workspace': workspace_root is None, 'stripped_env': stripped,
+        'shortened_env': shortened, 'not_judged_env': dict.fromkeys(unjudged, 'not judged: too many parts'),
         'env_overrides': {k: f'[REDACTED:{k}]' if sensitive_values(
             {k: v}, args.redact or [], min_length=1) else redactor.redact_text(v) for k, v in overrides.items()},
         'started_at_utc': started_at, 'ended_at_utc': ended_at, 'duration_s': duration,
         'exit_code': None if timed_out else exit_code, 'timed_out': timed_out, 'stopped': stopped,
-        'leftover_processes_terminated': leftovers, 'background_output_holder': orphaned_output,
+        'leftover_processes_terminated': leftovers,
+        'leftover_check': leftover_check,
+        'background_output_holder': orphaned_output,
+        'output_truncated': output_truncated, 'output_bytes_read': counters['bytes_read'],
+        'long_lines_cut': counters['lines_cut'], 'long_line_bytes_omitted': counters['bytes_omitted'],
         'log': log_path.name, 'log_sha256': log_sha, 'log_bytes': log_path.stat().st_size,
         'log_lines': counters['lines'], 'redactions': counters['redactions'],
-        'log_encoding': 'raw bytes as emitted; secrets masked', 'non_utf8_lines': counters['non_utf8_lines'],
-        'python': sys.version.split()[0], 'platform': sys.platform,
+        'log_encoding': 'raw bytes as emitted; terminal control sequences removed; secrets masked',
+        'non_utf8_lines': counters['non_utf8_lines'],
+        'python': sys.version.split()[0], 'platform': sys.platform, 'notes': notes,
     }
     write_json_new(meta_path, meta)
     summary: dict[str, Any] = {
@@ -1840,6 +3937,9 @@ def cmd_run(args: argparse.Namespace, command: list[str]) -> int:
 
 def cmd_stop(args: argparse.Namespace) -> int:
     evidence_dir = Path(args.evidence_dir).resolve()
+    if not evidence_dir.is_dir():
+        raise ToolError(f'Evidence directory not found or not a directory: {evidence_dir}; pass the --evidence-dir of '
+                        'the run.')
     targets = []
     for marker in sorted(evidence_dir.glob('*.running.json')):
         try:
@@ -1847,6 +3947,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
         except (OSError, ValueError):
             continue
         if isinstance(info, dict) and info.get('id') == args.id:
+            stem = info.get('stem')
+            # a stem is a plain file name: the stop request and the metadata stay inside the evidence directory
+            if not isinstance(stem, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,200}', stem):
+                raise ToolError(f'Run marker {marker.name} has no valid stem; nothing was stopped. Stop the process '
+                                'by hand if it still runs, then remove the marker.')
             targets.append(info)
     if not targets:
         raise ToolError(f'No active run with ID {args.id} in {evidence_dir}.')
@@ -1860,7 +3965,14 @@ def cmd_stop(args: argparse.Namespace) -> int:
             time.sleep(0.2)
         if meta_path.exists():
             time.sleep(0.2)
-            meta = read_json(meta_path)
+            try:
+                meta = read_json(meta_path)
+            except (OSError, ValueError) as exc:
+                raise ToolError(f'Metadata {meta_path.name} is unreadable ({exc}); the run ended, its log is no '
+                                'evidence until the check is rerun.') from exc
+            if not isinstance(meta, dict):
+                raise ToolError(f'Metadata {meta_path.name} does not contain a JSON object; the run ended, its log is no '
+                                'evidence until the check is rerun.')
             results.append({key: meta.get(key) for key in ('id', 'exit_code', 'stopped', 'duration_s', 'log',
                                                            'log_sha256', 'leftover_processes_terminated')})
         elif (isinstance(info.get('pid'), int)
@@ -1891,6 +4003,48 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- envkeys
 
+# Placeholder shapes (classify_value): (a) filler - optional short prefix, then only repeated filler characters or
+# groups; (b) every word a placeholder word; (c) a URL or bare host name on an example or localhost host. A URL
+# with a credential query parameter or a long letters-and-digits path segment counts as a URL with credentials.
+ENV_FILLER = re.compile(r'(?:[A-Za-z]{1,6}[-_]){0,2}(?:x{3,}|\*{3,}|0{3,}|#{3,}|\.{3,})(?:[-_ .:/]+(?:x+|\*+|0+|#+))*',
+                        re.IGNORECASE)
+ENV_PLACEHOLDER_WORDS = frozenset({
+    'your', 'my', 'this', 'api', 'key', 'keys', 'token', 'secret', 'password', 'pass', 'passwd', 'pwd',
+    'here', 'goes', 'changeme', 'change', 'me', 'replace', 'with', 'real', 'actual', 'todo', 'tbd', 'fixme', 'set',
+    'dummy', 'value', 'dummyvalue', 'placeholder', 'example', 'sample', 'insert', 'enter', 'fill', 'in', 'put', 'xxx',
+    'id', 'client', 'access', 'auth', 'user', 'username', 'name', 'url', 'host',
+})
+ENV_URL = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*://(?P<auth>[^@/?#\s]*@)?(?P<host>[^/:?#\s]*)(?::\d*)?(?P<path>/[^?#]*)?'
+                     r'(?P<query>\?[^#]*)?(?:#.*)?', re.DOTALL)
+ENV_BARE_HOST = re.compile(r'(?P<host>(?:[A-Za-z0-9-]+\.)*[A-Za-z]+)(?::\d+)?')
+CREDENTIAL_QUERY = re.compile(r'[?&;](?:token|access_token|refresh_token|id_token|auth_token|key|api_key|apikey|secret|'
+                              r'client_secret|sig|signature|password|auth)=[^&;#]', re.IGNORECASE)
+
+
+def url_carries_credentials(text: str) -> bool:
+    url = ENV_URL.fullmatch(text)
+    if url is None:
+        return False
+    if url.group('auth') or CREDENTIAL_QUERY.search(url.group('query') or ''):
+        return True
+    return any(re.fullmatch(r'[A-Za-z0-9]{20,}', segment) and re.search(r'[A-Za-z]', segment)
+               and re.search(r'\d', segment) for segment in (url.group('path') or '').split('/'))
+
+
+def is_placeholder_value(text: str) -> bool:
+    if ENV_FILLER.fullmatch(text):
+        return True
+    words = [word for word in re.split(r'[\s_\-.:/<>]+', text) if word]
+    if words and all(word.lower() in ENV_PLACEHOLDER_WORDS or ENV_FILLER.fullmatch(word) for word in words):
+        return True
+    url = ENV_URL.fullmatch(text)
+    host = url.group('host') if url else (ENV_BARE_HOST.fullmatch(text) or {'host': None})['host']
+    if not host:
+        return False
+    labels = host.lower().split('.')
+    return 'example' in labels or labels == ['localhost']
+
+
 def classify_value(value: str) -> str:
     text = value.strip().strip('"').strip("'")
     lower = text.lower()
@@ -1898,18 +4052,20 @@ def classify_value(value: str) -> str:
         return 'empty'
     if re.fullmatch(r'\$\{?[A-Za-z_][A-Za-z0-9_]*\}?', text):
         return 'Reference to another variable'
-    if any(marker in lower for marker in ('changeme', 'change_me', 'your_', 'your-', 'example', 'placeholder', 'xxx',
-                                          'todo', '<', 'dummy', 'replace')):
-        return 'Placeholder'
-    if re.search(URL_CREDENTIALS, text):
+    if ENV_PRIVATE_KEY.search(text):  # a key on one line, its line breaks written as \n
+        return 'looks real (private key)'
+    # Credential and token shapes first: a real secret that contains a placeholder word stays a secret.
+    if re.search(URL_CREDENTIALS, text) or url_carries_credentials(text):
         return 'URL with credentials'
-    if '://' in text:
-        return 'URL without credentials'
     if re.match(r'(sk|pk|rk)_test_', text):
         return 'Test key'
     for name, pattern in TOKEN_PATTERNS:
         if re.search(pattern, text):
             return f'looks real ({name})'
+    if is_placeholder_value(text):
+        return 'Placeholder'
+    if '://' in text:
+        return 'URL without credentials'
     if lower in {'true', 'false', 'yes', 'no', 'on', 'off'} or re.fullmatch(r'-?\d+(\.\d+)?', text):
         return 'Switch or number'
     if len(text) >= 20 and re.search(r'[A-Za-z]', text) and re.search(r'\d', text):
@@ -1917,22 +4073,56 @@ def classify_value(value: str) -> str:
     return 'set'
 
 
+ENV_ASSIGNMENT = re.compile(r'([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?:=|:(?=[ \t]|$))(.*)')
+ENV_PRIVATE_KEY = re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY|---- BEGIN SSH2 [A-Z0-9 ]*PRIVATE KEY')
+
+
+def closing_quote(text: str, quote: str) -> int:
+    """Index of the first unescaped quote character in text, or -1. Inside " and ` values a backslash escapes the
+    next character; inside ' values only \\' is an escaped quote, as the common loaders read it (a missed close only
+    hides later keys)."""
+    index = 0
+    while index < len(text):
+        if text[index] == '\\' and (quote != "'" or text[index + 1:index + 2] == "'"):
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return -1
+
+
+def continues(text: str) -> bool:
+    """An unquoted value that ends with an unescaped backslash continues on the next line."""
+    return (len(text) - len(text.rstrip('\\'))) % 2 == 1
+
+
 def cmd_envkeys(args: argparse.Namespace) -> int:
-    rows = []
+    rows, notes = [], []
     for name in args.files:
         path = Path(name)
-        try:
-            lines = path.read_text(encoding='utf-8-sig', errors='replace').splitlines()
-        except OSError as exc:
-            raise ToolError(f'File unreadable: {exc}') from exc
-        # Continuation lines of a multi-line value (quoted value, PEM block) are value, never keys.
+        if not path.is_file():
+            raise ToolError(f'File unreadable: {path} is not a file. Give an existing env file.')
+        text = read_text_file(path)  # UTF-8, or UTF-16 with byte-order mark
+        if text is None:
+            notes.append({'file': str(path), 'note': 'Not readable as text (binary, UTF-16 without byte-order mark, '
+                                                     'unreadable or larger than 2 MB): keys not listed.'})
+            continue
+        # Lines end only at \r\n, \n and \r; splitlines() would also split at form feeds and Unicode separators and
+        # print the value text after them as a key.
+        lines = re.split(r'\r\n|\r|\n', text[1:] if text.startswith('\ufeff') else text)
+        # Continuation lines of a multi-line value (quoted value, backslash continuation, PEM block) are value, never
+        # keys.
         open_quote: str | None = None
-        in_pem = False
+        in_pem = continued = False
         for number, line in enumerate(lines, start=1):
             stripped = line.strip()
             if open_quote is not None:
-                if open_quote in stripped:
+                if closing_quote(line, open_quote) >= 0:
                     open_quote = None
+                continue
+            if continued:
+                continued = continues(stripped)
                 continue
             if in_pem:
                 in_pem = not PRIVATE_KEY_END.search(stripped.encode('utf-8', 'replace')) and '-----END ' not in stripped
@@ -1942,23 +4132,31 @@ def cmd_envkeys(args: argparse.Namespace) -> int:
             if stripped.startswith('-----BEGIN '):
                 in_pem = '-----END ' not in stripped
                 continue
-            if stripped.startswith('export '):
-                stripped = stripped[len('export '):].strip()
-            if '=' not in stripped:
+            export = re.match(r'export\s+', stripped)
+            if export:
+                stripped = stripped[export.end():]
+            # KEY=value, or KEY: value (colon and blank), with the same quoting and continuation rules
+            assignment = ENV_ASSIGNMENT.match(stripped)
+            if assignment is None:
                 continue
-            key, value = stripped.split('=', 1)
-            key, value = key.strip(), value.strip()
-            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]*', key):
-                continue
-            multiline = value[:1] in ('"', "'") and value.count(value[0]) == 1
-            if multiline:
-                open_quote = value[0]
-            elif '-----BEGIN ' in value and '-----END ' not in value:
-                in_pem, multiline = True, True
+            key, value = assignment.group(1), assignment.group(2).strip()
+            multiline = False
+            if value[:1] in ('"', "'", '`'):
+                end = closing_quote(value[1:], value[0])
+                if end < 0:  # open until a line with the closing quote
+                    open_quote, multiline = value[0], True
+                else:  # text after the closing quote (a comment) is not value
+                    value = value[1:end + 1]
+            else:
+                value = re.split(r'\s#', value, maxsplit=1)[0].rstrip()  # inline comment of an unquoted value
+                if continues(value):
+                    continued = multiline = True
+                elif '-----BEGIN ' in value and '-----END ' not in value:
+                    in_pem, multiline = True, True
             rows.append({'file': str(path), 'line': number, 'key': key,
                          'shape': 'multiline value' if multiline else classify_value(value),
-                         'length': None if multiline else len(value.strip('"').strip("'"))})
-    print_json({'note': 'Values are never printed; only keys and value shapes.', 'keys': rows})
+                         'length': None if multiline else len(value)})
+    print_json({'note': 'Values are never printed; only keys and value shapes.', 'keys': rows, 'notes': notes})
     return 0
 
 
@@ -1973,50 +4171,223 @@ def is_link_or_junction(path: Path) -> bool:
     return S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
 
 
-def remove_entry(path: Path) -> None:
-    """One file or directory tree; read-only files are made writable first."""
-    if path.is_dir() and not is_link_or_junction(path):
-        remove_tree(path)
-        return
+def windows_absolute(text: str) -> str:
+    """Windows: the absolute form of a path with backslashes, made from the current directory as text only: `.` and
+    `..` components are resolved, every other component is kept exactly as given (abspath would drop a trailing dot
+    or space)."""
+    drive, rest = os.path.splitdrive(text)
+    if not drive.startswith('\\\\') and not (drive and rest[:1] == '\\'):
+        current_drive, current_rest = os.path.splitdrive(strip_extended_prefix(os.getcwd()).replace('/', '\\'))
+        if rest[:1] != '\\':  # relative to the current directory, or to the one of the named drive
+            rest = (current_rest if not drive or drive.upper() == current_drive.upper() else '\\') + '\\' + rest
+        drive = drive or current_drive
+    parts: list[str] = []
+    for part in rest.split('\\'):
+        if part == '..':
+            if parts:
+                parts.pop()
+        elif part not in ('', '.'):
+            parts.append(part)
+    return drive + '\\' + '\\'.join(parts)
+
+
+def extended_path(path: Path | str) -> str:
+    """Windows: the extended-length form of an absolute path, which the system takes as given, so a name with a
+    trailing dot or space is never opened as another entry; every component stays as given and the prefix is added
+    once. Elsewhere the absolute path."""
+    text = os.fspath(path)
+    if os.name != 'nt':
+        return os.path.abspath(text)
+    text = text.replace('/', '\\')
+    if text[:4] in ('\\\\?\\', '\\??\\'):
+        return '\\\\?\\' + text[4:]  # as given
+    text = windows_absolute(text)
+    return '\\\\?\\UNC\\' + text[2:] if text.startswith('\\\\') else '\\\\?\\' + text
+
+
+def entry_kind(item: os.DirEntry) -> str:
+    """'link', 'dir' or 'file', from the directory listing itself and never by opening the path again (Windows would
+    open 'j ' as 'j'). A symbolic link, junction or any other reparse point is a link: removed as a link, never
+    entered. OSError where the listing does not tell."""
+    junction = getattr(item, 'is_junction', None)  # Python 3.12 and newer
+    if item.is_symlink() or (junction is not None and junction()):
+        return 'link'
+    if os.name == 'nt' and item.stat(follow_symlinks=False).st_file_attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+        return 'link'
+    return 'dir' if item.is_dir(follow_symlinks=False) else 'file'
+
+
+def remove_link(item: os.DirEntry) -> None:
+    """A listed link removed as a link; Windows removes directory links, junctions and other directory reparse points
+    with rmdir, which never touches their target."""
+    if os.name == 'nt' and item.stat(follow_symlinks=False).st_file_attributes & 0x10:  # FILE_ATTRIBUTE_DIRECTORY
+        os.rmdir(item.path)
+    else:
+        os.unlink(item.path)
+
+
+def mount_points() -> list[str] | None:
+    """Linux: every mount point of this process (/proc/self/mountinfo); None where the table cannot be read."""
+    if not sys.platform.startswith('linux'):
+        return None
     try:
-        path.unlink()
+        with open('/proc/self/mountinfo', 'rb') as handle:
+            lines = handle.read().decode('utf-8', 'surrogateescape').splitlines()
     except OSError:
+        return None
+    found = []
+    for line in lines:
+        fields = line.split(' ')
+        if len(fields) > 4:  # octal escapes for space, tab, newline and backslash
+            found.append(re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), fields[4]))
+    return found
+
+
+def list_copy(root: Path) -> dict[str, Any]:
+    """Everything below root, listed with entry_kind on extended-length paths: file count and size, links (path,
+    target, whether the target lies outside root), mount points (Linux mount table, else another device), and entries
+    that cannot be classified. Links and mount points are never entered."""
+    base = extended_path(root)
+    table = mount_points()
+    inside = os.path.normpath(os.fspath(root))
+    mounts = sorted(point for point in table or [] if point == inside or point.startswith(inside.rstrip(os.sep) + os.sep))
+    device = os.lstat(base).st_dev
+    result: dict[str, Any] = {'files': 0, 'bytes': 0, 'links': [], 'mounts': mounts, 'unclassified': []}
+    pending = [base]
+    while pending:
+        directory = pending.pop()
         try:
-            os.chmod(path, 0o700)
-            path.unlink()
-        except OSError:
-            pass
+            with os.scandir(directory) as listing:
+                items = list(listing)
+        except OSError as exc:
+            result['unclassified'].append(f'{strip_extended_prefix(directory)}: directory cannot be listed '
+                                          f'({exc.strerror or exc.__class__.__name__})')
+            continue
+        for item in items:
+            shown = strip_extended_prefix(item.path)
+            try:
+                kind = entry_kind(item)
+                if kind == 'link':
+                    try:
+                        target: str | None = os.readlink(item.path)
+                    except (OSError, ValueError):  # a reparse point that is no link: its target is unknown
+                        target = None
+                    full = None if target is None else os.path.join(os.path.dirname(shown), strip_extended_prefix(target))
+                    result['links'].append({'path': shown, 'target': target, 'item': item,
+                                            'outside': full is None or not is_within(Path(full), root)})
+                elif kind == 'dir':
+                    if shown in mounts:
+                        continue
+                    if os.name != 'nt' and item.stat(follow_symlinks=False).st_dev != device:
+                        result['mounts'].append(shown)  # another file system: a mount point the table did not name
+                        continue
+                    pending.append(item.path)
+                else:
+                    result['files'] += 1
+                    result['bytes'] += item.stat(follow_symlinks=False).st_size
+            except OSError as exc:
+                result['unclassified'].append(f'{shown} ({exc.strerror or exc.__class__.__name__})')
+    return result
 
 
-def is_mount_point(path: Path, root_device: int) -> bool:
-    """A POSIX mount point below the copy (another device). On Windows mounted volumes are reparse points, which
-    is_link_or_junction already catches."""
-    if os.name == 'nt':
+if os.name == 'nt':
+    _cleanup_kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    _cleanup_kernel32.CreateFileW.restype = wintypes.HANDLE
+    _cleanup_kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                              wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _cleanup_kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    _cleanup_kernel32.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                             wintypes.DWORD]
+    _cleanup_kernel32.CloseHandle.restype = wintypes.BOOL
+    _cleanup_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def delete_keeping_attributes(target: str) -> bool:
+    """Windows: delete a file without clearing its read-only attribute, which its other hard links share (POSIX
+    delete semantics with the read-only attribute ignored; Windows 10 1809 or newer on NTFS). False where that is not
+    possible."""
+    if os.name != 'nt':
+        return False
+    full = extended_path(target)
+    # DELETE access, all sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    handle = _cleanup_kernel32.CreateFileW(full, 0x00010000, 0x7, None, 3, 0x02000000 | 0x00200000, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
         return False
     try:
-        return os.lstat(path).st_dev != root_device
+        # FileDispositionInfoEx (21): FILE_DISPOSITION_FLAG_DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+        flags = wintypes.DWORD(0x1 | 0x2 | 0x10)
+        return bool(_cleanup_kernel32.SetFileInformationByHandle(handle, 21, ctypes.byref(flags), ctypes.sizeof(flags)))
+    finally:
+        _cleanup_kernel32.CloseHandle(handle)
+
+
+def unlink_entry(target: str) -> None:
+    """Remove a file or file link. The mode of a file is never changed while another hard link shares it: POSIX needs
+    no change (only the directory counts); on Windows a read-only file with one link is made writable, one with
+    several links is deleted without touching the shared attribute, or left in place (OSError)."""
+    try:
+        os.unlink(target)
+        return
+    except PermissionError:
+        if os.name != 'nt':
+            raise
+    info = os.lstat(target)
+    if info.st_nlink > 1 and not S_ISLNK(info.st_mode):
+        if not delete_keeping_attributes(target):
+            raise PermissionError(f'Read-only file shared through hard links, left unchanged: {target}')
+        return
+    os.chmod(target, 0o700)
+    os.unlink(target)
+
+
+def open_parent(target: str, root: str) -> None:
+    """Make the directory of target writable when it lies inside root and is no link (read-only directories, such as
+    a Go module cache, block removing their entries)."""
+    parent = os.path.dirname(extended_path(target))  # abspath would drop a trailing space even after \\?\
+    try:
+        inside = os.path.commonpath([parent, root]) == root
+    except ValueError:
+        inside = False
+    if inside and not is_link_or_junction(Path(parent)):
+        os.chmod(parent, 0o700)
+
+
+def remove_entry(item: os.DirEntry) -> None:
+    """One listed entry: a directory tree (remove_tree), a link as a link, or a file; modes change only where no other
+    hard link shares them (unlink_entry)."""
+    try:
+        kind = entry_kind(item)
+        if kind == 'dir':
+            remove_tree(item.path)
+        elif kind == 'link':
+            remove_link(item)
+        else:
+            unlink_entry(item.path)
     except OSError:
-        return False
+        pass
 
 
-def links_and_mounts(root: Path) -> list[Path]:
-    """Links, junctions and mount points below root; the walk does not enter them."""
-    found, device = [], os.lstat(root).st_dev
-    for current, dirs, names in os.walk(root, followlinks=False):
-        directories, stop = set(dirs), set()
-        for name in dirs + names:
-            entry = Path(current) / name
-            if is_link_or_junction(entry) or (name in directories and is_mount_point(entry, device)):
-                found.append(entry)
-                stop.add(name)
-        dirs[:] = [d for d in dirs if d not in stop]
+def shared_files(root: Path, limit: int = 20) -> list[str]:
+    """Files below root with further hard links (their mode is never changed, so a read-only one may remain)."""
+    found: list[str] = []
+    for current, dirs, names in os.walk(extended_path(root)):
+        for name in names:
+            try:
+                if os.lstat(os.path.join(current, name)).st_nlink > 1:
+                    found.append(strip_extended_prefix(os.path.join(current, name)))
+            except OSError:
+                continue
+            if len(found) >= limit:
+                return found
     return found
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
-    """Remove a work copy made by `workspace`; refuses anything else. Links inside are removed, never followed, and the
-    marker goes last, so an interrupted cleanup can be repeated or measured with --dry-run."""
-    dest = Path(args.dest).absolute()
+    """Remove a work copy made by `workspace`; refuses anything else. Every entry is classified from the directory
+    listing on extended-length paths (Windows never opens 'j ' as 'j'); links and other reparse points are removed
+    first as links, never followed; mount points and entries that cannot be classified stop it before anything is
+    removed. The marker goes last, so an interrupted cleanup can be repeated or measured with --dry-run."""
+    dest = cli_path(args.dest, '--dest').absolute()
     if not dest.is_dir() or is_link_or_junction(dest):
         raise ToolError(f'Not a directory or is a link: {dest}. Only real working copies are removed.')
     dest = dest.resolve()
@@ -2025,67 +4396,89 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                         'nothing removed.')
     if not args.dry_run and is_within(Path.cwd(), dest):
         raise ToolError('The current working directory is in the copy; leave it first. Nothing removed.')
-    try:
-        marker = read_json(dest / WORKSPACE_MARKER)
-    except (OSError, ValueError) as exc:
-        raise ToolError(f'No readable marker {WORKSPACE_MARKER} in {dest}: only copies from workspace are '
-                        f'removed ({exc}).') from exc
-    original = marker.get('project_root') if isinstance(marker, dict) else None
-    if not isinstance(original, str) or not marker.get('baseline_fingerprint'):
-        raise ToolError('The marker is not from workspace (project_root or baseline_fingerprint is missing).')
-    original_path, project = Path(original).resolve(), Path(args.project).resolve()
-    if project != original_path:
+    project = cli_path(args.project, '--project').resolve()
+    if not project.is_dir():
+        raise ToolError(f'Project directory not found: {project}. cleanup removes only the copy of an existing '
+                        'original (--project); nothing removed.')
+    marker, reason = workspace_marker(dest)
+    if marker is None:
+        raise ToolError(f'No valid marker {WORKSPACE_MARKER} in {dest} ({reason}): only copies from workspace are '
+                        'removed.')
+    if not marker.get('baseline_fingerprint'):
+        raise ToolError('The marker is not from workspace (baseline_fingerprint is missing).')
+    original_path = Path(marker['project_root']).resolve()
+    if not same_location(project, original_path):
         raise ToolError(f'The copy belongs to {original_path}, not to {project}.')
     if is_within(dest, original_path) or is_within(original_path, dest):
         raise ToolError(f'Working copy and original overlap ({original_path}); nothing removed.')
-    files = size = 0
-    links = links_and_mounts(dest)
-    skipped = set(links)
-    for current, dirs, names in os.walk(dest, followlinks=False):
-        for name in names:
-            entry = Path(current) / name
-            if entry not in skipped:
-                try:
-                    info = entry.stat()
-                except OSError:
-                    continue
-                files, size = files + 1, size + info.st_size
-        dirs[:] = [d for d in dirs if Path(current) / d not in skipped]
-    result = {'dest': str(dest), 'project_root': str(original_path), 'files': files, 'bytes': size,
-              'links_removed_not_followed': len(links), 'dry_run': bool(args.dry_run)}
+    listing = list_copy(dest)
+    links = listing['links']
+    result = {'dest': str(dest), 'project_root': str(original_path), 'files': listing['files'],
+              'bytes': listing['bytes'], 'links_removed_not_followed': len(links),
+              'links_leading_outside': [{'path': link['path'], 'target': link['target']}
+                                        for link in links if link['outside']][:50],
+              'mount_points': listing['mounts'][:50], 'unclassified_entries': listing['unclassified'][:50],
+              'dry_run': bool(args.dry_run)}
+    stop = []
+    if listing['mounts']:
+        stop.append('Mount points lie in the copy (mount_points); cleanup never enters them. Unmount them, then run '
+                    'cleanup again.')
+    if listing['unclassified']:
+        stop.append('Entries of the copy cannot be classified (unclassified_entries), so links among them could not '
+                    'be excluded. Make their directories readable, then run cleanup again.')
+    if stop:
+        result['hint'] = ' '.join(stop) + ' Nothing removed.'
+        if not args.dry_run:
+            result['removed'] = False
+        print_json(result)
+        return 1
     if args.dry_run:
         print_json(result)
         return 0
-    # Links, junctions and mount points first, as links: their targets (possibly the original or a shared cache) stay
-    # untouched. If one cannot be removed, nothing else is deleted.
-    for entry in sorted(links, key=lambda p: len(p.parts), reverse=True):
-        try:  # Windows removes directory links and junctions with rmdir, POSIX links with unlink
-            if os.name == 'nt' and entry.is_dir():
-                os.rmdir(entry)
-            else:
-                entry.unlink()
-        except OSError:
-            pass
-    remaining_links = links_and_mounts(dest)
-    if remaining_links:
-        result.update(removed=False, links_not_removed=[str(p) for p in remaining_links[:20]],
-                      hint='Links or mount points could not be removed; nothing else deleted. Check and '
-                           'retry.')
+    # Links, junctions and other reparse points first, as links: their targets (possibly the original or a shared
+    # cache) stay untouched. If one cannot be removed, nothing else is deleted.
+    for link in sorted(links, key=lambda found: found['path'].count(os.sep), reverse=True):
+        for attempt in (1, 2):
+            try:
+                remove_link(link['item'])
+                break
+            except OSError:
+                if attempt == 2:
+                    break
+                try:  # a link in a read-only directory: make that directory writable (inside the copy only)
+                    open_parent(link['item'].path, extended_path(dest))
+                except OSError:
+                    break
+    remaining = list_copy(dest)
+    if remaining['links'] or remaining['mounts'] or remaining['unclassified']:
+        result.update(removed=False, links_not_removed=[link['path'] for link in remaining['links'][:20]],
+                      hint='Links or mount points could not be removed; nothing else deleted. Check and retry.')
         print_json(result)
         return 1
-    for child in list(dest.iterdir()):
-        if child.name != WORKSPACE_MARKER:
+    root = extended_path(dest)
+    with os.scandir(root) as children:
+        for child in list(children):
+            if child.name != WORKSPACE_MARKER:
+                remove_entry(child)
+    with os.scandir(root) as children:
+        rest = [child for child in children]
+    if not [child for child in rest if child.name != WORKSPACE_MARKER]:
+        for child in rest:
             remove_entry(child)
-    if not [child for child in dest.iterdir() if child.name != WORKSPACE_MARKER]:
-        remove_entry(dest / WORKSPACE_MARKER)
         try:
-            dest.rmdir()
+            os.rmdir(root)
         except OSError:
             pass
-    result['removed'] = not dest.exists()
+    result['removed'] = not os.path.lexists(root)
     if not result['removed']:
         result['hint'] = ('Parts of the copy remain, for example because a process still uses them. The marker is '
                           'retained: stop the processes and retry; --dry-run shows what remains.')
+        shared = shared_files(dest)
+        if shared:
+            result['shared_files_left'] = shared
+            result['hint'] += (' Files with further hard links (shared_files_left) keep their read-only mode, which '
+                               'their other links share: check that the other links are not needed, then make them '
+                               'writable and retry.')
     print_json(result)
     return 0 if result['removed'] else 1
 
@@ -2110,8 +4503,11 @@ def security_closure_allowed(data: dict[str, Any], state: dict[str, Any], run: P
     if isinstance(review, dict) and review.get('status') in ('DONE', 'NOT_APPLICABLE', 'NOT_PERFORMED', 'BLOCKED'):
         return True
     successor_id = state.get('superseded_by_run')
+    # a run superseded before its audit.json existed is known by its RUN-STATE.json run_id or directory name
+    own_id = next((value for value in (data.get('run_id'), state.get('run_id')) if isinstance(value, str) and value),
+                  run.name)
     if (not isinstance(successor_id, str) or not ID_PATTERN.fullmatch(successor_id)
-            or successor_id == data.get('run_id') or successor_id == run.name):
+            or successor_id == own_id or successor_id == run.name):
         return False
     successor = run.parent / successor_id
     if not is_within(successor, run.parent) or successor.resolve() == run.resolve():
@@ -2128,14 +4524,42 @@ def security_closure_allowed(data: dict[str, Any], state: dict[str, Any], run: P
         if (not isinstance(linked, dict) or linked.get('run_id') != successor_id
                 or linked.get('schema_version') != SCHEMA_VERSION):
             return False
-        found = found or data.get('run_id') in id_list(linked.get('previous_run_ids'))
+        found = found or own_id in id_list(linked.get('previous_run_ids'))
     return found
+
+
+CLOSED_GUIDANCE = 'Closed; do not resume. A re-audit, an implementation run or a prompt upgrade creates a new linked run.'
+CLOSED_DAMAGED_GUIDANCE = ('Closed run with an unreadable or missing audit.json; do not resume. Restore audit.json from a '
+                           'backup or start a new linked run; never restore the interim checkpoint over a closed run.')
+PROBABLY_CLOSED_GUIDANCE = ('Probably closed: RUN-STATE.json is unreadable, incomplete or missing, but audit.json has a '
+                            'finished security review and a final verdict. Not resumable by default and never restore the '
+                            'interim checkpoint over it; the user decides. If the user confirms it was closed: restore '
+                            'RUN-STATE.json from a backup (with closed_at_utc and the closure receipt); without a backup, '
+                            'leave the run as it is and start a new linked run. If the run continues: rebuild '
+                            'RUN-STATE.json from audit.json, RESUME.md and the evidence (run_id, schema_version, '
+                            'prompt_version, tool_version, phase P9, updated_at_utc, authorization, check lists, next '
+                            'steps) without closed_at_utc and closure, run checkpoint reanchor <run> when '
+                            'checkpoints/interim/ exists, run validate --final, then close records the closure.')
+REBUILT_STATE_FIELDS = ('run_id, schema_version, prompt_version, tool_version, phase, updated_at_utc, authorization, check '
+                        'lists, next steps')
+# What a current run (see current_run) whose RUN-STATE.json lacks tool_version needs: the one field, nothing rebuilt.
+TOOL_VERSION_REMEDY = (f'add "tool_version": "{TOOL_VERSION}" to RUN-STATE.json and keep every other field (closed_at_utc, '
+                       'closure, interim_checkpoint, superseded_by_run; a closure that close did not record is handled by '
+                       'E_CLOSURE_UNRECORDED); run checkpoint reanchor <run> only if the interim_checkpoint anchor is '
+                       'missing')
+# A recovery-* folder of moved live files leaves validate and checkpoint results unchanged.
+RESTORE_GUIDANCE = ('Offer the verified interim checkpoint; restoring discards all progress since the interim checkpoint. '
+                    'Restore with checkpoint restore <run> (--dry-run first shows what it moves and copies): it moves '
+                    'the live files the manifest lists into recovery-<UTC>/ inside the run, copies the checkpoint files '
+                    'back, RUN-STATE.json last with the interim_checkpoint anchor, and leaves files created after the '
+                    'checkpoint in place. Then run validate, review those files and resume with P8.')
 
 
 def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any] | None:
     """Facts about one run directory; None if it is no audit run (e.g. a folder of implementation notes)."""
     loaded: dict[str, Any] = {}
     problems = []
+    damaged = set()
     for name in ('RUN-STATE.json', 'audit.json'):
         if (directory / name).is_file():
             try:
@@ -2144,13 +4568,26 @@ def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any
             except (OSError, ValueError) as exc:
                 loaded[name] = {}
                 problems.append(f'{name} unreadable: {exc}')
+                damaged.add(name)
             else:
                 if not isinstance(value, dict):
                     problems.append(f'{name} does not contain a JSON object.')
+                    damaged.add(name)
     if not loaded:
-        return None
+        if not (directory / 'checkpoints/interim/manifest.json').is_file():
+            return None
+        # only the interim checkpoint is left: a run to recover, not a folder of other notes
+        problems = ['RUN-STATE.json missing', 'audit.json missing']
     state, audit = loaded.get('RUN-STATE.json', {}), loaded.get('audit.json', {})
     corrupt = len(problems) == 2
+    review = audit.get('security_review')
+    # a final verdict and a finished security review in audit.json while RUN-STATE.json is lost: probably closed
+    finished = (isinstance(review, dict) and review.get('status') in ('DONE', 'NOT_APPLICABLE', 'NOT_PERFORMED', 'BLOCKED')
+                and status_value(audit.get('audit_status')) in AUDIT_STATUS
+                and status_value(audit.get('release_status')) in RELEASE_STATUS)
+    # a readable RUN-STATE.json without run_id is as lost as an unreadable one
+    state_lost = 'RUN-STATE.json' in damaged or 'RUN-STATE.json' not in loaded or not state.get('run_id')
+    audit_lost = 'audit.json' in damaged or 'audit.json' not in loaded
     raw_version = state.get('prompt_version') or audit.get('prompt_version')
     version = str(raw_version) if isinstance(raw_version, (int, float)) else status_value(raw_version)
     parsed = version_tuple(version)
@@ -2160,10 +4597,19 @@ def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any
     compatible = schema == SCHEMA_VERSION
     if corrupt:
         status = 'CORRUPT'
-    elif state.get('closed_at_utc'):
-        status = 'OPEN' if compatible and not security_closure_allowed(audit, state, directory) else 'CLOSED'
-    elif 'closed_at_utc' in state or (parsed is not None and parsed >= (3, 1)):
-        status = 'OPEN'  # explicit closure field or supported identifier requires a closure marker
+    elif closure_marked(state) and audit_lost:
+        status = 'CLOSED'  # a damaged closed run is never reopened
+    elif closure_marked(state):
+        # only a typed closure beside a security review that is still open reopens; damage never does
+        review_open = isinstance(review, dict) and review.get('status') in ('PENDING', 'IN_PROGRESS')
+        status = ('OPEN' if compatible and review_open and 'closure' not in state
+                  and not security_closure_allowed(audit, state, directory) else 'CLOSED')
+    elif state_lost and finished:
+        status = 'PROBABLY_CLOSED'
+    elif 'closed_at_utc' in state or (parsed is not None and parsed >= (3, 1)) or current_run(state, directory):
+        # explicit closure field, supported identifier or a current run (whatever its RUN-STATE.json says about the
+        # prompt version) requires a closure marker
+        status = 'OPEN'
     elif audit_status in AUDIT_STATUS and report:
         status = 'LEGACY_CLOSED_INFERRED'  # stored run has no explicit closure field
     else:
@@ -2177,47 +4623,114 @@ def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any
     live_valid = False
     top_type_error = False
     live_codes: set[str] = set()
-    if inspect_live and compatible and audit:
+    live_errors: list[dict[str, Any]] = []
+    validated = inspect_live and compatible and 'audit.json' in loaded and 'audit.json' not in damaged
+    if validated:
         try:
             live_issues, _ = validate_audit(audit, directory, None, final=False)
-            live_codes = live_issues.codes()
+            live_codes, live_errors = live_issues.codes(), live_issues.errors
             top_type_error = any(e['code'] == 'E_TYPE' and e['where'] in TOP_LEVEL_REQUIRED for e in live_issues.errors)
             live_valid = not live_issues.errors
         except (OSError, ValueError, TypeError):
             live_codes = {'E_TYPE'}
     checkpoint = (verify_checkpoint(directory) if inspect_live else
                   {'state': 'PRESENT_UNVERIFIED' if (directory / 'checkpoints/interim').is_dir() else 'ABSENT'})
+    anchor = state.get('interim_checkpoint')
+    if isinstance(anchor, dict) and nonempty(anchor.get('reanchored_at_utc')):
+        checkpoint = dict(checkpoint, reanchored_at_utc=anchor['reanchored_at_utc'])
     phase = re.match(r'^P(\d+)\b', str(state.get('phase', '')))
     before_interim = phase is not None and int(phase[1]) < 7
     project_changed = bool(live_codes & {'E_CODE_REF_STALE', 'E_SOURCE_STALE', 'E_CODE_REF_FILE'})
     malformed = bool(problems) or not compatible or top_type_error or any(key not in audit for key in TOP_LEVEL_REQUIRED)
-    if corrupt and not inspect_live:
+    closed = status in ('CLOSED', 'LEGACY_CLOSED_INFERRED', 'PROBABLY_CLOSED')
+    restorable = checkpoint['state'] == 'VALID' and not before_interim
+    # audit.json is usable and only RUN-STATE.json is unreadable, incomplete or missing
+    state_damaged = (validated and live_codes <= {'E_RUN_STATE', 'E_RUN_STATE_TOOL_VERSION'}
+                     and ('RUN-STATE.json' in damaged or 'RUN-STATE.json' not in loaded or 'E_RUN_STATE' in live_codes))
+    # RUN-STATE.json is complete and only lacks tool_version: the one field is added, nothing is rebuilt
+    tool_version_missing = validated and live_codes == {'E_RUN_STATE_TOOL_VERSION'}
+    top_level_only = (validated and not damaged and bool(live_errors) and all(
+        e['code'] in ('E_MISSING_FIELD', 'E_TYPE') and e['where'] in TOP_LEVEL_REQUIRED for e in live_errors))
+    fallback = (' Only if the repair is not possible: ' + RESTORE_GUIDANCE) if restorable else ''
+    if closed:
+        guidance = CLOSED_GUIDANCE
+        if status == 'PROBABLY_CLOSED':
+            guidance = PROBABLY_CLOSED_GUIDANCE
+        elif audit_lost:
+            guidance = CLOSED_DAMAGED_GUIDANCE
+    elif corrupt and not inspect_live:
         guidance = 'CORRUPT live state; inspect this run and verify its interim checkpoint for possible recovery. Restoring discards all progress since the interim checkpoint.'
     elif not inspect_live:
         guidance = 'Continue from the persisted phase; inspect this run before resuming.'
+    elif corrupt and checkpoint['state'] != 'VALID':
+        guidance = ('CORRUPT live state and no verified interim checkpoint: repair the live state before anything else; '
+                    'not resumable as it is. Then revalidate.')
+    elif not compatible and checkpoint['state'] != 'VALID':
+        guidance = 'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. Never change the schema identifier.'
+    elif compatible and not corrupt and phase is not None and int(phase[1]) in (8, 9) and checkpoint['state'] != 'VALID':
+        # master prompt §16: without a verified interim checkpoint, P8 never starts or continues
+        last_resort = ('report the checkpoint state to the user, keep the run open with its results and offer a new '
+                       'linked re-audit run or a recorded user decision (security_review NOT_PERFORMED with its decision '
+                       'source).')
+        guidance = (f'Interim checkpoint {checkpoint["state"]} in {phase[0]}: do not start or continue P8. '
+                    + ('' if live_valid else 'Repair live state, then revalidate, so its results are kept. ')
+                    + (str(checkpoint.get('remedy')) + ' Only if none of this is possible: '
+                       + last_resort if checkpoint['state'] == 'INVALID' else 'R' + last_resort[1:])
+                    + (' If no P8 result exists yet, complete P7 instead: validate --final, then checkpoint create.'
+                       if checkpoint['state'] == 'ABSENT' and int(phase[1]) == 8 else ''))
     elif project_changed:
         guidance = 'Continue / revalidate; project changed since checkpoint: follow re-audit rules. Do not restore over live progress.'
+    elif state_damaged:
+        guidance = ('RUN-STATE.json is unreadable, incomplete or missing while audit.json is usable: rebuild RUN-STATE.json '
+                    f'from audit.json, RESUME.md and the evidence ({REBUILT_STATE_FIELDS}), '
+                    + ('run checkpoint reanchor <run>, ' if checkpoint['state'] != 'ABSENT' else '')
+                    + 'then validate and continue from that phase.' + fallback)
+    elif tool_version_missing:
+        guidance = ('RUN-STATE.json lacks tool_version (E_RUN_STATE_TOOL_VERSION): ' + TOOL_VERSION_REMEDY
+                    + '. Then validate and continue from the persisted phase.'
+                    + (' ' + str(checkpoint.get('remedy')) if checkpoint['state'] == 'INVALID' else ''))
     elif live_codes and not malformed:
         guidance = 'Repair live state, then revalidate; preserve progress and continue from the persisted phase.'
     elif before_interim and compatible:
         guidance = 'Continue from the persisted phase; complete and revalidate live state before the interim checkpoint.'
+    elif top_level_only:
+        guidance = ('Repair live state first: restore the missing or mistyped top-level fields of audit.json ('
+                    + ', '.join(sorted({e['where'] for e in live_errors})) + ') from RESUME.md, RUN-STATE.json and the '
+                    'evidence, then revalidate and continue from the persisted phase.' + fallback)
     elif malformed and not before_interim and checkpoint['state'] == 'VALID':
-        guidance = 'Live state malformed or schema-invalid. Offer the verified interim checkpoint; restoring discards all progress since the interim checkpoint. Restore its files to live state using temp files + atomic rename, keep the last valid state, then validate before resuming P8/P9.'
-    elif corrupt:
-        guidance = 'CORRUPT live state; no verified checkpoint is available. Repair live state, then revalidate.'
-    elif not compatible:
-        guidance = 'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. Never change the schema identifier.'
+        guidance = 'Live state malformed or schema-invalid. ' + RESTORE_GUIDANCE
     elif malformed:
         guidance = 'Repair live state, then revalidate; no verified interim checkpoint is available.'
+    elif checkpoint['state'] == 'INVALID':
+        guidance = ('Interim checkpoint INVALID: ' + str(checkpoint.get('remedy'))
+                    + ' Only if none of this is possible: start a new linked re-audit run.')
     else:
         guidance = 'Continue from live state and persisted phase; revalidate unresolved checks and verify the interim checkpoint before P8.'
-    if not compatible and not inspect_live and not corrupt:
+    if not compatible and not inspect_live and not corrupt and not closed:
         guidance = 'Cannot resume with this package; preserve artifacts and create a new linked audit/re-audit run. Never change the schema identifier.'
-    return {'dir': directory.name, 'run_id': status_value(state.get('run_id')) or status_value(audit.get('run_id')),
-            'schema_version': schema, 'resumable_with_package':
-                (checkpoint['state'] == 'VALID' if inspect_live else None) if corrupt else compatible,
-            'live_state': 'CORRUPT' if corrupt else (('VALID' if live_valid else 'INVALID_OR_INCOMPLETE') if inspect_live else 'NOT_CHECKED'),
+    if closed:
+        resumable: bool | None = False
+    elif not inspect_live:
+        resumable = None if corrupt else compatible
+    elif compatible and not corrupt and phase is not None and int(phase[1]) in (8, 9) and checkpoint['state'] != 'VALID':
+        resumable = False  # P8 never starts or continues without a verified interim checkpoint
+    else:
+        # repair or restore under this package: supported live schema, or a verified checkpoint to restore from
+        resumable = compatible and not corrupt or checkpoint['state'] == 'VALID'
+    if corrupt:
+        live_state = 'CORRUPT'
+    elif not inspect_live:
+        live_state = 'NOT_CHECKED'
+    elif not compatible:
+        live_state = 'INCOMPATIBLE'
+    elif validated or 'audit.json' in damaged:
+        live_state = 'VALID' if live_valid else 'INVALID_OR_INCOMPLETE'
+    else:
+        live_state = 'NOT_CHECKED'  # no audit.json to validate
+    info = {'dir': directory.name, 'run_id': status_value(state.get('run_id')) or status_value(audit.get('run_id')),
+            'schema_version': schema, 'resumable_with_package': resumable, 'live_state': live_state,
             'live_validation_errors': sorted(live_codes) if inspect_live else None, 'resume_guidance': guidance,
+            'project_changed_since_run': project_changed if validated else None,
             'security_review': {'status': status_value((audit.get('security_review') or {}).get('status'))
                                 if isinstance(audit.get('security_review'), dict) else None},
             'checkpoint': checkpoint,
@@ -2227,6 +4740,15 @@ def describe_run(directory: Path, *, inspect_live: bool = True) -> dict[str, Any
             'release_status': status_value(audit.get('release_status')),
             'previous_run_ids': audit.get('previous_run_ids') or state.get('previous_run_ids'),
             'has_report': report, 'problems': problems}
+    receipt = closure_receipt_state(state, directory)
+    if receipt is not None:  # closed current run (current_run): was its closure recorded by close, still valid?
+        info.update(closure_recorded=receipt != 'UNRECORDED', closure_stale=receipt == 'STALE')
+    closure = state.get('closure') if isinstance(state, dict) else None
+    if status != 'OPEN' and isinstance(state, dict) and (
+            nonempty(state.get('superseded_by_run')) or isinstance(closure, dict) and closure.get('superseded') is True):
+        # close --superseded-by claims no validation: the verdict of such a run was never checked
+        info.update(superseded_by_run=state.get('superseded_by_run'), closure_superseded=True)
+    return info
 
 
 def cmd_runs(args: argparse.Namespace) -> int:
@@ -2240,26 +4762,64 @@ def cmd_runs(args: argparse.Namespace) -> int:
                 other.append(directory.name)
             else:
                 runs.append(info)
-    runs.sort(key=lambda item: str(item['created_at_utc']))
+    # creation time in UTC; values without a time zone or date format sort first, among themselves as text
+    runs.sort(key=lambda item: (utc_stamp(item['created_at_utc']) is not None,
+                                utc_stamp(item['created_at_utc']) or datetime.min.replace(tzinfo=timezone.utc),
+                                str(item['created_at_utc'])))
     open_runs = [r['dir'] for r in runs if r['status'] in ('OPEN', 'LEGACY_OPEN_INFERRED', 'CORRUPT')]
-    closed_runs = [r['dir'] for r in runs if r['status'] in ('CLOSED', 'LEGACY_CLOSED_INFERRED')]
-    latest_resumable = next((r['dir'] for r in reversed(runs) if r['resumable_with_package'] and r['dir'] in open_runs), None)
-    selected = latest_resumable or (open_runs[-1] if open_runs else None)
-    for index, info in enumerate(runs):
-        if args.inspect_all or info['dir'] == selected:
-            runs[index] = describe_run(results / info['dir']) or info
-    latest_resumable = next((r['dir'] for r in reversed(runs) if r['resumable_with_package'] and r['dir'] in open_runs), None)
+    closed_runs = [r['dir'] for r in runs if r['status'] in ('CLOSED', 'LEGACY_CLOSED_INFERRED', 'PROBABLY_CLOSED')]
+    # an open run older than a closed one is no default for resuming; its note says so
+    predates_closed = {info['dir'] for position, info in enumerate(runs)
+                       if any(r['dir'] in closed_runs for r in runs[position + 1:])}
+    # only the newest open run is a default for resuming: it is inspected, so a damaged newer run is judged, not
+    # skipped for an older one
+    candidates = [index for index in range(len(runs)) if runs[index]['dir'] in open_runs
+                  and runs[index]['dir'] not in predates_closed]
+    for index in reversed(range(len(runs))):
+        if args.inspect_all or candidates and index == candidates[-1]:
+            runs[index] = describe_run(results / runs[index]['dir']) or runs[index]
+    newest = runs[candidates[-1]] if candidates else None
+    latest_resumable = newest['dir'] if newest is not None and newest['resumable_with_package'] else None
     notes = []
+    if newest is not None and latest_resumable is None and len(candidates) > 1:
+        notes.append(f'Newest open run {newest["dir"]} is not resumable as it is (see its resume_guidance); older open '
+                     'runs are no default for resuming: the user decides which run continues.')
     if any(r['status'].startswith('LEGACY') for r in runs):
         notes.append('Runs without an explicit closure field may have LEGACY_* status inferred from audit_status and REPORT.md '
                      'and must be clarified with the user if uncertain.')
     if len(open_runs) > 1:
         notes.append('Multiple unclosed runs: clarify which one is intended before resuming.')
+    for position, info in enumerate(runs):
+        newer_closed = [r['dir'] for r in runs[position + 1:] if r['dir'] in closed_runs]
+        if info['dir'] in open_runs and newer_closed:
+            notes.append(f'Open run {info["dir"]} predates closed run {newer_closed[-1]}: resuming it is not the default; '
+                         'the user decides whether to resume it.')
+            info['resume_guidance'] = (f'Predates closed run {newer_closed[-1]}: resuming it is not the default; the '
+                                       'user decides whether to resume it. Only then: ' + info['resume_guidance'])
+    for info in runs:
+        if (info.get('checkpoint') or {}).get('reanchored_at_utc'):
+            notes.append(f'Run {info["dir"]} has a re-anchored interim checkpoint (checkpoint.reanchored_at_utc): '
+                         + REANCHORED_NOTE)
+        if info.get('closure_recorded') is False:
+            notes.append(f'Run {info["dir"]} records a closure without both closed_at_utc and the closure receipt of '
+                         'close (closure_recorded false): its closure and final validation are unproven, so it is no '
+                         'closed base for a re-audit until the user decides. ' + CLOSURE_UNRECORDED_REMEDY
+                         + ' Or start a new linked run.')
+        elif info.get('closure_stale'):
+            notes.append(f'Run {info["dir"]} changed after closure (closure_stale true): audit.json differs from the '
+                         'closure receipt. A closed run is immutable; restore audit.json as closed and record '
+                         'corrections in a new linked run.')
+        if info.get('closure_superseded'):
+            notes.append(f'Run {info["dir"]} was closed by supersession (superseded_by_run '
+                         f'{info.get("superseded_by_run")}): its verdict was never validated, so it is no closed base '
+                         'for a re-audit; its successor is.')
     if other:
         notes.append('Other directories without RUN-STATE.json and audit.json (other_dirs) are not audit runs.')
     print_json({'results_dir': str(results), 'exists': results.is_dir(), 'package_prompt_version': PROMPT_VERSION,
                 'runs': runs, 'latest_open': open_runs[-1] if open_runs else None,
-                'latest_closed': closed_runs[-1] if closed_runs else None,
+                'latest_closed': next((r['dir'] for r in reversed(runs)  # never a PROBABLY_CLOSED or superseded run
+                                       if r['status'] in ('CLOSED', 'LEGACY_CLOSED_INFERRED')
+                                       and not r.get('closure_superseded')), None),
                 'latest_resumable': latest_resumable, 'other_dirs': other, 'notes': notes})
     return 0
 
@@ -2270,6 +4830,7 @@ class Issues:
     def __init__(self) -> None:
         self.errors: list[dict[str, str]] = []
         self.warnings: list[dict[str, str]] = []
+        self.review: list[dict[str, Any]] = []  # closure_review: items only a reader can judge (data, not errors)
 
     def error(self, code: str, where: str, message: str) -> None:
         self.errors.append({'code': code, 'where': where, 'message': message})
@@ -2291,6 +4852,11 @@ def check_enum(issues: Issues, where: str, value: Any, allowed: set, nullable: b
         issues.error('E_ENUM', where, f'Invalid value {value!r}; allowed: {", ".join(sorted(map(str, allowed)))}.')
 
 
+def member(value: Any, allowed: set | frozenset) -> bool:
+    """Set membership that treats malformed values (lists, objects) as not allowed instead of failing."""
+    return isinstance(value, str) and value in allowed
+
+
 def normalize_ws(text: str) -> str:
     return ' '.join(text.split())
 
@@ -2303,23 +4869,34 @@ def tally(entries: Iterable[dict[str, Any]], field: str) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def project_path_of(ref: Any) -> str | None:
+def ref_path_part(text: str) -> str:
+    """Path part of a reference: without '#anchor', '::name' or ':lines', with '/' separators and no leading './'."""
+    text = re.sub(r':\d+(-\d+)?$', '', text.split('#', 1)[0].split('::', 1)[0]).replace('\\', '/')
+    while text.startswith('./'):
+        text = text[2:]
+    return text
+
+
+def project_path_of(ref: Any, known: dict[str, str] | None = None) -> str | None:
     """Project-relative path in a reference such as 'docs/prd.md#goal', 'src/a.ts:12-14' or 'tests/x.py::test_y'.
 
-    None for everything else: URLs, prose, prefixed references like 'run:VISION.md' or 'user:StartRequest',
-    absolute paths and files of the results directory.
+    With `known` (the start-baseline files), also a reference whose path part or first word is one of them, such as
+    'Dockerfile', 'docs/Product Spec.md#goal' or 'README.md section Goal'. None for everything else: URLs, prose,
+    prefixed references like 'run:VISION.md' or 'user:StartRequest', absolute paths and files of the results directory.
     """
     if not isinstance(ref, str):
         return None
     text = ref.strip()
+    if known and text and '://' not in text:
+        for candidate in (text, text.split()[0]):
+            if ref_path_part(candidate) in known:
+                return ref_path_part(candidate)
     if not text or '://' in text or any(char.isspace() for char in text) or has_glob_magic(text):
         return None
     head = text.split(':', 1)[0]
     if ':' in text and '/' not in head and '\\' not in head and '.' not in head:
         return None  # prefixed reference or Windows drive letter
-    text = re.sub(r':\d+(-\d+)?$', '', text.split('#', 1)[0].split('::', 1)[0]).replace('\\', '/')
-    if text.startswith('./'):
-        text = text[2:]
+    text = ref_path_part(text)
     text = text.rstrip('/')
     if text == DEFAULT_RESULTS_DIRNAME or text.startswith(DEFAULT_RESULTS_DIRNAME + '/'):
         return None
@@ -2328,19 +4905,510 @@ def project_path_of(ref: Any) -> str | None:
     return None
 
 
+def project_text(path: Path) -> tuple[str, bool]:
+    """Text of a project file as editors show it (UTF-16 or UTF-8 by byte-order mark, otherwise UTF-8) and whether
+    it is neither: such a file is read as Windows-1252, or Latin-1 where Windows-1252 leaves a byte undefined."""
+    data = path.read_bytes()
+    encoding = 'utf-16' if data[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8-sig'
+    try:
+        return data.decode(encoding), False
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode('cp1252'), True
+    except UnicodeDecodeError:
+        return data.decode('latin-1'), True
+
+
+def encoding_mismatch(rel: str) -> str:
+    return (f'{rel} is not valid UTF-8, nor UTF-16 or UTF-8 with byte-order mark; read as Windows-1252 the excerpt '
+            'does not occur in it. Copy the excerpt as an editor shows the file in that encoding, or cite the location '
+            'in evidence limits instead.')
+
+
+# Terminal control sequences (colours, cursor movement) that a rendered terminal never shows.
+CSI_SEQUENCE = re.compile('\x1b\\[[0-?]*[ -/]*[@-~]')
+
+
+def log_section(excerpt: str) -> str:
+    """A quoted log section as compared: without terminal control sequences, trailing spaces and line-ending style."""
+    lines = re.split(r'\r\n|\r|\n', CSI_SEQUENCE.sub('', excerpt).strip('\r\n'))
+    return '\n'.join(line.rstrip() for line in lines)
+
+
+def log_contains(path: Path, excerpts: list[str], chunk_chars: int = 1 << 22) -> list[bool]:
+    """Which excerpts occur verbatim in a log read once in bounded pieces, so large logs are never held in memory.
+
+    Line endings, trailing whitespace of each line and terminal control sequences do not matter; a multi-line
+    excerpt matches contiguous lines (its first line ends a log line, its last line begins one). Reading stops once
+    every excerpt was found.
+    """
+    wanted = [log_section(excerpt) for excerpt in excerpts]
+    found = [False] * len(wanted)
+    pending = list(range(len(wanted)))
+    overlap = max((len(text) for text in wanted), default=1) - 1
+    tail, buffer, size, carry = '', [], 0, ''
+
+    def search() -> None:
+        nonlocal tail, buffer, size
+        text = tail + ''.join(buffer)
+        for index in list(pending):
+            if wanted[index] in text:
+                found[index] = True
+                pending.remove(index)
+        tail, buffer, size = (text[len(text) - overlap:] if overlap > 0 else ''), [], 0
+
+    with open(path, encoding='utf-8-sig', errors='replace', newline=None) as handle:  # \r\n and \r read as \n
+        while pending:
+            piece = handle.readline(chunk_chars)
+            if not piece:
+                break
+            piece = carry + piece
+            if piece.endswith('\n'):
+                carry, piece = '', CSI_SEQUENCE.sub('', piece[:-1]).rstrip() + '\n'
+            else:  # part of a long line: hold back trailing spaces and a split control sequence (bounded)
+                cut = len(piece.rstrip())
+                escape = piece.rfind('\x1b', max(0, cut - 64))
+                cut = escape if escape >= 0 else cut
+                cut = cut if len(piece) - cut <= 4096 else len(piece)
+                carry, piece = piece[cut:], CSI_SEQUENCE.sub('', piece[:cut])
+            buffer.append(piece)
+            size += len(piece)
+            if size >= chunk_chars:
+                search()
+        buffer.append(CSI_SEQUENCE.sub('', carry).rstrip())
+        search()
+    return found
+
+
+def log_whole_lines(path: Path, excerpts: list[str], chunk_chars: int = 1 << 22) -> list[bool]:
+    """Which excerpts consist of complete lines of the log: all their lines are whole lines of it, one after the other
+    (a fragment of a line is none). Compared like log_contains, also without indentation; the log is read line by
+    line in bounded pieces."""
+    wanted = [[line.strip() for line in log_section(excerpt).split('\n')] for excerpt in excerpts]
+    whole = [False] * len(wanted)
+    by_last: dict[str, list[int]] = {}
+    for index, lines in enumerate(wanted):
+        by_last.setdefault(lines[-1], []).append(index)
+    window: deque[str] = deque(maxlen=max((len(lines) for lines in wanted), default=1))
+    with open(path, encoding='utf-8-sig', errors='replace', newline=None) as handle:
+        while not all(whole):
+            piece = handle.readline(chunk_chars)
+            if not piece:
+                break
+            if len(piece) == chunk_chars and not piece.endswith('\n'):  # a line longer than any quotation: no match
+                while len(piece) == chunk_chars and not piece.endswith('\n'):
+                    piece = handle.readline(chunk_chars)
+                window.clear()
+                continue
+            window.append(CSI_SEQUENCE.sub('', piece).strip())
+            for index in by_last.get(window[-1], ()):
+                lines = wanted[index]
+                if not whole[index] and len(lines) <= len(window) and list(window)[len(window) - len(lines):] == lines:
+                    whole[index] = True
+    return whole
+
+
+def shared_log_sections(quoted: list[tuple[str, str]], owner: dict[str, str],
+                        whole_lines: Callable[[list[str]], list[bool]]) -> list[tuple[str, str]]:
+    """Quoted sections of one log that are identical to, contain or lie within a section another check quotes:
+    (location of the quotation, the other check), each location once. A section of complete log lines (whole_lines
+    decides it against the log) lies within another only when all its lines are lines of the other; a fragment of a
+    line is compared as text."""
+    sections = [(at, owner[at], log_section(text).strip('\n')) for at, text in quoted]
+    starts, position = [], 0
+    for _, _, text in sections:
+        starts.append(position)
+        position += len(text) + 1
+    corpus = '\x00'.join(text for _, _, text in sections)  # one search per section, linear in the quoted text
+    pairs: list[tuple[int, int]] = []  # (section, other section) with the text of the first inside the second
+    for index, (_, check_id, text) in enumerate(sections):
+        found = corpus.find(text)
+        while found >= 0:
+            other = bisect.bisect_right(starts, found) - 1
+            if sections[other][1] != check_id and found + len(text) <= starts[other] + len(sections[other][2]):
+                pairs.append((index, other))
+            found = corpus.find(text, found + 1)
+    inner = sorted({index for index, _ in pairs})
+    whole = dict(zip(inner, whole_lines([sections[index][2] for index in inner]))) if inner else {}
+    shared: dict[str, str] = {}
+    for index, other in pairs:
+        at, check_id, text = sections[index]
+        other_at, other_check, other_text = sections[other]
+        lines, other_lines = ([line.strip() for line in value.split('\n')] for value in (text, other_text))
+        if whole[index] and not any(other_lines[start:start + len(lines)] == lines
+                                    for start in range(len(other_lines) - len(lines) + 1)):
+            continue
+        shared.setdefault(at, other_check)
+        shared.setdefault(other_at, check_id)
+    return [(at, shared[at]) for at, _, _ in sections if at in shared]
+
+
+# Programs that wrap another command, run a script, a module or inline code, a task, or a command that follows their options.
+SHELLS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh'})
+POWERSHELLS = frozenset({'pwsh', 'powershell'})
+INLINE_CODE = {'python': ('-c',), 'node': ('-e', '--eval', '-p', '--print'), 'ruby': ('-e',), 'perl': ('-e', '-E'),
+               'php': ('-r',)}
+SCRIPT_RUNNERS = frozenset({'npm', 'pnpm', 'yarn', 'bun'})  # `test`, `t`, `run test` and `run-script test` are one task
+TASK_RUNNERS = frozenset({'deno', 'go', 'cargo', 'dotnet', 'gradle', 'gradlew', 'mvn', 'mvnw', 'make', 'pipenv'})
+COMMAND_RUNNERS = {'npx': (), 'pnpx': (), 'bunx': (), 'uvx': (), 'uv': ('run',), 'poetry': ('run',), 'pipx': ('run',),
+                   'pnpm': ('dlx', 'exec'), 'yarn': ('dlx', 'exec'), 'npm': ('exec', 'x')}
+WRAPPERS = frozenset({'env', 'time', 'nice', 'sudo'})
+OPTIONS_WITH_VALUE = {
+    'python': frozenset({'-W', '-X', '--check-hash-based-pycs'}),
+    'node': frozenset({'-r', '--require', '--import', '--loader', '--experimental-loader', '--input-type',
+                       '--max-old-space-size', '--stack-size', '--conditions', '-C'}),
+    'env': frozenset({'-u', '--unset', '-C', '--chdir', '-S'}), 'nice': frozenset({'-n', '--adjustment'}),
+    'time': frozenset({'-f', '--format', '-o', '--output'}),
+    'sudo': frozenset({'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'}),
+    'bash': frozenset({'-o', '+o', '-O', '+O', '--rcfile', '--init-file'}),
+    'powershell': frozenset({'-executionpolicy', '-ep', '-workingdirectory', '-wd', '-windowstyle', '-inputformat',
+                             '-outputformat', '-version', '-configurationname', '-config', '-psconsolefile'}),
+    'npm': frozenset({'--prefix', '-w', '--workspace', '--registry', '--loglevel', '--userconfig', '--cache'}),
+    'pnpm': frozenset({'-C', '--dir', '--filter', '-F', '--workspace-concurrency', '--reporter', '--registry'}),
+    'yarn': frozenset({'--cwd', '--cache-folder', '--registry'}), 'bun': frozenset({'--cwd', '--filter', '--config', '-c'}),
+    'npx': frozenset({'-p', '--package', '--prefix', '--registry', '--userconfig', '--cache'}),
+    'uv': frozenset({'--with', '--with-requirements', '--with-editable', '--project', '--directory', '--python', '-p',
+                     '--group', '--extra', '--package', '--env-file', '--index', '--index-url', '--config-file',
+                     '--cache-dir', '--python-preference'}),
+    'poetry': frozenset({'-C', '--directory', '--project', '-P'}),
+    'pipx': frozenset({'--spec', '--python', '--pip-args', '--index-url'}),
+    'cargo': frozenset({'-p', '--package', '--manifest-path', '--target', '--features', '-F', '-j', '--jobs',
+                        '--target-dir', '--config', '-Z', '--profile', '--color', '--message-format'}),
+    'go': frozenset({'-C'}),
+    'make': frozenset({'-C', '--directory', '-f', '--file', '--makefile', '-j', '--jobs', '-I', '--include-dir', '-o',
+                       '--old-file', '-W', '--what-if', '-l', '--load-average'}),
+    'mvn': frozenset({'-pl', '--projects', '-f', '--file', '-P', '-s', '--settings', '-T', '--threads', '-rf',
+                      '--resume-from', '-l', '--log-file'}),
+    'gradle': frozenset({'-p', '--project-dir', '-b', '--build-file', '-c', '--settings-file', '-I', '--init-script', '-g',
+                         '--gradle-user-home'}),
+}
+OPTIONS_WITH_VALUE['bunx'] = OPTIONS_WITH_VALUE['pnpx'] = OPTIONS_WITH_VALUE['npx']
+OPTIONS_WITH_VALUE['uvx'] = OPTIONS_WITH_VALUE['uv']
+OPTIONS_WITH_VALUE['gradlew'] = OPTIONS_WITH_VALUE['gradle']
+OPTIONS_WITH_VALUE['mvnw'] = OPTIONS_WITH_VALUE['mvn']
+OPTIONS_WITH_VALUE['pwsh'] = OPTIONS_WITH_VALUE['powershell']
+for _shell in SHELLS:
+    OPTIONS_WITH_VALUE.setdefault(_shell, OPTIONS_WITH_VALUE['bash'])
+# Options that take no value, for the programs whose options come before the task or command.
+OPTIONS_WITHOUT_VALUE = frozenset({'-y', '--yes', '--no', '--no-install', '-q', '--quiet', '--silent', '-s', '-v',
+                                   '--verbose', '--ci', '--locked', '--frozen', '--frozen-lockfile', '--offline',
+                                   '--release', '--no-color', '--no-progress', '--if-present', '--isolated', '--no-sync',
+                                   '--no-project', '--no-cache', '--all-features', '-E', '-H', '-n', '-S', '-i', '-k',
+                                   '-p', '-a', '--ignore-environment'})
+ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=.*', re.DOTALL)
+CMD_LINE = re.compile(r'\s*"?(?:[^"]*[\\/])?cmd(?:\.exe)?"?(?:\s+/[A-Za-z0-9:]+)*?\s+/[ck]\s+(.*)', re.IGNORECASE | re.DOTALL)
+PROGRAM_DEPTH = 8  # wrappers inside wrappers; at the limit the program is the whole remaining line
+
+
+def command_words(text: str, windows: bool) -> list[list[str]]:
+    """The simple commands of a command line as lists of words: quotes removed, split at unquoted blanks and at ; & |
+    and line breaks. A Windows line has no escape character. With an unbalanced quote the line is split at blanks."""
+    commands: list[list[str]] = []
+    words: list[str] = []
+    word, quote, started, index = '', '', False, 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == quote:
+                quote = ''
+            elif char == '\\' and quote == '"' and not windows and text[index + 1:index + 2] in ('"', '\\', '$', '`'):
+                index += 1
+                word += text[index]
+            else:
+                word += char
+        elif char == '"' or char == "'" and not windows:
+            quote, started = char, True
+        elif char == '\\' and not windows and index + 1 < len(text):
+            index += 1
+            word += text[index]
+            started = True
+        elif char in ';&|\r\n' or char in '<>()' or char.isspace():
+            if started:
+                words.append(word)
+            word, started = '', False
+            if char in ';&|\r\n' and words:
+                commands.append(words)
+                words = []
+        else:
+            word += char
+            started = True
+        index += 1
+    if quote:
+        return [text.split()]
+    if started:
+        words.append(word)
+    return commands + ([words] if words else [])
+
+
+def program_name(token: str) -> str:
+    """Executable or script without directory and launcher suffix, lower case."""
+    return re.sub(r'\.(?:exe|cmd|bat|com|ps1)$', '', re.split(r'[\\/]', token.strip())[-1].lower())
+
+
+def first_operand(tokens: list[str], base: str, assignments: bool = False) -> tuple[int, bool]:
+    """Index of the first operand after the options of a program (after `--` the next token), and whether an option
+    of unknown value came first: its value, if it has one, would be taken for the operand."""
+    valued = OPTIONS_WITH_VALUE.get(base, frozenset())
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--':
+            return index + 1, False
+        if assignments and ASSIGNMENT.fullmatch(token):
+            index += 1
+        elif not token.startswith(('-', '+')):
+            return index, False
+        elif token in valued:
+            index += 2
+        elif ('=' in token or token in OPTIONS_WITHOUT_VALUE or token.startswith('+')
+              or not token.startswith('--') and len(token) > 2):  # a toolchain, a flag or a short option with its value
+            index += 1
+        elif index + 1 < len(tokens) and not tokens[index + 1].startswith(('-', '+')):
+            return index, True
+        else:
+            index += 1
+    return len(tokens), False
+
+
+def line_program(text: str, windows: bool, depth: int = 0) -> tuple[str, ...]:
+    """The program of a command line: that of its command, of each command of a compound line in turn."""
+    match = CMD_LINE.fullmatch(text)
+    if match is not None:  # cmd.exe /c: the rest of the line, without its outer quotes unless they only wrap a program path
+        inner = match[1].strip()
+        if (len(inner) > 1 and inner.startswith('"') and inner.endswith('"')
+                and not (inner.count('"') == 2 and re.search(r'\.(?:exe|cmd|bat|com)$', inner[:-1], re.IGNORECASE))):
+            inner = inner[1:-1]
+        return line_program(inner, True, depth + 1) if depth < PROGRAM_DEPTH else (text,)
+    parts: tuple[str, ...] = ()
+    for words in command_words(text, windows):
+        program = command_program(words, depth)
+        if program:
+            parts += ((';',) if parts else ()) + program
+    return parts
+
+
+def command_program(tokens: list[str], depth: int = 0) -> tuple[str, ...]:
+    """The program a command runs, to compare a re-run with a failed attempt. Wrappers (`env`, `time`, `nice`, `sudo`,
+    leading NAME=value, `cmd /c`, `sh|bash|zsh -c`, `pwsh|powershell -Command`) give the program of the command inside;
+    otherwise it is the executable without directory, launcher suffix and version digits, lower case. `python -m X`,
+    `py -m X` and `X` are one program; an interpreter's program adds its script (inline code with its text); a package
+    runner (`npx`, `uv run`, `pnpm dlx|exec`, ...) gives the program that follows its options; for npm, pnpm, yarn and
+    bun, and for task runners, it adds the task. Options never count; where an option's value is unknown the result
+    keeps the rest of the line, so such a line differs from any other."""
+    tokens = list(tokens)
+    while tokens and ASSIGNMENT.fullmatch(tokens[0]):
+        tokens = tokens[1:]
+    if not tokens:
+        return ()
+    name = program_name(tokens[0])
+    base = re.sub(r'[0-9.]+$', '', name) or name
+    base = 'python' if base in ('py', 'pypy') else base
+    rest = tokens[1:]
+    if depth >= PROGRAM_DEPTH or not name:
+        return (' '.join(tokens),) if name else ()
+
+    def unknown(position: int) -> tuple[str, ...]:
+        return (base, '?') + tuple(rest[position:])
+
+    if base in WRAPPERS:
+        position, ambiguous = first_operand(rest, base, assignments=base == 'env')
+        return unknown(position) if ambiguous else command_program(rest[position:], depth + 1) or (base,)
+    if base == 'cmd':
+        for position, token in enumerate(rest):
+            if token.lower() in ('/c', '/k'):
+                inner = rest[position + 1:]
+                return (line_program(inner[0], True, depth + 1) if len(inner) == 1
+                        else command_program(inner, depth + 1)) or (base,)
+        return (base,)
+    if base in SHELLS:
+        index = 0
+        while index < len(rest):
+            token = rest[index]
+            if re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', token):
+                return line_program(rest[index + 1], False, depth + 1) if index + 1 < len(rest) else (base,)
+            if token in OPTIONS_WITH_VALUE['bash']:
+                index += 1
+            elif not token.startswith(('-', '+')):
+                return (base, program_name(token))
+            index += 1
+        return (base,)
+    if base in POWERSHELLS:
+        index = 0
+        while index < len(rest):
+            token = rest[index].lower()
+            if token in ('-command', '-c', '-commandwithargs'):
+                inner = rest[index + 1:]
+                return (line_program(inner[0], True, depth + 1) if len(inner) == 1
+                        else command_program(inner, depth + 1)) or (base,)
+            if token in ('-file', '-f'):
+                return (base, program_name(rest[index + 1])) if index + 1 < len(rest) else (base,)
+            if token in ('-encodedcommand', '-e', '-ec'):
+                return (base, '-encodedcommand')
+            if token in OPTIONS_WITH_VALUE['powershell']:
+                index += 1
+            elif not token.startswith('-'):
+                return (base, program_name(rest[index]))
+            index += 1
+        return (base,)
+    if base in INLINE_CODE:
+        index = 0
+        while index < len(rest):
+            token = rest[index]
+            if base == 'python' and token == '-m':
+                return (program_name(rest[index + 1]),) if index + 1 < len(rest) else (base,)
+            if base == 'python' and token.startswith('-m') and len(token) > 2:
+                return (program_name(token[2:]),)
+            if token in INLINE_CODE[base]:
+                return (base, token, ' '.join(rest[index + 1:]).strip())
+            if token == '--test':
+                return (base, token)
+            if token in OPTIONS_WITH_VALUE.get(base, ()):
+                index += 1
+            elif not token.startswith('-'):
+                return (base, program_name(token))
+            index += 1
+        return (base,)
+    runner = COMMAND_RUNNERS.get(base)
+    if runner is not None:
+        position, ambiguous = first_operand(rest, base)
+        if not ambiguous and runner and position < len(rest) and rest[position] in runner:
+            skipped, ambiguous = first_operand(rest[position + 1:], base)
+            position += 1 + skipped
+        elif runner:
+            runner = None  # `npm test`, `yarn test`: a task of the runner itself
+        if runner is not None:
+            return unknown(position) if ambiguous else command_program(rest[position:], depth + 1) or (base,)
+    if base in SCRIPT_RUNNERS or base in TASK_RUNNERS or base in COMMAND_RUNNERS:
+        position, ambiguous = first_operand(rest, base, assignments=base == 'make')
+        if ambiguous:
+            return unknown(position)
+        if position >= len(rest):
+            return (base,)
+        task = rest[position]
+        if task in ('run', 'run-script', 'task') and base in (SCRIPT_RUNNERS | {'deno'}):
+            skipped, ambiguous = first_operand(rest[position + 1:], base)
+            if ambiguous:
+                return unknown(position + 1 + skipped)
+            if position + 1 + skipped >= len(rest):
+                return (base, task)
+            task = rest[position + 1 + skipped]
+        elif task in ('t', 'tst') and base in SCRIPT_RUNNERS:
+            task = 'test'
+        return (base, task)
+    return (name,)
+
+
+def programs_of(command: Any, platform: Any = None) -> frozenset[tuple[str, ...]]:
+    """The programs a recorded run command can stand for: one for a recorded argument list; for a recorded string one
+    for the platform that recorded it (metadata `platform`: win32 or another), else one for each way to split it.
+    Empty for a missing or malformed command."""
+    if isinstance(command, list):
+        programs = {command_program([part for part in command if isinstance(part, str)])}
+    elif isinstance(command, str):
+        programs = {line_program(command, windows) for windows in (
+            [platform == 'win32'] if isinstance(platform, str) and platform else [True, False])}
+    else:
+        programs = set()
+    return frozenset(program for program in programs if program)
+
+
+# YYYY-MM-DDTHH:MM[:SS[.fraction]] with Z or a numeric offset, parsed alike on every supported Python version.
+UTC_STAMP = re.compile(r'([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,9}))?)?'
+                       r'(Z|[+-][0-9]{2}:?[0-9]{2})')
+
+
 def utc_stamp(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
-    value = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', value)
+    match = UTC_STAMP.fullmatch(value)
+    if match is None:
+        return None
+    minutes, seconds, fraction, zone = match.groups()
+    zone = '+00:00' if zone == 'Z' else zone[:3] + ':' + zone[-2:]
     try:
-        stamp = datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith('Z') else value)
-        return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
-    except ValueError:
+        stamp = datetime.fromisoformat(f'{minutes}:{seconds or "00"}.{(fraction or "").ljust(6, "0")[:6]}{zone}')
+        return stamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):  # out-of-range dates, such as year 9999 with a negative offset
         return None
 
 
 def canonical_run_path(value: str) -> str:
     return posixpath.normpath(value.replace('\\', '/'))
+
+
+REVIEW_TEXT_LIMIT = 300  # characters of a command, excerpt or description in closure_review
+# What a FAIL means for each check purpose (closure_review FAILED_CHECK).
+FAILURE_MEANING = {
+    'ACCEPTANCE_REGRESSION': 'The required behaviour does not work.',
+    'CHARACTERIZATION': 'The behaviour differs from the recorded expectation.',
+    'INVESTIGATION': 'The suspected defect did not show: the hypothesis is refuted, nothing is shown to work.',
+    'BUG_REPRODUCTION': 'The reported defect was not reproduced: nothing is shown to work.',
+    'HARNESS_CONTROL': 'The test harness failed its own control: results of that harness are not trustworthy.',
+}
+
+
+# The way out of a T1 rule for a journey the user left out of the release (journeys[].exclusion).
+EXCLUSION_REMEDY = ('A journey the user took out of the release scope records exclusion {reason, source_ids} with that '
+                    "user decision (a sources entry with a user: ref that quotes the user's words); it then needs no "
+                    'check of its own, and its own check need not be mandatory.')
+SEVERITY_ORDER, PRIORITY_ORDER = ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'), ('P0', 'P1', 'P2', 'P3')
+
+
+def lowered(order: tuple[str, ...], before: Any, after: Any) -> bool:
+    """after ranks below before in order (first is strongest); a value outside the order ranks lowest."""
+    def rank(value: Any) -> int:
+        return order.index(value) if isinstance(value, str) and value in order else len(order)
+    return rank(after) > rank(before)
+
+
+FAILED_RUN_LIMIT = 50  # runs spelled out in the OTHER_FAILED_RUNS entry of closure_review
+FAILED_RUN_META_BYTES = 1 << 20  # a larger metadata file counts as unreadable
+
+
+def run_log_key(path: str) -> str:
+    """A run-relative log path as compared: one spelling, and one file on a case-insensitive file system."""
+    stored = canonical_run_path(path)
+    return stored.lower() if os.name == 'nt' else stored
+
+
+def failed_run_logs(run_root: Path) -> tuple[list[dict[str, Any]], int]:
+    """The run logs of this run (every run record below evidence) whose metadata states a non-zero exit code, a
+    timeout or a failed start, each as {log, command, exit_code, error}, and the number of metadata files that cannot
+    be read. Only this run's metadata is read, no link is followed. An evidence directory that is itself a link and a
+    directory that cannot be listed count as unreadable (their records exist but are not seen); metadata names are
+    matched as the file system matches them (on Windows in any case)."""
+    logs: list[dict[str, Any]] = []
+    unreadable = 0
+    directory = run_root / 'evidence'
+    if is_link_or_junction(directory):
+        return logs, 1
+    if not directory.is_dir():
+        return logs, unreadable
+
+    def unlisted(error: OSError) -> None:
+        nonlocal unreadable
+        unreadable += 1
+
+    for parent, directories, names in os.walk(directory, onerror=unlisted):
+        directories[:] = sorted(name for name in directories if not is_link_or_junction(Path(parent) / name))
+        for name in sorted(names):
+            path = Path(parent) / name
+            if not os.path.normcase(name).endswith('.meta.json') or is_link_or_junction(path):
+                continue
+            try:
+                if path.stat().st_size > FAILED_RUN_META_BYTES:
+                    raise ValueError('metadata too large')
+                meta = read_json(path)
+            except (OSError, ValueError):
+                meta = None
+            code = meta.get('exit_code') if isinstance(meta, dict) else None
+            if not isinstance(meta, dict) or code is not None and type(code) is not int:
+                unreadable += 1
+            elif code not in (None, 0) or meta.get('timed_out') is True or nonempty(meta.get('error')):
+                logs.append({'log': path.relative_to(run_root).as_posix()[:-len('.meta.json')] + '.log',
+                             'command': meta.get('command'), 'exit_code': code, 'error': meta.get('error')})
+    return logs, unreadable
 
 
 def validate_audit(data: Any, run_dir: Path, project: Path | None,
@@ -2376,6 +5444,9 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     for key in ('previous_run_ids', 'residual_risks', 'next_actions'):
         if key in data and not isinstance(data[key], list):
             issues.error('E_TYPE', key, 'List expected.')
+    for key in ID_REGISTERS:
+        if key in data and data[key] is None:
+            issues.error('E_TYPE', key, 'List expected; an empty register is [] (null is no register).')
 
     # Baseline binding: code citations and paths must belong to the audited state.
     baseline_snapshot: dict[str, Any] | None = None
@@ -2508,8 +5579,21 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             check_enum(issues, f'{where}.applicability', row.get('applicability'), APPLICABILITY, nullable=False)
             if row.get('applicability') in ('NOT_APPLICABLE', 'UNKNOWN') and not nonempty(row.get('reason')):
                 issues.error('E_DOMAIN_REASON', where, 'NOT_APPLICABLE/UNKNOWN requires a specific reason.')
+            if row.get('applicability') == 'APPLICABLE' and not nonempty(row.get('reason')):
+                soft('E_DOMAIN_REASON', where, 'APPLICABLE requires a specific reason (what in the project makes the '
+                     'domain relevant).')
             if row.get('applicability') == 'APPLICABLE' and not id_list(row.get('check_ids')):
                 issues.warning('W_DOMAIN_UNCHECKED', where, 'Applicable domain without checks.')
+            if final and row.get('applicability') == 'UNKNOWN':
+                issues.error('E_DOMAIN_UNDECIDED', where, 'At closure every domain is APPLICABLE or NOT_APPLICABLE; '
+                             'decide its applicability with a reason.')
+            if final and row.get('applicability') == 'APPLICABLE' and not any(
+                    by_id['checks'].get(cid, {}).get('required_for_audit') is True
+                    or by_id['checks'].get(cid, {}).get('required_for_release') is True
+                    for cid in id_list(row.get('check_ids'))):
+                issues.error('E_DOMAIN_UNPLANNED', where, 'At closure an applicable domain needs at least one registered '
+                             'mandatory check in check_ids (required_for_audit or required_for_release true; it may be '
+                             'BLOCKED or deferred); an optional check does not plan the domain.')
             check_refs(where, row)
         for domain in DOMAINS:
             if domain not in seen:
@@ -2560,8 +5644,12 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 issues.warning('W_SECRET_LIKE_IN_EXCERPT', at, f'Excerpt contains {", ".join(weak)}; check whether a '
                                'real value is cited, and if so end the excerpt before the value.')
             rel = path_value.replace('\\', '/')
+            while rel.startswith('./'):
+                rel = rel[2:]
             if baseline_files and rel not in baseline_files:
-                issues.error('E_CODE_REF_NOT_IN_BASELINE', at, f'{rel} does not belong to the audited project state.')
+                issues.error('E_CODE_REF_NOT_IN_BASELINE', at, f'{rel} does not belong to the audited project state'
+                             + ('; give the plain relative path in path and the lines in line_start/line_end, without '
+                                '#anchor or :lines.' if ref_path_part(rel) != rel else '.'))
                 valid = False
                 continue
             if project_root is None or baseline_snapshot is None:
@@ -2577,7 +5665,8 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 valid = False
                 continue
             # Lines as grep -n, git blame and editors count them: only \n ends a line (not form feed or U+2028).
-            lines = target.read_text(encoding='utf-8', errors='replace').split('\n')
+            content, lossy = project_text(target)
+            lines = content.split('\n')
             lines = [line[:-1] if line.endswith('\r') else line for line in lines]
             if lines and lines[-1] == '':
                 lines.pop()
@@ -2591,16 +5680,25 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             loose = len(window) > 1 and (normalized in normalize_ws(' '.join(window[1:]))
                                          or normalized in normalize_ws(' '.join(window[:-1])))
             if not inside or loose:
-                issues.error('E_CODE_REF', at, f'Excerpt does not match {rel}:{start}-{end} exactly.')
+                issues.error('E_CODE_REF', at, encoding_mismatch(rel) if lossy and not excerpt.isascii()
+                             else f'Excerpt does not match {rel}:{start}-{end} exactly; correct the lines or the '
+                             'excerpt' + (f' ({rel} is not UTF-8 or UTF-16 and was read as Windows-1252).' if lossy
+                                          else '.'))
                 valid = False
                 continue
             code_ref_count += 1
         return valid
 
     log_exit: dict[str, Any] = {}
+    log_command: dict[str, Any] = {}
+    log_platform: dict[str, Any] = {}
+    log_files: dict[str, Path] = {}
+    evidence_paths: dict[str, str] = {}
     verifiable: set[str] = set()
     qualifying: set[str] = set()
     observed: set[str] = set()
+    empty: set[str] = set()  # stored evidence files of zero bytes
+    outside: set[str] = set()  # run logs recorded outside the working copy (run --outside-workspace)
     baseline_time = utc_stamp((baseline_snapshot or {}).get('captured_at_utc'))
 
     def within_run(value: Any) -> bool:
@@ -2614,7 +5712,15 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             historical = True
         else:
             historical = False
+        if item.get('kind') is not None and not isinstance(item.get('kind'), str):
+            issues.error('E_TYPE', f'{where}.kind', 'Evidence kind as text expected (LOG, STATIC_REF, UI, ...).')
         if path_value:
+            stored = canonical_run_path(str(path_value))
+            stored = stored.lower() if os.name == 'nt' else stored  # one file on a case-insensitive file system
+            if stored in evidence_paths:
+                soft('E_EVIDENCE_DUPLICATE', where, f'{evidence_paths[stored]} already records {path_value}; keep one '
+                     'evidence entry per file and cite its ID.')
+            evidence_paths.setdefault(stored, item['id'])
             target = run_root / canonical_run_path(str(path_value))
             if not is_within(target, evidence_root):
                 issues.error('E_EVIDENCE_PATH', where, 'Evidence files belong under evidence/ in the run directory.')
@@ -2651,14 +5757,24 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                                  'Log predates the start baseline of this run; mark as STALE or regenerate.')
                     continue
                 log_exit[item['id']] = meta.get('exit_code')
+                log_command[item['id']] = meta.get('command')
+                log_platform[item['id']] = meta.get('platform')
+                log_files[item['id']] = target
+                if meta.get('outside_workspace') is True or 'workspace_root' in meta and meta['workspace_root'] is None:
+                    outside.add(item['id'])
             verifiable.add(item['id'])
             current = item.get('freshness') == 'CURRENT' and within_run(item.get('captured_at_utc'))
+            if target.stat().st_size == 0:
+                empty.add(item['id'])
+                issues.warning('W_EVIDENCE_EMPTY', where, f'{path_value} is empty: it shows no attempt, blocker or '
+                               'observation and qualifies only as the run log of a silent command that exited with 0.')
             if (item.get('kind') == 'LOG' and current and meta.get('tool') == 'audit_tools.py'
-                    and nonempty(meta.get('command')) and within_run(meta.get('started_at_utc')) and within_run(ended)):
+                    and nonempty(meta.get('command')) and within_run(meta.get('started_at_utc')) and within_run(ended)
+                    and (item['id'] not in empty or meta.get('exit_code') == 0)):
                 qualifying.add(item['id'])
                 observed.add(item['id'])
             observation = item.get('observation')
-            if (item.get('kind') in UI_EVIDENCE_KINDS and current and isinstance(observation, dict)
+            if (item['id'] not in empty and current and isinstance(observation, dict)
                     and all(isinstance(observation.get(k), str) and observation[k].strip()
                             for k in ('observer', 'description'))):
                 qualifying.add(item['id'])
@@ -2697,13 +5813,19 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         path_fields = (('sources', 'ref'), ('components', 'ref'), ('test_assessments', 'ref'), ('doc_claims', 'source'))
         for register, field in path_fields:
             for entry in registers[register]:
-                rel = project_path_of(entry.get(field))
+                rel = project_path_of(entry.get(field), baseline_files)
                 if rel is not None and rel not in baseline_files and rel not in baseline_dirs:
                     issues.error('E_PATH_REF', f'{register}[{entry["id"]}].{field}',
                                  f'{rel} does not exist in the audited project state.')
         for source in registers['sources']:
-            rel = project_path_of(source.get('ref'))
+            ref = source.get('ref')
+            rel = project_path_of(ref, baseline_files)
             excerpt = source.get('excerpt')
+            if (rel is None and isinstance(excerpt, str) and excerpt.strip() and isinstance(ref, str)
+                    and not re.match(r'(?:user:|run:|[A-Za-z][A-Za-z0-9+.-]*://)', ref.strip())):
+                issues.warning('W_SOURCE_UNVERIFIED', f'sources[{source["id"]}].excerpt', 'Excerpt cannot be verified '
+                               'against the start baseline: ref names no project file of it, user: statement, run: '
+                               'artifact or URL. Give the project path if the excerpt comes from a project file.')
             if rel in baseline_files and isinstance(excerpt, str) and excerpt.strip() and project_root is not None:
                 target = project_root / rel
                 if not target.is_file():
@@ -2711,9 +5833,19 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 if sha256_file(target) != baseline_files[rel]:
                     issues.error('E_SOURCE_STALE', f'sources[{source["id"]}]',
                                  f'{rel} has changed since the start baseline.')
-                elif normalize_ws(excerpt) not in normalize_ws(target.read_text(encoding='utf-8', errors='replace')):
+                    continue
+                content, lossy = project_text(target)
+                if normalize_ws(excerpt) not in normalize_ws(content):
                     issues.error('E_SOURCE_EXCERPT', f'sources[{source["id"]}].excerpt',
-                                 f'Excerpt does not occur verbatim in {rel}.')
+                                 encoding_mismatch(rel) if lossy and not excerpt.isascii()
+                                 else f'Excerpt does not occur verbatim in {rel}; copy the passage from the file'
+                                 + (f' ({rel} is not UTF-8 or UTF-16 and was read as Windows-1252).' if lossy else '.'))
+
+    for source in registers['sources']:
+        excerpt = source.get('excerpt')
+        if isinstance(excerpt, str) and excerpt.strip() and len(''.join(excerpt.split())) < 15:
+            soft('E_SOURCE_TRIVIAL', f'sources[{source["id"]}].excerpt', 'Excerpt too short (under 15 characters '
+                 'without spaces); quote the passage that carries the statement.')
 
     graph = {task['id']: [d for d in id_list(task.get('depends_on')) if d in tasks] for task in registers['tasks']}
     indegree = {node: len(deps) for node, deps in graph.items()}
@@ -2732,6 +5864,25 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     if cyclic:
         issues.error('E_TASK_CYCLE', 'tasks', f'Cyclic dependencies: {", ".join(cyclic)}')
 
+    # Governed by the security completion contract instead of the closure and journey rules.
+    security_check_ids = ({cid for area in registers['security_scope'] for cid in id_list(area.get('check_ids'))}
+                          | {cid for row in matrix_rows if row.get('domain') == 'H' for cid in id_list(row.get('check_ids'))}
+                          | {c['id'] for c in registers['checks'] if c.get('security') is True})
+
+    def user_deferral(check: dict[str, Any]) -> bool:
+        """deferral {reason, decision_source_ids} that resolves to sources with at least one user: ref."""
+        deferral = check.get('deferral')
+        if not isinstance(deferral, dict) or not isinstance(deferral.get('reason'), str) or not deferral['reason'].strip():
+            return False
+        decision = deferral.get('decision_source_ids')
+        if not isinstance(decision, list) or not decision or not all(
+                isinstance(sid, str) and sid in by_id['sources'] for sid in decision):
+            return False
+        return any(isinstance(by_id['sources'][sid].get('ref'), str) and by_id['sources'][sid]['ref'].startswith('user:')
+                   for sid in decision)
+
+    log_quotes: dict[str, list[tuple[str, str]]] = {}
+    quote_owner: dict[str, str] = {}  # quoted section -> check
     for check in registers['checks']:
         where = f'checks[{check["id"]}]'
         execution, method = check.get('execution'), check.get('method')
@@ -2739,8 +5890,12 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         for flag in ('required_for_audit', 'required_for_release'):
             if flag in check and check[flag] is None and not nonempty(check.get('required_reason')):
                 issues.error('E_REQUIRED_NULL', f'{where}.{flag}', 'null requires a reason in required_reason.')
-        if method is not None and method not in METHOD:
-            issues.warning('W_METHOD', f'{where}.method', f'Unknown method {method!r}.')
+        if method is not None and not isinstance(method, str):
+            issues.error('E_TYPE', f'{where}.method', 'Method as text expected (STATIC, UNIT, CONTRACT, ...).')
+        elif method not in METHOD:  # the method decides which evidence rules apply
+            (issues.error if final else issues.warning)(
+                'E_ENUM' if final else 'W_METHOD', f'{where}.method', f'Unknown method {method!r}; allowed: '
+                f'{", ".join(sorted(METHOD))}. The method decides which evidence rules apply.')
         exit_code = check.get('exit_code')
         logged = [log_exit[eid] for eid in evidence_ids if eid in log_exit]
         if exit_code is not None and type(exit_code) is not int:
@@ -2754,23 +5909,90 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             elif not any(eid in verifiable for eid in evidence_ids):
                 issues.error('E_CHECK_EVIDENCE_UNVERIFIABLE', where, 'No verifiable evidence (file with hash, run log '
                              'or code_refs).')
-            if method in RUN_LOG_METHODS and not any(eid in log_exit for eid in evidence_ids):
+            if member(method, RUN_LOG_METHODS) and not any(eid in log_exit for eid in evidence_ids):
                 issues.error('E_CHECK_NEEDS_RUN_LOG', where, f'{method} result requires a log from audit_tools.py run.')
-            if method == 'E2E' and not any(eid in log_exit or (evidence.get(eid, {}).get('kind') in UI_EVIDENCE_KINDS
-                                                               and eid in verifiable) for eid in evidence_ids):
-                issues.error('E_CHECK_NEEDS_RUN_LOG', where, 'E2E result requires a run log or UI evidence.')
+            if method == 'E2E' and not any(eid in log_exit or eid in observed for eid in evidence_ids):
+                issues.error('E_CHECK_NEEDS_RUN_LOG', where, 'E2E result requires a run log or a stored observation '
+                             '(non-empty evidence file with observation {observer, description}).')
+            if method in ('E2E', 'MANUAL') and not any(eid in observed for eid in evidence_ids):
+                soft('E_CHECK_NEEDS_OBSERVATION', where, f'{method} result rests on an observation of this run: a run '
+                     'log from audit_tools.py run, or a stored non-empty evidence file (any kind) with observation '
+                     '{observer, description}, current and captured in this run; a code reference or note shows no '
+                     'execution.')
         if exit_code is not None and logged and exit_code not in logged:
             issues.error('E_EXIT_MISMATCH', where, f'exit_code {exit_code} contradicts the log ({logged}).')
+        # A shared run log (exit_code null) stands behind this check only through its own quoted section (§6).
+        quotes = check.get('log_excerpts')
+        if quotes is not None and not isinstance(quotes, list):
+            soft('E_CHECK_LOG_SECTION', f'{where}.log_excerpts', 'List of {evidence_id, excerpt} objects expected.')
+        for index, quote in enumerate(quotes if isinstance(quotes, list) else []):
+            quoted_at = f'{where}.log_excerpts[{index}]'
+            if not (isinstance(quote, dict) and isinstance(quote.get('evidence_id'), str)
+                    and isinstance(quote.get('excerpt'), str)):
+                soft('E_CHECK_LOG_SECTION', quoted_at, 'Object with evidence_id and verbatim excerpt (text) expected.')
+            elif quote['evidence_id'] not in evidence_ids or quote['evidence_id'] not in log_files:
+                soft('E_CHECK_LOG_SECTION', quoted_at, f'{quote["evidence_id"]!r} is no run log among the evidence_ids '
+                     'of this check; quote one of its own run logs.')
+            elif sum(char.isalnum() for char in CSI_SEQUENCE.sub('', quote['excerpt'])) < 10:
+                soft('E_CHECK_LOG_SECTION', quoted_at, 'Excerpt too short (under 10 letters or digits); quote the test '
+                     'name or log section that shows the result of this check.')
+            else:
+                log_quotes.setdefault(quote['evidence_id'], []).append((quoted_at, quote['excerpt']))
+                quote_owner[quoted_at] = check['id']
+        if (execution in ('PASS', 'FAIL') and exit_code is None and any(eid in log_exit for eid in evidence_ids)
+                and not quotes):
+            soft('E_CHECK_LOG_SECTION', where, 'A check that cites a run log with exit_code null (shared log, such as '
+                 'a suite run) quotes its test name or log section: log_excerpts [{evidence_id, excerpt}] (master '
+                 'prompt §6).')
+        if execution == 'PASS' and type(exit_code) is int and exit_code != 0 and not any(
+                isinstance(quote, dict) and isinstance(quote.get('evidence_id'), str)
+                and quote['evidence_id'] in evidence_ids and log_exit.get(quote['evidence_id']) == exit_code
+                for quote in (quotes if isinstance(quotes, list) else [])):
+            soft('E_CHECK_LOG_SECTION', where, f'A PASS with exit_code {exit_code} (a run expected to fail, such as a '
+                 'rejected invalid input) quotes the lines of that run log which show the expected failure: '
+                 'log_excerpts [{evidence_id, excerpt}].')
+        if check.get('rerun_reason') is not None and not (isinstance(check['rerun_reason'], str)
+                                                          and check['rerun_reason'].strip()):
+            issues.error('E_TYPE', f'{where}.rerun_reason', 'Text or null expected: why the cited run of another '
+                         'program replaces the failed attempt.')
         if execution == 'BLOCKED' and not evidence_ids:
             issues.error('E_BLOCKED_UNEVIDENCED', where, 'BLOCKED requires evidence of the attempt or blocker.')
+        elif (execution == 'BLOCKED' and not any(eid in qualifying and eid not in empty for eid in evidence_ids)
+              and (check.get('required_for_audit') is not False or check.get('required_for_release') is not False)):
+            soft('E_BLOCKED_UNEVIDENCED', where, 'BLOCKED requires current qualifying evidence of the attempt or '
+                 'blocker: the run log of the failed attempt, an observation or verified code_refs; a note is no '
+                 'evidence. Without an attempt or cited blocker the check stays NOT_RUN (execute it or record a user '
+                 'deferral).')
         if (execution in ('BLOCKED', 'NOT_RUN', 'SKIPPED')
                 and (check.get('required_for_audit') is not False or check.get('required_for_release') is not False)
                 and not nonempty(check.get('catch_up_plan'))):
             issues.error('E_CATCH_UP', where, 'An unexecuted mandatory check requires a catch-up plan.')
+        if (final and execution in ('NOT_RUN', 'SKIPPED') and check['id'] not in security_check_ids
+                and (check.get('required_for_audit') is not False or check.get('required_for_release') is not False)
+                and not user_deferral(check)):
+            issues.error('E_CHECK_UNDECIDED', where, 'At closure a mandatory check is PASS/FAIL, BLOCKED with evidence, '
+                         'or deferred by a recorded user decision (deferral with reason and decision_source_ids '
+                         'including a user: source).')
+    for eid, quoted in log_quotes.items():  # each log is read once for all its quotations
+        for (quoted_at, _), found in zip(quoted, log_contains(log_files[eid], [text for _, text in quoted])):
+            if not found:
+                soft('E_CHECK_LOG_SECTION', quoted_at, f'Excerpt does not occur verbatim in the log of {eid}; copy '
+                     'contiguous lines from the log (line endings, trailing spaces and terminal colour codes do not '
+                     'matter).')
+        for quoted_at, other in shared_log_sections(quoted, quote_owner, lambda texts, path=log_files[eid]: log_whole_lines(path, texts)):
+            soft('E_CHECK_LOG_SECTION', quoted_at, f'Identical to or nested in the excerpt of {other} from the log of '
+                 f'{eid}; each check quotes the lines that show its own result, normally the whole line naming its test '
+                 '(quote the whole line, so that test_save_note is no part of test_save_note_unicode). One '
+                 'executed procedure is one check, which requirements and domain rows may cite together, while a '
+                 "journey's own check belongs to that journey alone.")
 
     for claim in registers['claims']:
         if claim.get('assessment') in ('SUPPORTED', 'VIOLATED') and not id_list(claim.get('evidence_ids')):
             issues.error('E_CLAIM_EVIDENCE', f'claims[{claim["id"]}]', 'SUPPORTED/VIOLATED requires evidence_ids.')
+        if claim.get('assessment') in ('SUPPORTED', 'VIOLATED') and claim.get('basis') in ('ASSUMED', 'UNKNOWN'):
+            soft('E_CLAIM_BASIS', f'claims[{claim["id"]}]', f'A claim with basis {claim["basis"]} is INCONCLUSIVE or '
+                 'NOT_TESTED until evidence carries it; record basis OBSERVED or INFERRED with that evidence, or lower '
+                 'the assessment.')
     for requirement in registers['requirements']:
         where = f'requirements[{requirement["id"]}]'
         binding = requirement.get('binding')
@@ -2797,22 +6019,126 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     for invariant in registers['invariants']:
         if not id_list(invariant.get('source_ids')):
             issues.error('E_UNSOURCED_INVARIANT', f'invariants[{invariant["id"]}]', 'An invariant requires source_ids.')
+    journey_uses: dict[str, int] = {}
+    for journey in registers['journeys']:
+        for cid in set(id_list(journey.get('check_ids'))):
+            journey_uses[cid] = journey_uses.get(cid, 0) + 1
+
+    def exercises_journey(cid: str) -> bool:
+        """Own, non-security check close to end-to-end: executed with an observation, BLOCKED with qualifying evidence,
+        or user-deferred."""
+        check = checks.get(cid)
+        if check is None or cid in security_check_ids:
+            return False
+        own = journey_uses.get(cid) == 1
+        end_to_end = isinstance(check.get('method'), str) and check['method'] in END_TO_END_METHODS
+        mandatory = check.get('required_for_audit') is True and check.get('required_for_release') is True
+        execution = check.get('execution')
+        resolved = ((execution in ('PASS', 'FAIL') and any(eid in observed for eid in id_list(check.get('evidence_ids'))))
+                    or (execution == 'BLOCKED' and any(eid in qualifying for eid in id_list(check.get('evidence_ids'))))
+                    or (execution in ('NOT_RUN', 'SKIPPED') and user_deferral(check)))
+        return own and end_to_end and mandatory and resolved
+
+    def user_exclusion(journey: dict[str, Any]) -> bool:
+        """exclusion {reason, source_ids} that resolves to sources with at least one user: ref."""
+        exclusion = journey.get('exclusion')
+        return isinstance(exclusion, dict) and user_deferral({'deferral': {
+            'reason': exclusion.get('reason'), 'decision_source_ids': exclusion.get('source_ids')}})
+
+    # A T1 journey with a recorded user exclusion is outside the release scope of every T1 rule.
+    excluded_t1 = {journey['id'] for journey in registers['journeys']
+                   if journey.get('tier') == 'T1' and user_exclusion(journey)}
+    released_checks = {cid for journey in registers['journeys'] if journey['id'] not in excluded_t1
+                       for cid in id_list(journey.get('check_ids'))}
+    excluded_checks = {cid: journey['id'] for journey in registers['journeys'] if journey['id'] in excluded_t1
+                       for cid in id_list(journey.get('check_ids')) if cid not in released_checks}
     for journey in registers['journeys']:
         where = f'journeys[{journey["id"]}]'
         check_ids = id_list(journey.get('check_ids'))
-        if journey.get('tier') == 'T1' and not check_ids and not nonempty(journey.get('gap')):
-            issues.error('E_JOURNEY_TRACE', where, 'T1 journey without a check and without a gap.')
+        exclusion = journey.get('exclusion')
+        if exclusion is not None and not isinstance(exclusion, dict):
+            issues.error('E_TYPE', f'{where}.exclusion', 'Object {reason, source_ids} or null expected.')
+        elif isinstance(exclusion, dict):
+            check_refs(f'{where}.exclusion', exclusion)
+            if not (isinstance(exclusion.get('reason'), str) and exclusion['reason'].strip()):
+                issues.error('E_TYPE', f'{where}.exclusion.reason', 'Text expected: why the user excluded the journey '
+                             'from the release scope.')
+            if not isinstance(exclusion.get('source_ids'), list) or not id_list(exclusion.get('source_ids')):
+                issues.error('E_TYPE', f'{where}.exclusion.source_ids', 'List of source IDs expected: the recorded user '
+                             'decision (a sources entry with a user: ref).')
+        if (journey.get('tier') == 'T1' and journey['id'] not in excluded_t1 and not check_ids
+                and not nonempty(journey.get('gap'))):
+            issues.error('E_JOURNEY_TRACE', where, 'T1 journey without a check and without a gap. ' + EXCLUSION_REMEDY)
         if journey.get('tier') in ('T2', 'T3') and set(id_list(journey.get('objective_ids'))) & critical_objectives:
             issues.error('E_TIER_DOWNGRADE', where, 'A journey that supports a core objective is T1.')
-        if journey.get('tier') == 'T1' and check_ids and not any(
+        if journey.get('status') == 'SUPPORTED' and not any(checks.get(cid, {}).get('execution') == 'PASS'
+                                                            for cid in check_ids):
+            soft('E_JOURNEY_STATUS', where, 'SUPPORTED requires at least one PASS check among check_ids; otherwise the '
+                 'journey is VIOLATED, INCONCLUSIVE or NOT_TESTED.')
+        if journey.get('tier') == 'T1' and journey['id'] not in excluded_t1 and check_ids and not any(
                 checks.get(cid, {}).get('required_for_audit') is True
                 and checks.get(cid, {}).get('required_for_release') is True for cid in check_ids):
-            soft('E_REQUIRED_MISSING', where, 'None of the checks of a T1 journey is mandatory for both audit and release.')
+            soft('E_REQUIRED_MISSING', where, 'None of the checks of a T1 journey is mandatory for both audit and '
+                 'release. ' + EXCLUSION_REMEDY)
+        if (journey.get('tier') == 'T1' and journey['id'] not in excluded_t1
+                and not any(exercises_journey(cid) for cid in check_ids)):
+            soft('E_T1_UNEXERCISED', where, 'T1 journey needs a check of its own beyond STATIC/UNIT, mandatory for audit '
+                 'and release, that was executed with qualifying evidence, is BLOCKED with qualifying evidence or is '
+                 'deferred by a user decision; a check shared with other journeys does not count. ' + EXCLUSION_REMEDY)
+    t1_objectives = {oid for journey in registers['journeys'] if journey.get('tier') == 'T1'
+                     for oid in id_list(journey.get('objective_ids'))}
+    for objective in registers['objectives']:
+        if final and objective['id'] in critical_objectives and objective['id'] not in t1_objectives:
+            issues.error('E_TIER_DOWNGRADE', f'objectives[{objective["id"]}]', 'A core objective (critical not false) '
+                         'is carried by a T1 journey with its own check: name it in the objective_ids of a T1 journey, '
+                         'or record critical: false with a supporting source.')
     for environment in registers['environments']:
         if environment.get('authorized') is True and environment.get('used') is False and not nonempty(
                 environment.get('unused_reason')):
             soft('E_ENV_UNUSED', f'environments[{environment["id"]}]',
                  'Authorized environment unused without unused_reason.')
+
+    def blocking(finding: dict[str, Any]) -> bool:
+        return (finding.get('release_blocker') is True or finding.get('severity') == 'CRITICAL'
+                or finding.get('priority') == 'P0')
+
+    # End of each supersession chain, resolved once for all findings (None inside a cycle).
+    chain_end: dict[str, str | None] = {}
+    on_cycle: set[str] = set()
+    for start in findings:
+        path: list[str] = []
+        position: dict[str, int] = {}
+        node: Any = start
+        while isinstance(node, str) and node in findings and node not in chain_end and node not in position:
+            position[node] = len(path)
+            path.append(node)
+            node = findings[node].get('superseded_by')
+        if isinstance(node, str) and node in position:
+            on_cycle.update(path[position[node]:])
+            end = None
+        else:
+            end = chain_end[node] if isinstance(node, str) and node in chain_end else path[-1] if path else None
+        for member_id in path:
+            chain_end[member_id] = end
+
+    def weaker(successor: dict[str, Any], original: dict[str, Any]) -> bool:
+        return ((original.get('assessment') == 'CONFIRMED' and successor.get('assessment') != 'CONFIRMED')
+                or lowered(SEVERITY_ORDER, original.get('severity'), successor.get('severity'))
+                or lowered(PRIORITY_ORDER, original.get('priority'), successor.get('priority'))
+                or (original.get('release_blocker') is True and successor.get('release_blocker') is not True))
+
+    previous_runs = id_list(data.get('previous_run_ids'))
+
+    def earlier_run_file(reference: str) -> str:
+        """FOUND, MISSING or UNCHECKED (run directory not beside this run) for run:<RUN_ID>/<path>."""
+        match = re.fullmatch(r'run:([^/\\]+)[/\\](.+)', reference, flags=re.DOTALL)
+        if not match or match[1] not in previous_runs or match[1] in ('.', '..'):
+            return 'MISSING'
+        directory = run_root.parent / match[1]
+        if not directory.is_dir():
+            return 'UNCHECKED'
+        target = directory / canonical_run_path(match[2])
+        return 'FOUND' if is_within(target, directory) and target.is_file() else 'MISSING'
 
     run_type = data.get('run_type')
     for finding in registers['findings']:
@@ -2880,15 +6206,24 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                              'and COMMENT_ONLY; DISPUTED while CONFIRMED needs qualifying countercheck_evidence_ids.')
             if state == 'OPEN' and not id_list(finding.get('task_ids')):
                 soft('E_FINDING_TASK', where, 'Open confirmed finding without a package.')
-            if (finding.get('severity') == 'CRITICAL' and finding.get('release_blocker') is False
+            if ((finding.get('severity') == 'CRITICAL'
+                 or finding.get('severity') == 'HIGH' and state in ('OPEN', 'CANDIDATE_FIXED'))
+                    and finding.get('release_blocker') is not True
                     and not nonempty(finding.get('release_blocker_reason'))):
-                issues.error('E_BLOCKER_REASON', where, 'CRITICAL without a release blocker requires release_blocker_reason.')
+                soft('E_BLOCKER_REASON', where, 'CRITICAL, or HIGH while OPEN or CANDIDATE_FIXED, without a release '
+                     'blocker requires release_blocker_reason: why the release can go ahead with it.'
+                     + (' release_blocker is null: decide it, true (the release waits for the fix) or false with '
+                        'release_blocker_reason.' if finding.get('release_blocker') is None else ''))
         if assessment == 'UNCONFIRMED' and state == 'OPEN' and not any(
                 tasks.get(tid, {}).get('type') == 'INVESTIGATE' for tid in id_list(finding.get('task_ids'))):
             soft('E_FINDING_INVESTIGATE', where, 'Open unconfirmed finding without an INVESTIGATE package.')
         if assessment == 'DISPROVEN':
             if not id_list(finding.get('counter_evidence_ids')) and not nonempty(finding.get('disproof')):
                 issues.error('E_DISPROVEN', where, 'DISPROVEN requires counter_evidence_ids or disproof.')
+            elif blocking(finding) and not any(eid in qualifying for eid in id_list(finding.get('counter_evidence_ids'))):
+                issues.error('E_DISPROVEN', where, 'A blocking, CRITICAL or P0 finding is DISPROVEN only by current '
+                             'qualifying counter_evidence_ids (run log, observation or verified code_refs of this run); '
+                             'prose in disproof is not enough.')
             if state in ('CANDIDATE_FIXED', 'VERIFIED_FIXED'):
                 issues.error('E_STATE_CONFLICT', where, 'A fixed defect is not DISPROVEN.')
         if state == 'ACCEPTED_RISK':
@@ -2901,8 +6236,56 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                              'and source_ids that refer to the decision.')
         if state == 'SUPERSEDED' and not (finding.get('superseded_by') or nonempty(finding.get('superseded_reason'))):
             issues.error('E_SUPERSEDED', where, 'SUPERSEDED requires superseded_by or superseded_reason.')
-        if state == 'VERIFIED_FIXED' and not evidence_ids:
-            issues.error('E_VERIFIED_FIXED', where, 'VERIFIED_FIXED requires verification evidence.')
+        if finding['id'] in on_cycle:
+            issues.error('E_SUPERSEDED', f'{where}.superseded_by', 'Supersession leads back to this finding; name the '
+                         'finding that replaces it.')
+        end = chain_end.get(finding['id'])
+        if (state == 'SUPERSEDED' and end is not None and end != finding['id']
+                and (assessment == 'CONFIRMED' or blocking(finding)) and weaker(findings[end], finding)):
+            issues.error('E_SUPERSEDED', f'{where}.superseded_by', f'Superseded through {end}, which is weaker: the '
+                         'finding at the end of the chain keeps assessment CONFIRMED, at least the severity and priority '
+                         'and release_blocker true of the finding it replaces; otherwise keep this finding and resolve '
+                         'it on evidence.')
+        counter_ids = id_list(finding.get('counter_evidence_ids'))
+        shared = [eid for eid in counter_ids if eid in evidence_ids]
+        if shared:
+            soft('E_SUPERSEDED' if state == 'SUPERSEDED' else 'E_DISPROVEN', f'{where}.counter_evidence_ids',
+                 f'{", ".join(shared)} listed in evidence_ids and in counter_evidence_ids: one record cannot both '
+                 'show the defect and refute it; remove it from the list it does not belong to.'
+                 if assessment != 'DISPROVEN' and state not in ('SUPERSEDED', 'VERIFIED_FIXED') else
+                 f'{", ".join(shared)} also in evidence_ids: ' + (
+                     'a fixed finding cites the run that verifies the fix in evidence_ids (where VERIFIED_FIXED '
+                     'requires it), not in counter_evidence_ids, which holds the evidence that disproves a finding. '
+                     'Remove it from counter_evidence_ids.' if state == 'VERIFIED_FIXED' else
+                     'the evidence that confirmed a finding cannot disprove it. Cite the run or code that shows the '
+                     'defect absent.'))
+        if (state == 'SUPERSEDED' and not finding.get('superseded_by') and blocking(finding)
+                and not any(eid in qualifying for eid in counter_ids)):
+            issues.error('E_SUPERSEDED', where, 'A blocking, CRITICAL or P0 finding superseded by a reason needs current '
+                         'qualifying counter_evidence_ids (run log, observation or verified code_refs of this run) '
+                         'that show the reason; its own evidence_ids do not count. A duplicate names its successor in '
+                         'superseded_by.')
+        elif (state == 'SUPERSEDED' and not finding.get('superseded_by') and assessment == 'CONFIRMED'
+                and not any(eid in evidence for eid in evidence_ids + counter_ids)):
+            issues.error('E_SUPERSEDED', where, 'A confirmed finding superseded by a reason needs an evidenced reason: '
+                         'cite evidence_ids or counter_evidence_ids (master prompt §13).')
+        if state == 'VERIFIED_FIXED' and not any(eid in qualifying for eid in evidence_ids):
+            references = [str(evidence[eid]['ref']).strip() for eid in evidence_ids
+                          if nonempty(evidence.get(eid, {}).get('ref')) and str(evidence[eid]['ref']).strip().startswith('run:')]
+            checked = {reference: earlier_run_file(reference) for reference in references}
+            for reference in (r for r, status in checked.items() if status == 'UNCHECKED'):
+                issues.warning('W_RUN_REF_UNVERIFIED', where, f'{reference}: the earlier run directory is not beside '
+                               'this run, so the referenced file cannot be checked; keep that run beside this one.')
+            if (data.get('release_status') == 'GO_FOR_DEFINED_SCOPE' and blocking(finding)
+                    and 'UNCHECKED' in checked.values() and 'FOUND' not in checked.values()):
+                soft('E_VERIFIED_FIXED', where, 'Under GO a blocking, CRITICAL or P0 finding is VERIFIED_FIXED only on '
+                     'verification that can be checked: current qualifying evidence of this run (re-run the verification), '
+                     'or a run:<RUN_ID>/<path> reference whose earlier run directory lies beside this run.')
+            if not any(status != 'MISSING' for status in checked.values()):
+                issues.error('E_VERIFIED_FIXED', where, 'VERIFIED_FIXED requires verification evidence: current '
+                             'qualifying evidence of this run, or a run:<RUN_ID>/<path> reference to the verification '
+                             'of an earlier run whose RUN_ID is listed in previous_run_ids and whose file exists in that '
+                             'run directory.')
         if run_type == 'INITIAL' and state in ('CANDIDATE_FIXED', 'VERIFIED_FIXED'):
             issues.error('E_FIXED_IN_INITIAL', where, 'An initial run does not change the product; *_FIXED is available only in a '
                          're-audit.')
@@ -2926,6 +6309,34 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         supporting = [c for c in registers['checks'] if set(id_list(c.get('claim_ids'))) & set(id_list(gate.get('claim_ids')))]
         if supporting and not any(c.get('required_for_release') is True for c in supporting):
             soft('E_REQUIRED_MISSING', where, 'None of the checks of this gate is mandatory for release.')
+
+    # A violated result is recorded as a finding, whatever its state: linked by claim_ids or shared evidence_ids.
+    finding_links = [(set(id_list(f.get('claim_ids'))), set(id_list(f.get('evidence_ids'))),
+                      set(id_list(f['target'].get('objective_ids'))) if isinstance(f.get('target'), dict) else set())
+                     for f in registers['findings']]
+
+    def recorded(claim_ids: Iterable[str], evidence_ids: Iterable[str], objective_ids: Iterable[str] = ()) -> bool:
+        claim_ids, evidence_ids, objective_ids = set(claim_ids), set(evidence_ids), set(objective_ids)
+        return any(c & claim_ids or e & evidence_ids or o & objective_ids for c, e, o in finding_links)
+
+    def check_recorded(cid: str) -> bool:
+        check = checks.get(cid, {})
+        return recorded(id_list(check.get('claim_ids')), id_list(check.get('evidence_ids')))
+
+    unrecorded = [(f'checks[{c["id"]}]', 'Failed mandatory check') for c in registers['checks']
+                  if c.get('execution') == 'FAIL' and c.get('purpose') in ('ACCEPTANCE_REGRESSION', 'CHARACTERIZATION')
+                  and (c.get('required_for_audit') is True or c.get('required_for_release') is True)
+                  and not check_recorded(c['id'])]
+    unrecorded += [(f'claims[{c["id"]}]', 'VIOLATED claim') for c in registers['claims']
+                   if c.get('assessment') == 'VIOLATED' and not recorded([c['id']], id_list(c.get('evidence_ids')))]
+    unrecorded += [(f'journeys[{j["id"]}]', 'VIOLATED T1 journey') for j in registers['journeys']
+                   if j.get('tier') == 'T1' and j.get('status') == 'VIOLATED'
+                   and not any(check_recorded(cid) for cid in id_list(j.get('check_ids')))
+                   and not recorded((), (), id_list(j.get('objective_ids')))]
+    for at, what in unrecorded:
+        soft('E_VIOLATION_WITHOUT_FINDING', at, f'{what} without a finding: a violated result is recorded as a finding, '
+             'whatever its state. Cite it from a finding (claim_ids, or evidence_ids it shares with the result; for a '
+             'journey also target.objective_ids).')
 
     audit_status, release_status = data.get('audit_status'), data.get('release_status')
     security = data.get('security_review')
@@ -2981,8 +6392,10 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                                and (c.get('required_for_audit') is True or c.get('required_for_release') is True))
         done_checks = scope_valid and all(checks.get(cid, {}).get('execution') in ('PASS', 'FAIL') and any(
             eid in qualifying for eid in id_list(checks.get(cid, {}).get('evidence_ids'))) for cid in security_checks)
+        done_checks = done_checks and any(checks[cid].get('execution') in ('PASS', 'FAIL') and any(
+            eid in qualifying for eid in id_list(checks[cid].get('evidence_ids'))) for cid in security_check_ids if cid in checks)
         if not done_checks:
-            issues.error('E_SECURITY_DONE_CHECKS', 'security_review', 'DONE requires all mandatory security checks resolved with current qualifying evidence.')
+            issues.error('E_SECURITY_DONE_CHECKS', 'security_review', 'DONE requires all mandatory security checks resolved with current qualifying evidence, and at least one executed (PASS/FAIL) security check; with nothing to check use NOT_APPLICABLE.')
         security_valid = security_valid and done_checks
     if security_status == 'NOT_APPLICABLE':
         na_valid = (isinstance(security.get('reason'), str) and bool(security['reason'].strip()) and data.get('security_scope') == []
@@ -3001,6 +6414,43 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 and any(tasks.get(tid, {}).get('type') in ('HUMAN', 'VERIFY') for tid in decision_tasks)
                 and audit_status == 'PARTIAL'):
             issues.error('E_SECURITY_NOT_PERFORMED', 'security_review', 'NOT_PERFORMED needs a user-decision source, a HUMAN/VERIFY task reference and PARTIAL audit status.')
+    for check in registers['checks']:  # NOT_PERFORMED: the review's own user decision covers its checks
+        if not (final and security_status in ('NOT_APPLICABLE', 'BLOCKED') and check['id'] in security_check_ids
+                and (check.get('required_for_audit') is not False or check.get('required_for_release') is not False)):
+            continue
+        execution = check.get('execution')
+        if security_status == 'NOT_APPLICABLE' and execution in ('NOT_RUN', 'SKIPPED'):
+            issues.error('E_SECURITY_NA_REASON', f'checks[{check["id"]}]', 'With security review NOT_APPLICABLE a '
+                         'mandatory security check does not stay NOT_RUN or SKIPPED: execute it, or, with nothing to '
+                         'check, set required_for_audit and required_for_release false and say why in required_reason.')
+        if security_status == 'BLOCKED' and not (
+                execution in ('PASS', 'FAIL') or user_deferral(check) or execution == 'BLOCKED' and any(
+                    eid in qualifying and eid not in empty for eid in id_list(check.get('evidence_ids')))):
+            issues.error('E_CHECK_UNDECIDED', f'checks[{check["id"]}]', 'With security review BLOCKED every mandatory '
+                         'security check is PASS/FAIL, BLOCKED with qualifying evidence, or deferred by a recorded user '
+                         'decision (deferral with reason and decision_source_ids including a user: source).')
+    decisions: list[tuple[str, str, Any]] = []  # (subject, source, reason) of every relied-upon user decision
+    for check in registers['checks']:
+        if isinstance(check.get('deferral'), dict):
+            decisions += [(f'checks[{check["id"]}].deferral', sid, check['deferral'].get('reason'))
+                          for sid in id_list(check['deferral'].get('decision_source_ids'))]
+    for journey in registers['journeys']:
+        if isinstance(journey.get('exclusion'), dict):
+            decisions += [(f'journeys[{journey["id"]}].exclusion', sid, journey['exclusion'].get('reason'))
+                          for sid in id_list(journey['exclusion'].get('source_ids'))]
+    decisions += [('security_review', sid, security.get('reason')) for sid in id_list(security.get('decision_source_ids'))]
+    for finding in registers['findings']:
+        if isinstance(finding.get('acceptance'), dict):
+            decisions += [(f'findings[{finding["id"]}].acceptance', sid, finding['acceptance'].get('scope'))
+                          for sid in id_list(finding['acceptance'].get('source_ids'))]
+    decisions = [(subject, sid, reason) for subject, sid, reason in decisions
+                 if str(by_id['sources'].get(sid, {}).get('ref')).startswith('user:')]
+    for sid in dict.fromkeys(sid for _, sid, _ in decisions):
+        excerpt = by_id['sources'][sid].get('excerpt')
+        if not (isinstance(excerpt, str) and len(''.join(excerpt.split())) >= 15):
+            soft('E_USER_DECISION', f'sources[{sid}].excerpt', 'A user decision relied upon (deferral, '
+                 "security_review.decision_source_ids or acceptance) records the user's words: an excerpt of at least "
+                 '15 characters without spaces, quoted from the request or conversation.')
     security_complete = security_valid and scope_valid and security_status in ('DONE', 'NOT_APPLICABLE')
     if release_status == 'GO_FOR_DEFINED_SCOPE' and not security_complete:
         issues.error('E_GO_SECURITY_PENDING', 'release_status', 'GO requires a valid DONE or NOT_APPLICABLE security review.')
@@ -3018,6 +6468,12 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                      f'Open confirmed release blockers require NO_GO: {", ".join(open_blockers)}')
     if release_status == 'NO_GO' and not open_blockers:
         issues.error('E_NO_GO_UNFOUNDED', 'release_status', 'NO_GO without a confirmed open release blocker.')
+    def user_accepted(finding: dict[str, Any]) -> bool:
+        acceptance = finding.get('acceptance') if isinstance(finding.get('acceptance'), dict) else {}
+        return any(str(by_id['sources'].get(sid, {}).get('ref')).startswith('user:')
+                   for sid in id_list(acceptance.get('source_ids')))
+    accepted_ids = [set(id_list(f.get('claim_ids'))) | set(id_list(f.get('evidence_ids'))) for f in registers['findings']
+                    if f.get('state') == 'ACCEPTED_RISK' and user_accepted(f)]
     if release_status == 'GO_FOR_DEFINED_SCOPE':
         if audit_status != 'COMPLETE_FOR_DEFINED_SCOPE':
             issues.error('E_GO_INCOMPLETE', 'release_status', 'GO requires a fully processed audit scope.')
@@ -3025,6 +6481,10 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             issues.error('E_GO_NO_OBJECTIVE', 'objectives', 'GO without a demonstrated critical core objective.')
         if not registers['release_gates']:
             issues.error('E_GO_NO_GATES', 'release_gates', 'GO without defined release gates.')
+
+        def qualified(record: dict[str, Any]) -> bool:
+            return any(eid in qualifying for eid in id_list(record.get('evidence_ids')))
+        gate_carriers: set[str] = set()
         for gate in registers['release_gates']:
             where = f'release_gates[{gate["id"]}]'
             if gate.get('status') != 'MET':
@@ -3048,33 +6508,170 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                     issues.error('E_GO_SUPPORT', where, f'{claim_id} has no passed ACCEPTANCE_REGRESSION check '
                                  'with verifiable evidence (reproducers, characterization, investigation and harness controls '
                                  'do not support authorization).')
+                gate_carriers.update(c['id'] for c in carrying)
+                if not qualified(claim):
+                    issues.error('E_GO_EVIDENCE', where, f'{claim_id} has no current qualifying evidence (run log, '
+                                 'stored observation or verified code_refs of this run).')
+                if carrying and not any(qualified(c) for c in carrying):
+                    issues.error('E_GO_EVIDENCE', where, f'The acceptance check carrying {claim_id} has no current '
+                                 'qualifying evidence; a handwritten note does not carry a gate.')
         for check in registers['checks']:
             if check.get('required_for_release') is True:
                 executed = check.get('execution') in ('PASS', 'FAIL')
+                hint = (f' This is the check of {excluded_checks[check["id"]]}, which the user excluded from the release '
+                        'scope: set required_for_release false (required_for_audit too, if the audit does not need it) '
+                        'and name the exclusion in required_reason.' if check['id'] in excluded_checks else '')
                 if not executed or (check.get('purpose') == 'ACCEPTANCE_REGRESSION' and check.get('execution') != 'PASS'):
                     issues.error('E_GO_REQUIRED_CHECK', f'checks[{check["id"]}]',
-                                 'Mandatory release check not executed or acceptance check not PASS.')
+                                 'Mandatory release check not executed or acceptance check not PASS.' + hint)
+                elif (check.get('execution') == 'FAIL' and check.get('purpose') not in ('INVESTIGATION', 'BUG_REPRODUCTION')
+                      and not any(ids & (set(id_list(check.get('claim_ids'))) | set(id_list(check.get('evidence_ids'))))
+                                  for ids in accepted_ids)):
+                    issues.error('E_GO_REQUIRED_CHECK', f'checks[{check["id"]}]', 'A failed release-mandatory check '
+                                 'prevents GO (for INVESTIGATION and BUG_REPRODUCTION, FAIL means the suspected defect '
+                                 'did not show), unless a finding in state ACCEPTED_RISK with a user decision '
+                                 '(acceptance.source_ids with a user: source) shares a claim or evidence ID with it.'
+                                 + hint)
             if check.get('required_for_release') is None:
                 issues.error('E_GO_REQUIRED_NULL', f'checks[{check["id"]}]', 'Release obligation unresolved.')
+            if (check.get('required_for_release') is True and check.get('execution') in ('PASS', 'FAIL')
+                    and not qualified(check)):
+                issues.error('E_GO_EVIDENCE', f'checks[{check["id"]}]', 'Executed release check without current '
+                             'qualifying evidence (run log, stored observation or verified code_refs of this run).')
+            stated = 0 if check.get('exit_code') is None else check.get('exit_code')
+            disagreeing = [eid for eid in id_list(check.get('evidence_ids')) if eid in log_exit
+                           and evidence[eid].get('freshness') == 'CURRENT' and log_exit[eid] != stated]
+            if (check.get('execution') == 'PASS' and disagreeing
+                    and (check['id'] in gate_carriers or check.get('required_for_release') is True)):
+                issues.error('E_GO_FAILED_LOG', f'checks[{check["id"]}]', f'{", ".join(disagreeing)}: the run log does '
+                             f'not exit with {stated!r} as this PASS states; cite only the run that shows this result; a '
+                             'build log and a test log belong to two checks.')
+        # The evidence of a defect never shows its absence, nor the passing result that carries the release.
+        defect_evidence = {eid for f in registers['findings'] if f.get('assessment') == 'CONFIRMED'
+                           and f.get('state') in ('OPEN', 'CANDIDATE_FIXED') for eid in id_list(f.get('evidence_ids'))}
+        t1_own = {cid for journey in registers['journeys'] if journey.get('tier') == 'T1' and journey['id'] not in excluded_t1
+                  for cid in id_list(journey.get('check_ids')) if journey_uses.get(cid) == 1}
+        for check in registers['checks']:
+            if check.get('execution') != 'PASS' or not (check['id'] in gate_carriers or check['id'] in t1_own):
+                continue
+            resting = [eid for eid in id_list(check.get('evidence_ids')) if eid in qualifying]
+            if resting and set(resting) <= defect_evidence:
+                candidates = [f['id'] for f in registers['findings'] if f.get('assessment') == 'CONFIRMED'
+                              and f.get('state') == 'CANDIDATE_FIXED' and set(resting) & set(id_list(f.get('evidence_ids')))]
+                issues.error('E_GO_EVIDENCE', f'checks[{check["id"]}]', f'{", ".join(resting)}: also the evidence of an '
+                             'open confirmed finding; the same evidence cannot show both the defect and the passing '
+                             'result. Cite the run that shows this result (for a passing test inside a failed suite run, '
+                             'run that test alone).' + (
+                                 f' {", ".join(candidates)} is CANDIDATE_FIXED: the run that verifies the fix belongs '
+                                 'in the evidence_ids of this check, as a log of its own made after the fix; the finding '
+                                 'then becomes VERIFIED_FIXED with that log in its evidence_ids.' if candidates else ''))
+            attempts = [eid for eid in id_list(check.get('evidence_ids')) if eid in log_exit
+                        and evidence[eid].get('freshness') == 'STALE' and log_exit[eid] != 0]
+            reruns = set().union(*(programs_of(log_command.get(eid), log_platform.get(eid))
+                                   for eid in resting if eid in log_exit))
+            unmatched = [eid for eid in attempts if not programs_of(log_command.get(eid), log_platform.get(eid)) & reruns]
+            if unmatched and not nonempty(check.get('rerun_reason')):
+                issues.error('E_GO_SUPERSEDED_ATTEMPT', f'checks[{check["id"]}]', f'{", ".join(unmatched)}: a failed '
+                             'attempt set aside as STALE, but no current run log of this check runs the same program '
+                             '(the executable, the module or script of an interpreter, the task of a task runner, '
+                             'seen through wrappers such as cmd /c, env and sh -c). Cite the corrected re-run of that '
+                             'program, or state rerun_reason: why the run of another program replaces the attempt. '
+                             'Where the program cannot be told from the recorded command (an option whose value is '
+                             'unknown), rerun_reason settles it.')
+        for requirement in registers['requirements']:
+            if requirement.get('binding') != 'BINDING':
+                continue
+            covering = [checks[cid] for cid in id_list(requirement.get('check_ids')) if cid in checks]
+            failed_ids = {ref for c in covering if c.get('execution') == 'FAIL'
+                          for ref in id_list(c.get('claim_ids')) + id_list(c.get('evidence_ids'))}
+            if not any(c.get('execution') == 'PASS' and c.get('purpose') in ('ACCEPTANCE_REGRESSION', 'CHARACTERIZATION')
+                       and qualified(c) for c in covering) and not any(
+                    f.get('state') == 'ACCEPTED_RISK' and user_accepted(f) and (
+                        isinstance(f.get('target'), dict) and requirement['id'] in id_list(f['target'].get('requirement_ids'))
+                        or failed_ids & set(id_list(f.get('claim_ids')) + id_list(f.get('evidence_ids'))))
+                    for f in registers['findings']):
+                issues.error('E_GO_REQUIREMENT', f'requirements[{requirement["id"]}]', 'GO requires every BINDING '
+                             'requirement to be shown met: a PASS check in its check_ids with purpose '
+                             'ACCEPTANCE_REGRESSION or CHARACTERIZATION and current qualifying evidence (an INVESTIGATION '
+                             'or BUG_REPRODUCTION result shows no requirement met), or a finding in ACCEPTED_RISK with a '
+                             'user decision (acceptance.source_ids with a user: source) that names the requirement in '
+                             'target.requirement_ids or shares a claim or evidence ID with its failed check.')
         for objective in registers['objectives']:
             if objective['id'] in critical_objectives and objective.get('fulfillment') != 'DEMONSTRATED':
                 issues.error('E_GO_OBJECTIVE', f'objectives[{objective["id"]}]', 'Critical core objective not demonstrated.')
+            if objective['id'] in critical_objectives and not any(
+                    claims.get(cid, {}).get('assessment') == 'SUPPORTED' and qualified(claims[cid])
+                    for cid in id_list(objective.get('claim_ids'))):
+                issues.error('E_GO_EVIDENCE', f'objectives[{objective["id"]}]', 'Critical core objective without a '
+                             'SUPPORTED claim backed by current qualifying evidence.')
         if vision.get('status') == 'CONFLICTED':
             issues.error('E_GO_VISION', 'vision.status', 'GO with a conflicting vision.')
         elif vision.get('status') == 'PARTIAL':
             issues.warning('W_GO_VISION', 'vision.status', 'GO with a partially evidenced vision: justify relevance.')
         for journey in registers['journeys']:
-            if journey.get('tier') == 'T1' and journey.get('status') == 'VIOLATED':
-                issues.error('E_GO_JOURNEY', f'journeys[{journey["id"]}]', 'GO with a violated T1 journey.')
+            where = f'journeys[{journey["id"]}]'
+            if journey.get('tier') == 'T1' and journey.get('status') == 'VIOLATED' and journey['id'] not in excluded_t1:
+                issues.error('E_GO_JOURNEY', where, 'GO with a violated T1 journey. ' + EXCLUSION_REMEDY)
+            if journey.get('tier') != 'T1':
+                continue
+            if journey.get('exclusion') is not None:
+                demonstrated = [oid for oid in id_list(journey.get('objective_ids'))
+                                if objectives.get(oid, {}).get('fulfillment') == 'DEMONSTRATED']
+                if not user_exclusion(journey):
+                    issues.error('E_GO_T1', where, 'exclusion takes a T1 journey out of the release scope only with a '
+                                 'recorded user decision: reason and source_ids including a sources entry with a user: ref '
+                                 "that quotes the user's words. Record the decision, or remove exclusion and exercise "
+                                 'the journey.')
+                elif demonstrated:
+                    issues.error('E_GO_T1', where, f'Excluded from the release scope, but its objective '
+                                 f'{", ".join(demonstrated)} is DEMONSTRATED: an excluded journey shows nothing for the '
+                                 'release. Remove the exclusion and exercise the journey, or keep its objectives '
+                                 'NOT_DEMONSTRATED (a core objective then prevents GO).')
+                continue
+            own = [cid for cid in id_list(journey.get('check_ids')) if (
+                    journey_uses.get(cid) == 1 and cid not in security_check_ids
+                    and member(checks.get(cid, {}).get('method'), END_TO_END_METHODS)
+                    and checks[cid].get('execution') == 'PASS'
+                    and any(eid in observed for eid in id_list(checks[cid].get('evidence_ids')))
+                    )]
+            if journey.get('status') != 'SUPPORTED' or not own:
+                issues.error('E_GO_T1', where, 'GO requires every T1 journey of the release scope to be SUPPORTED, with a '
+                             'PASS of its own (not shared), non-security check beyond STATIC/UNIT that rests on observed '
+                             'evidence (run log, or stored observation with observer and description). A journey the user '
+                             'excluded from the release scope records exclusion {reason, source_ids} with that user '
+                             'decision.')
+            elif all(checks[cid].get('exit_code') not in (None, 0) or any(
+                    eid in observed and log_exit.get(eid, 0) != 0 for eid in id_list(checks[cid].get('evidence_ids')))
+                    for cid in own):
+                issues.error('E_GO_T1', where, f'{", ".join(own)}: a PASS on a run that does not exit with 0. Under GO '
+                             "the journey's own check shows the journey working on a run that exits with 0. An "
+                             'expected-failure test (a rejected invalid input) belongs in a separate check that the '
+                             'journey cites in check_ids; for a passing test inside a failed suite run, run that test '
+                             'alone. A journey whose subject is a rejection asserts the expectation inside a test or '
+                             'wrapper that exits with 0 on the expected rejection; that run is the '
+                             "journey's own check.")
         for finding in registers['findings']:
-            if finding.get('assessment') == 'UNCONFIRMED' and finding.get('state') == 'OPEN':
-                # An open suspicion of a critical defect is diagnostics the audit still owes (§15).
-                if finding.get('severity') == 'CRITICAL' or finding.get('priority') == 'P0':
-                    issues.error('E_GO_OPEN_SUSPICION', f'findings[{finding["id"]}]',
-                                 'Open unconfirmed CRITICAL or P0 suspicion prevents GO; resolve it first.')
-                elif finding.get('severity') == 'HIGH' or finding.get('priority') == 'P1':
+            # An open or parked suspicion of a critical defect is diagnostics the audit still owes (§15).
+            if finding.get('assessment') == 'UNCONFIRMED' and blocking(finding) and not (
+                    finding.get('state') == 'SUPERSEDED' and finding.get('superseded_by')
+                    or finding.get('state') == 'ACCEPTED_RISK' and user_accepted(finding)):
+                issues.error('E_GO_OPEN_SUSPICION', f'findings[{finding["id"]}]', 'An unconfirmed blocking, CRITICAL or '
+                             'P0 suspicion prevents GO until it is resolved: DISPROVEN with qualifying '
+                             'counter_evidence_ids, superseded by a finding that is not weaker (superseded_by), or '
+                             'ACCEPTED_RISK with a user decision (acceptance.source_ids with a user: source).')
+            elif finding.get('assessment') == 'UNCONFIRMED' and finding.get('state') in ('OPEN', 'CANDIDATE_FIXED'):
+                if finding.get('severity') == 'HIGH' or finding.get('priority') == 'P1':
                     issues.warning('W_GO_OPEN_SUSPICION', f'findings[{finding["id"]}]',
                                    'Justify GO despite an open HIGH or P1 suspicion.')
+            acceptance = finding.get('acceptance') if isinstance(finding.get('acceptance'), dict) else {}
+            if (finding.get('assessment') == 'CONFIRMED' and finding.get('state') == 'ACCEPTED_RISK'
+                    and (finding.get('release_blocker') is True or finding.get('severity') == 'CRITICAL'
+                         or finding.get('priority') == 'P0')
+                    and not any(str(by_id['sources'].get(sid, {}).get('ref')).startswith('user:')
+                                for sid in id_list(acceptance.get('source_ids')))):
+                issues.error('E_GO_ACCEPTED_RISK', f'findings[{finding["id"]}]', 'An accepted blocker, CRITICAL or P0 '
+                             'risk under GO needs the decision of an authorized person: acceptance.source_ids must '
+                             'include a sources entry with a user: ref.')
             if finding.get('assessment') != 'CONFIRMED' or finding.get('state') not in ('OPEN', 'CANDIDATE_FIXED'):
                 continue
             if finding.get('release_blocker') is None:
@@ -3085,7 +6682,10 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
     if audit_status == 'COMPLETE_FOR_DEFINED_SCOPE':
         for check in registers['checks']:
             if check.get('required_for_audit') is True and check.get('execution') in ('BLOCKED', 'NOT_RUN', 'SKIPPED'):
-                issues.error('E_COMPLETE_GAP', f'checks[{check["id"]}]', 'Mandatory audit check not executed.')
+                issues.error('E_COMPLETE_GAP', f'checks[{check["id"]}]', 'Mandatory audit check not executed.' + (
+                    f' This is the check of {excluded_checks[check["id"]]}, which the user excluded from the release '
+                    'scope: set required_for_audit false (required_for_release too) and name the exclusion in '
+                    'required_reason.' if check['id'] in excluded_checks else ''))
             if check.get('required_for_audit') is None:
                 issues.error('E_COMPLETE_REQUIRED_NULL', f'checks[{check["id"]}]', 'Audit obligation unresolved.')
         for row in matrix_rows:
@@ -3094,16 +6694,30 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             if row.get('applicability') == 'APPLICABLE' and not id_list(row.get('check_ids')):
                 issues.error('E_COMPLETE_DOMAIN_UNCHECKED', f'domain_matrix[{row["domain"]}]',
                              'Applicable domain without checks prevents COMPLETE.')
+            elif row.get('applicability') == 'APPLICABLE' and row.get('domain') != 'H' and not any(
+                    checks.get(cid, {}).get('execution') in ('PASS', 'FAIL') for cid in id_list(row.get('check_ids'))):
+                issues.error('E_COMPLETE_DOMAIN', f'domain_matrix[{row["domain"]}]', 'COMPLETE requires at least one '
+                             'executed check (PASS or FAIL) in every applicable domain; with only blocked, deferred or '
+                             'unexecuted checks the audit is PARTIAL (domain H follows the security review).')
         for journey in registers['journeys']:
-            if journey.get('tier') == 'T1' and not any(
+            if journey.get('tier') == 'T1' and journey['id'] not in excluded_t1 and not any(
                     checks.get(cid, {}).get('execution') in ('PASS', 'FAIL')
-                    and checks.get(cid, {}).get('method') in END_TO_END_METHODS
+                    and member(checks.get(cid, {}).get('method'), END_TO_END_METHODS)
                     and any(eid in observed for eid in id_list(checks.get(cid, {}).get('evidence_ids')))
                     for cid in id_list(journey.get('check_ids'))):
                 issues.error('E_COMPLETE_T1', f'journeys[{journey["id"]}]',
-                             'T1 journey without an executed check close to end-to-end (not only STATIC/UNIT).')
+                             'T1 journey without an executed check close to end-to-end (not only STATIC/UNIT). '
+                             + EXCLUSION_REMEDY)
         if vision.get('status') == 'CONFLICTED':
             issues.warning('W_COMPLETE_VISION', 'vision.status', 'Justify COMPLETE with a conflicting vision.')
+        for requirement in registers['requirements']:
+            if requirement.get('binding') == 'BINDING' and not any(checks.get(cid, {}).get('execution') in (
+                    'PASS', 'FAIL') for cid in id_list(requirement.get('check_ids'))):
+                issues.error('E_COMPLETE_REQUIREMENT', f'requirements[{requirement["id"]}]', 'COMPLETE requires every '
+                             'binding requirement to be checked (a check with PASS or FAIL); a named gap means PARTIAL.')
+        if nonempty(scope.get('scope_gaps') if isinstance(scope, dict) else None) or nonempty(vision.get('open_questions')):
+            issues.warning('W_COMPLETE_OPEN_SCOPE', 'scope', 'Justify COMPLETE with open scope_gaps or vision '
+                           'open_questions: none may be relevant to the inspection (master prompt §15).')
         if any(f.get('assessment') == 'UNCONFIRMED' and f.get('state') == 'OPEN' for f in registers['findings']):
             issues.warning('W_COMPLETE_UNCONFIRMED', 'findings', 'Justify open unconfirmed findings with COMPLETE.')
 
@@ -3140,12 +6754,76 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                 issues.error('E_DISCOVERABLE_FILE', rel_run,
                              'Project tools could discover this file; store it as .txt or a patch.')
 
+    for name in ('objectives', 'journeys', 'components', 'checks'):
+        if final and not registers[name]:
+            issues.error('E_FINAL_EMPTY', name, 'Closure requires at least one entry in this register.')
     for name in ('REPORT.md', 'VISION.md', 'RESUME.md', 'RUN-STATE.json'):
         if not (run_root / name).is_file():
             if final:
                 issues.error('E_FINAL_FILE', name, 'Required artifact missing.')
             else:
                 issues.warning('W_FILE_PENDING', name, 'Artifact not yet present.')
+    # The security review and the verdict build on the frozen interim result (checkpoints/interim).
+    try:
+        live_state = read_json(run_root / 'RUN-STATE.json')
+    except (OSError, ValueError):
+        live_state = None
+    # A checkpoint snapshot (<run>/checkpoints/<name>/files) holds no checkpoint itself; the anchor its copied state
+    # may carry belongs to a checkpoint that was replaced.
+    snapshot = run_root.name == 'files' and run_root.parent.parent.name == 'checkpoints'
+    anchored = isinstance(live_state, dict) and 'interim_checkpoint' in live_state and not snapshot
+    review_started = (security_status in ('IN_PROGRESS', 'DONE', 'BLOCKED', 'NOT_APPLICABLE')
+                      or security_status == 'PENDING' and security.get('started_at_utc') is not None)
+    needs_checkpoint = (review_started or audit_status == 'COMPLETE_FOR_DEFINED_SCOPE'
+                        or release_status == 'GO_FOR_DEFINED_SCOPE') if final else review_started
+    checkpoint = verify_checkpoint(run_root) if final or needs_checkpoint or anchored else {'state': 'VALID'}
+    if checkpoint['state'] != 'VALID' and not (final and checkpoint['state'] == 'INVALID'):
+        # checkpoint create needs the whole interim state: security review PENDING, audit PARTIAL, no GO, interim REPORT.md
+        started = ('set security_review back to PENDING with started_at_utc, executed_by and completed_at_utc null, '
+                   'audit_status PARTIAL and a release_status other than GO_FOR_DEFINED_SCOPE (for example '
+                   'NOT_DEMONSTRATED), and REPORT.md marked as the interim result with those two statuses (checkpoint '
+                   'create needs this whole interim state), run checkpoint create and repeat the review; or close with '
+                   'the review NOT_PERFORMED under its rules (user decision).')
+        invalid = f'does not verify ({checkpoint.get("error")}). {checkpoint.get("remedy")}'
+        closed = closed_run_remedy(run_root)  # a closed run is not set back
+        if anchored:
+            soft('E_CHECKPOINT_REQUIRED', 'checkpoints/interim', 'RUN-STATE.json records an interim checkpoint '
+                 '(interim_checkpoint), but checkpoints/interim ' + (
+                     invalid if checkpoint['state'] == 'INVALID' else
+                     'is missing: the checkpoint was removed or changed. Restore it unchanged. ' + closed if closed else
+                     'is missing: the checkpoint was removed or changed. Restore it unchanged; otherwise '
+                     + (started if review_started else 'run checkpoint create again (before the security review it '
+                                                       'replaces a checkpoint that does not verify).')))
+        elif needs_checkpoint:
+            soft('E_CHECKPOINT_REQUIRED', 'checkpoints/interim', 'The security review and the verdict build on the '
+                 'frozen interim result, but this run has no interim checkpoint that verifies. ' + (
+                     'It ' + invalid if checkpoint['state'] == 'INVALID' else
+                     closed if closed else
+                     'Review already started: ' + started if review_started else
+                     'Before the security review: validate --final, then checkpoint create.'))
+    project_is_workspace = (isinstance(live_state, dict) and isinstance(live_state.get('workspace'), str)
+                            and bool(live_state['workspace'].strip()) and project_root is not None
+                            and same_location(project_root / live_state['workspace'], project_root))  # relative: from the project root
+    met_claims = {cid for gate in registers['release_gates'] if gate.get('status') == 'MET'
+                  for cid in id_list(gate.get('claim_ids'))}
+    own_checks = {cid for journey in registers['journeys'] if journey.get('tier') == 'T1' and journey['id'] not in excluded_t1
+                  for cid in id_list(journey.get('check_ids')) if journey_uses.get(cid) == 1}
+    for check in registers['checks']:
+        rests = [eid for eid in id_list(check.get('evidence_ids')) if eid in observed]
+        if (not project_is_workspace and rests and set(rests) <= outside and (
+                check['id'] in own_checks and check.get('execution') in ('PASS', 'FAIL')
+                or check.get('execution') == 'PASS' and met_claims & set(id_list(check.get('claim_ids'))))):
+            soft('E_RUN_OUTSIDE_WORKSPACE', f'checks[{check["id"]}]', f'{", ".join(rests)}: run outside the working '
+                 'copy (run --outside-workspace); such a run neither exercises a T1 journey nor carries a MET gate. Run '
+                 'the check in the working copy (run --cwd <copy>); if the user made the project itself the workspace, '
+                 'record its path as workspace in RUN-STATE.json.')
+    if not final and isinstance(live_state, dict) and not (
+            isinstance(live_state.get('authorization'), list)
+            and all(isinstance(item, str) and item.strip() for item in live_state['authorization'])):
+        issues.warning('W_RUN_AUTHORIZATION', 'RUN-STATE.json', 'authorization not recorded: record the authorizations '
+                       'of the start request as verbatim quotations (an empty list without authorizations); checkpoint '
+                       'create requires them (master prompt §16).')
+    saved: Any = None  # audit.json of the interim checkpoint, once it verifies (final validation)
     if final:
         def text_of(rel: str) -> str | None:
             """Content of an existing artifact; None if it is missing (reported elsewhere). Empty files count."""
@@ -3155,11 +6833,22 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             except OSError:
                 return None
         report = text_of('REPORT.md')
-        for needle in ('Executive summary', str(audit_status), str(release_status)):
+        if report is not None and 'executive summary' not in report.lower():
+            issues.error('E_FINAL_CONTENT', 'REPORT.md', "Does not contain 'Executive summary' (executive summary with "
+                         'verdict).')
+        for needle in (str(audit_status), str(release_status)):
             if report is not None and needle not in report:
                 issues.error('E_FINAL_CONTENT', 'REPORT.md', f'Does not contain {needle!r} (executive summary with verdict).')
         if report is not None and not re.search(r'^#{1,6}\s+(?:\d+(?:\.\d+)*\.?\s+)?Security review\b[^\n]*$', report, flags=re.MULTILINE | re.IGNORECASE):
             issues.error('E_FINAL_CONTENT', 'REPORT.md', 'Security review section heading missing.')
+        listed = dict.fromkeys([check['id'] for check in registers['checks'] if nonempty(check.get('deferral'))]
+                               + [journey['id'] for journey in registers['journeys'] if nonempty(journey.get('exclusion'))]
+                               + [sid for _, sid, _ in decisions])
+        missing = [item for item in listed if report is not None and not re.search(
+            r'(?<![\w.-])' + re.escape(item) + r'(?![\w-])', report)]
+        if missing:
+            issues.error('E_FINAL_CONTENT', 'REPORT.md', f'Does not contain {", ".join(missing)}: list deferred checks '
+                         'and excluded journeys and the user decisions they rest on in the report.')
         vision_text = text_of('VISION.md')
         if vision_text is not None and str(vision.get('status')) not in vision_text:
             issues.error('E_FINAL_CONTENT', 'VISION.md', 'Vision status missing.')
@@ -3178,6 +6867,205 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                                 or (task.get('type') != 'HUMAN' and 'candidate_complete' not in content)):
                     issues.error('E_FINAL_CONTENT', f'tasks[{task["id"]}]',
                                  'File does not contain the ID or copyable implementation request.')
+        # Nothing recorded at the interim checkpoint disappears before closure.
+        if checkpoint['state'] == 'INVALID':
+            issues.error('E_CHECKPOINT_INVALID', 'checkpoints/interim', f'Interim checkpoint does not verify '
+                         f'({checkpoint.get("error")}). {checkpoint.get("remedy")}')
+        elif checkpoint['state'] == 'VALID':
+            snapshot = run_root / 'checkpoints' / 'interim' / 'files'
+            try:
+                saved = read_json(snapshot / 'audit.json')
+            except (OSError, ValueError):
+                saved = None
+            removed = [f'{name}[{item["id"]}]' for name in ID_REGISTERS + OPTIONAL_ID_REGISTERS
+                       for item in (saved.get(name) if isinstance(saved, dict) and isinstance(saved.get(name), list)
+                                    else []) if isinstance(item, dict) and isinstance(item.get('id'), str)
+                       and item['id'] not in by_id[name]]
+            if removed:
+                issues.error('E_CHECKPOINT_REGRESSION', 'audit.json', f'{len(removed)} entries of the interim checkpoint '
+                             f'are missing: {", ".join(removed[:10])}{" ..." if len(removed) > 10 else ""}; an entry '
+                             'recorded at the checkpoint stays in its register and only changes its state.')
+
+            def file_bytes(path: Path) -> bytes | None:
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    return None
+            rel = 'evidence/baseline/baseline-start.json'
+            if file_bytes(snapshot / rel) != file_bytes(run_root / rel):
+                issues.error('E_CHECKPOINT_REGRESSION', rel, 'Differs from the copy in the interim checkpoint; the start '
+                             'baseline never changes after the checkpoint (restore it from checkpoints/interim/files).')
+    def closure_review() -> list[dict[str, Any]]:
+        """Items only a reader can judge in the semantic review: does this command exercise this journey, does this
+        excerpt name its test, does this evidence show the blocker, did the user decide this?"""
+        def clip(value: Any) -> str | None:
+            if value is None:
+                return None
+            text = ' '.join(str(part) for part in value) if isinstance(value, list) else str(value)
+            return text if len(text) <= REVIEW_TEXT_LIMIT else text[:REVIEW_TEXT_LIMIT] + ' [cut]'
+
+        shown_logs: set[str] = set()  # run logs an entry carries with the exit code: they count as shown
+
+        def shown(eid: str) -> dict[str, Any]:
+            item = evidence.get(eid, {})
+            view: dict[str, Any] = {'evidence': eid, 'kind': item.get('kind')}
+            if eid in log_exit:
+                if nonempty(item.get('path')):
+                    shown_logs.add(run_log_key(str(item['path'])))
+                view.update(command=clip(log_command.get(eid)), exit_code=log_exit[eid], freshness=item.get('freshness'),
+                            outside_workspace=eid in outside)
+            if isinstance(item.get('observation'), dict):
+                view['observation'] = clip(item['observation'].get('description'))
+            if isinstance(item.get('code_refs'), list):
+                view['code_refs'] = [clip(f'{ref.get("path")}:{ref.get("line_start")}-{ref.get("line_end")} '
+                                          f'{ref.get("excerpt")}') for ref in item['code_refs'] if isinstance(ref, dict)]
+            if nonempty(item.get('ref')):
+                view['ref'] = clip(item['ref'])
+            return view
+
+        def check_view(check: dict[str, Any]) -> dict[str, Any]:
+            quotes = check.get('log_excerpts') if isinstance(check.get('log_excerpts'), list) else []
+            return {'check': check['id'], 'title': clip(check.get('title')), 'method': check.get('method'),
+                    'execution': check.get('execution'), 'evidence': [shown(eid) for eid in id_list(check.get('evidence_ids'))],
+                    'excerpts': [clip(quote.get('excerpt')) for quote in quotes if isinstance(quote, dict)]}
+        entries: list[dict[str, Any]] = []
+        for journey in registers['journeys']:
+            if journey.get('tier') == 'T1':
+                entries += [dict(kind='T1_OWN_CHECK', journey=journey['id'], **check_view(checks[cid]))
+                            for cid in id_list(journey.get('check_ids')) if cid in checks and journey_uses.get(cid) == 1]
+        for gate in registers['release_gates']:
+            if gate.get('status') == 'MET':
+                entries += [dict(kind='GATE_CARRIER', gate=gate['id'], claim=claim_id, **check_view(check))
+                            for claim_id in id_list(gate.get('claim_ids')) for check in registers['checks']
+                            if claim_id in id_list(check.get('claim_ids')) and check.get('execution') == 'PASS']
+        entries += [dict(kind='BLOCKED_CHECK', **check_view(check)) for check in registers['checks']
+                    if check.get('execution') == 'BLOCKED'
+                    and (check.get('required_for_audit') is not False or check.get('required_for_release') is not False)]
+        for subject, sid, reason in decisions:
+            entries.append({'kind': 'USER_DECISION', 'subject': subject, 'reason': clip(reason), 'source': sid,
+                            'excerpt': clip(by_id['sources'][sid].get('excerpt'))})
+        for finding in registers['findings']:
+            if blocking(finding) and (finding.get('state') != 'OPEN' or finding.get('assessment') == 'DISPROVEN'):
+                acceptance = finding.get('acceptance') if isinstance(finding.get('acceptance'), dict) else {}
+                entries.append({
+                    'kind': 'BLOCKING_FINDING', 'finding': finding['id'], 'state': finding.get('state'),
+                    'assessment': finding.get('assessment'), 'superseded_by': finding.get('superseded_by'),
+                    'chain_end': chain_end.get(finding['id']), 'reason': clip(finding.get('superseded_reason')
+                                                                              or finding.get('disproof')),
+                    'counter_evidence': [shown(eid) for eid in id_list(finding.get('counter_evidence_ids'))],
+                    'evidence': [shown(eid) for eid in id_list(finding.get('evidence_ids'))],
+                    'acceptance_sources': [{'source': sid, 'ref': clip(by_id['sources'].get(sid, {}).get('ref')),
+                                            'excerpt': clip(by_id['sources'].get(sid, {}).get('excerpt'))}
+                                           for sid in id_list(acceptance.get('source_ids'))]})
+            elif finding.get('assessment') == 'DISPROVEN' or finding.get('state') == 'SUPERSEDED':
+                counter = [shown(eid) for eid in id_list(finding.get('counter_evidence_ids'))]
+                entries.append({
+                    'kind': 'FINDING_NOT_OPEN', 'finding': finding['id'], 'assessment': finding.get('assessment'),
+                    'state': finding.get('state'), 'severity': finding.get('severity'),
+                    'priority': finding.get('priority'), 'release_blocker': finding.get('release_blocker'),
+                    'disproof': clip(finding.get('disproof')), 'superseded_reason': clip(finding.get('superseded_reason')),
+                    'counter_evidence': counter or 'none', 'successor': finding.get('superseded_by'),
+                    'chain_end': chain_end.get(finding['id']),
+                    'evidence': [shown(eid) for eid in id_list(finding.get('evidence_ids'))]})
+        # Downgrades that remain possible: each with the facts a reader needs to judge it.
+        for check in registers['checks']:
+            cited = id_list(check.get('evidence_ids'))
+            failed_runs = [eid for eid in cited if eid in log_exit and log_exit[eid] != 0
+                           and evidence[eid].get('freshness') != 'STALE']
+            if check.get('execution') == 'PASS' and (failed_runs or check.get('exit_code') not in (None, 0)):
+                entries.append(dict(kind='PASS_ON_FAILED_RUN', exit_code=check.get('exit_code'), **check_view(check)))
+            attempts = [eid for eid in cited if eid in log_exit and log_exit[eid] != 0
+                        and evidence[eid].get('freshness') == 'STALE']
+            if check.get('execution') == 'PASS' and attempts and any(
+                    eid in log_exit and evidence[eid].get('freshness') == 'CURRENT' for eid in cited):
+                entries.append(dict(kind='SUPERSEDED_ATTEMPT', attempts=attempts,
+                                    rerun_reason=clip(check.get('rerun_reason')), **check_view(check)))
+            if check.get('execution') == 'FAIL':
+                claim_ids, check_evidence = set(id_list(check.get('claim_ids'))), set(cited)
+                entries.append(dict(
+                    kind='FAILED_CHECK', purpose=check.get('purpose'),
+                    meaning=FAILURE_MEANING.get(check['purpose']) if member(check.get('purpose'), PURPOSE) else None,
+                    required_for_audit=check.get('required_for_audit'),
+                    required_for_release=check.get('required_for_release'),
+                    required_reason=clip(check.get('required_reason')),
+                    requirements=[r['id'] for r in registers['requirements'] if check['id'] in id_list(r.get('check_ids'))],
+                    journeys=[j['id'] for j in registers['journeys'] if check['id'] in id_list(j.get('check_ids'))],
+                    gates=[g['id'] for g in registers['release_gates'] if claim_ids & set(id_list(g.get('claim_ids')))],
+                    findings=[{'finding': f['id'], 'assessment': f.get('assessment'), 'state': f.get('state'),
+                               'severity': f.get('severity'), 'priority': f.get('priority'),
+                               'release_blocker': f.get('release_blocker')} for f in registers['findings']
+                              if claim_ids & set(id_list(f.get('claim_ids')))
+                              or check_evidence & set(id_list(f.get('evidence_ids')))],
+                    **check_view(check)))
+        for finding in registers['findings']:
+            if (finding.get('assessment') == 'CONFIRMED' and finding.get('state') in ('OPEN', 'CANDIDATE_FIXED')
+                    and finding.get('severity') in ('CRITICAL', 'HIGH') and finding.get('release_blocker') is not True):
+                entries.append({'kind': 'OPEN_FINDING_NOT_BLOCKING', 'finding': finding['id'],
+                                'state': finding.get('state'), 'severity': finding.get('severity'),
+                                'priority': finding.get('priority'), 'release_blocker': finding.get('release_blocker'),
+                                'reason': clip(finding.get('release_blocker_reason')),
+                                'evidence': [shown(eid) for eid in id_list(finding.get('evidence_ids'))]})
+        # Everything the interim checkpoint held with a stronger negative weight than the live register.
+        for register in ('checks', 'findings'):
+            for before in (saved.get(register) if isinstance(saved, dict) and isinstance(saved.get(register), list) else []):
+                now = by_id[register].get(before.get('id')) if isinstance(before, dict) and isinstance(
+                    before.get('id'), str) else None
+                if now is None:
+                    continue
+                changes: list[tuple[str, Any, Any]] = []
+                if register == 'checks':
+                    changes += [(field, before.get(field), now.get(field))
+                                for field in ('required_for_audit', 'required_for_release')
+                                if before.get(field) is True and now.get(field) is not True]
+                    if (before.get('execution') == 'FAIL' and now.get('execution') != 'FAIL'
+                            or before.get('execution') == 'BLOCKED' and now.get('execution') == 'PASS'):
+                        changes.append(('execution', before.get('execution'), now.get('execution')))
+                else:
+                    changes += [(field, before.get(field), now.get(field))
+                                for field, order in (('severity', SEVERITY_ORDER), ('priority', PRIORITY_ORDER))
+                                if lowered(order, before.get(field), now.get(field))]
+                    changes += [(field, before.get(field), now.get(field)) for field, weakened in (
+                        ('release_blocker', before.get('release_blocker') is True and now.get('release_blocker') is not True),
+                        ('assessment', before.get('assessment') == 'CONFIRMED' and now.get('assessment') != 'CONFIRMED'),
+                        ('state', before.get('state') == 'OPEN' and now.get('state') != 'OPEN')) if weakened]
+                if changes:
+                    entries.append({'kind': 'CHANGED_SINCE_CHECKPOINT', register[:-1]: before['id'], 'changes': [
+                        {'field': field, 'at_checkpoint': clip(was) if isinstance(was, (str, list, dict)) else was,
+                         'live': clip(live) if isinstance(live, (str, list, dict)) else live}
+                        for field, was, live in changes]})
+        # Every failed run of this run that no entry shows with its log view (exit code) is listed with what cites it.
+        failed_runs, unreadable = failed_run_logs(run_root)
+        pointing: dict[str, list[str]] = {}  # log path -> the evidence entries whose path is that file
+        for eid, item in evidence.items():
+            if nonempty(item.get('path')):
+                pointing.setdefault(run_log_key(str(item['path'])), []).append(eid)
+        other = [run for run in failed_runs if run_log_key(run['log']) not in shown_logs]
+        for run in other:
+            cited = pointing.get(run_log_key(run['log']), [])
+            run['cited_by'] = [{'check': check['id'], 'execution': check.get('execution'),
+                                'required_for_audit': check.get('required_for_audit'),
+                                'required_for_release': check.get('required_for_release'),
+                                'evidence': [{'evidence': eid, 'kind': evidence[eid].get('kind')}
+                                             for eid in cited if eid in id_list(check.get('evidence_ids'))]}
+                               for check in registers['checks']
+                               if set(cited) & set(id_list(check.get('evidence_ids')))]
+            run['findings'] = [{'finding': finding['id'], 'assessment': finding.get('assessment'),
+                                'state': finding.get('state'), 'severity': finding.get('severity'),
+                                'release_blocker': finding.get('release_blocker')}
+                               for finding in registers['findings']
+                               if set(cited) & set(id_list(finding.get('evidence_ids')))]
+        other.sort(key=lambda run: not run['cited_by'] and not run['findings'])
+        if other or unreadable:
+            entries.append({'kind': 'OTHER_FAILED_RUNS', 'count': len(other), 'unreadable_metadata': unreadable,
+                            'runs': [{'log': run['log'], 'command': clip(run['command']), 'exit_code': run['exit_code'],
+                                      'error': clip(run['error']), 'cited_by': run['cited_by'],
+                                      'findings': run['findings']} for run in other[:FAILED_RUN_LIMIT]],
+                            'not_listed': max(0, len(other) - FAILED_RUN_LIMIT)})
+        if security_status == 'NOT_APPLICABLE':
+            entries.append({'kind': 'SECURITY_NOT_APPLICABLE', 'reason': clip(security.get('reason')),
+                            'completed_at_utc': security.get('completed_at_utc')})
+        return entries
+
     run_state_path = run_root / 'RUN-STATE.json'
     if run_state_path.is_file():
         try:
@@ -3190,9 +7078,10 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
             if missing:
                 issues.error('E_RUN_STATE', 'RUN-STATE.json', f'Fields missing: {", ".join(missing)}')
             elif run_state.get('run_id') != data.get('run_id'):
-                issues.warning('W_RUN_ID', 'RUN-STATE.json', 'run_id differs from audit.json.')
-            if (isinstance(run_state, dict) and run_state.get('closed_at_utc')
-                    and not security_closure_allowed(data, run_state, run_root)):
+                soft('E_RUN_ID', 'RUN-STATE.json', 'run_id differs from audit.json; both files belong to one run (a '
+                     'checkpoint of mismatching identities never verifies). The run ID is the one init printed and the '
+                     'run directory name carries; correct the file that differs.')
+            if closure_marked(run_state) and not security_closure_allowed(data, run_state, run_root):
                 issues.error('E_RUN_SECURITY_CLOSURE', 'RUN-STATE.json',
                              'Closed run requires DONE, NOT_APPLICABLE, NOT_PERFORMED or BLOCKED security review, '
                              'or a supported superseding run linked through previous_run_ids.')
@@ -3205,8 +7094,10 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
                                  'list (master prompt §16).')
                 if not nonempty(run_state.get('closed_at_utc')):
                     issues.warning('W_RUN_NOT_CLOSED', 'RUN-STATE.json', 'closed_at_utc missing; the final check '
-                                   'runs before closure (master prompt §16); P7 remains open. Record closure only at P9 or a valid supersession.')
+                                   'runs before closure (master prompt §16); the run stays open until close records the closure at P9 or a valid supersession.')
 
+    if final:
+        issues.review = closure_review()
     confirmed = [f for f in registers['findings'] if f.get('assessment') == 'CONFIRMED']
     counts: dict[str, Any] = {
         'audit_status': audit_status, 'release_status': release_status, 'open_release_blockers': open_blockers,
@@ -3238,6 +7129,7 @@ def validate_audit(data: Any, run_dir: Path, project: Path | None,
         counts['test_assessments'] = tally(registers['test_assessments'], 'class')
     if registers['doc_claims']:
         counts['doc_claims'] = tally(registers['doc_claims'], 'verdict')
+    closure_receipt_issues(issues, run_root, final)
     return issues, counts
 
 
@@ -3255,7 +7147,77 @@ def markdown_links(text: str) -> list[str]:
         else:
             prose.append(line)
     text = re.sub(r'(?<!`)(`+)(?!`)(.*?)\1(?!`)', '', ''.join(prose), flags=re.DOTALL)
-    return re.findall(r'!?\[[^\]]*\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)', text)
+    return link_destinations(text)
+
+
+LEADING_BLANKS = re.compile(r'\s*')
+
+
+def link_destinations(text: str) -> list[str]:
+    """Destinations of `[text](destination "title")` links, in time linear in the text (up to a log factor). A
+    destination may contain parentheses nested to any depth when they are balanced (evidence/ui/login(1).png); with
+    unbalanced ones it ends at the first blank or `)`, so such a link is still reported."""
+    def positions(pattern: str) -> list[int]:
+        return [m.start() for m in re.finditer(pattern, text)]
+
+    def following(found: list[int], start: int) -> int | None:
+        index = bisect_left(found, start)
+        return found[index] if index < len(found) else None
+
+    stops, closers, blank_or_close = positions(r'[\s()]'), positions(r'\)'), positions(r'[\s)]')
+    angle_ends, opens, closes = positions('>'), positions(r'\['), positions(r'\]')
+    matching: dict[int, int] = {}  # '(' -> its ')' when no blank lies between
+    stack: list[int] = []
+    for index in stops:
+        char = text[index]
+        if char == '(':
+            stack.append(index)
+        elif char == ')':
+            if stack:
+                matching[stack.pop()] = index
+        else:
+            stack.clear()
+    links, consumed = [], 0
+    for bracket in re.finditer(r'\]\(', text):
+        close = bracket.start()
+        if close < consumed:
+            continue
+        previous = bisect_left(closes, close) - 1
+        floor = max(closes[previous] + 1 if previous >= 0 else 0, consumed)
+        opener = following(opens, floor)
+        if opener is None or opener > close:
+            continue  # no `[` of its own: not a link
+        start = LEADING_BLANKS.match(text, bracket.end()).end()
+        target_end = None
+        if text.startswith('<', start):
+            end = following(angle_ends, start + 1)
+            target_end = end + 1 if end is not None and end > start + 1 else None
+        else:
+            position = start
+            while True:
+                stop = following(stops, position)
+                if stop is None:
+                    break  # the text ends inside the destination
+                if text[stop] == '(':
+                    if stop not in matching:
+                        break  # unbalanced
+                    position = matching[stop] + 1
+                    continue
+                target_end = stop if stop > start else None
+                break
+        if target_end is None:
+            fallback = following(blank_or_close, start)
+            target_end = fallback if fallback is not None and fallback > start else None
+        if target_end is None:
+            continue
+        rest = target_end
+        if rest < len(text) and text[rest] != ')':
+            rest = following(closers, rest) if text[rest].isspace() else None  # an optional title, then `)`
+        if rest is None or rest >= len(text) or text[rest] != ')':
+            continue
+        links.append(text[start:target_end])
+        consumed = rest + 1
+    return links
 
 
 def checkpoint_files(run: Path, data: dict[str, Any]) -> tuple[set[str], list[dict[str, str]], set[str]]:
@@ -3345,10 +7307,128 @@ def checkpoint_files(run: Path, data: dict[str, Any]) -> tuple[set[str], list[di
                    for source, reference, reason in sorted(omitted)], directories
 
 
-def verify_checkpoint(run: Path) -> dict[str, Any]:
+OS_METADATA_FILES = frozenset({'.ds_store', 'thumbs.db', 'desktop.ini'})
+
+
+def inventory_difference(actual: set[str], expected: set[str]) -> str:
+    """Unexpected and missing entries of an inventory, for an error message."""
+    return '; '.join(f'{label} ' + ', '.join(sorted(items)[:20]) + (' ...' if len(items) > 20 else '')
+                     for label, items in (('unexpected', actual - expected), ('missing', expected - actual)) if items)
+
+
+SNAPSHOT_DRIFT_CODES = frozenset({'E_CODE_REF_STALE', 'E_SOURCE_STALE', 'E_CODE_REF_FILE'})
+
+
+CHECKPOINT_WAY_OUT = ('Never repair a checkpoint or its anchor by hand. While security_review is PENDING without '
+                      'started_at_utc, checkpoint create replaces a checkpoint that does not verify (the old one moves to '
+                      'checkpoints/invalid-<UTC>/). After the security review has started: set security_review back to '
+                      'PENDING with started_at_utc, completed_at_utc and executed_by cleared, create the checkpoint and '
+                      'repeat the review, or close with the review NOT_PERFORMED under its rules.')
+REANCHOR_WAY_OUT = ('If RUN-STATE.json was rebuilt after damage, run checkpoint reanchor <run> (it writes the anchor again '
+                    'when the checkpoint verifies against its manifest), then validate.')
+BEFORE_REVIEW_WAY_OUT = ('Before the security review starts, checkpoint create replaces the checkpoint once validate '
+                         '--final passes for the interim state (the old one moves to checkpoints/invalid-<UTC>/); never '
+                         'repair the checkpoint or its anchor by hand.')
+AFTER_REVIEW_WAY_OUT = ('After the security review has started, set security_review back to PENDING with started_at_utc, '
+                        'completed_at_utc and executed_by cleared, create the checkpoint and repeat the review, or close '
+                        'with the review NOT_PERFORMED under its rules; never repair the checkpoint or its anchor by hand.')
+CLOSED_WAY_OUT = ('The run is closed: a closed run is not changed. Its results stay as recorded; a new linked re-audit '
+                  'run gets a checkpoint of its own.')
+REANCHORED_NOTE = ('the interim_checkpoint anchor was written again after the run state was rebuilt (checkpoint '
+                   'reanchor or checkpoint restore without a matching live anchor), so that the checkpoint predates the '
+                   'security review rests on the manifest alone; REPORT.md must say so.')
+
+
+def valid_anchor(anchor: Any) -> bool:
+    """An interim_checkpoint anchor that names a manifest hash; a null or malformed anchor counts as missing."""
+    return isinstance(anchor, dict) and isinstance(anchor.get('manifest_sha256'), str)
+
+
+def interim_state_problem(data: Any) -> str | None:
+    """None when audit.json is the state of an interim checkpoint (audit_status PARTIAL, security review PENDING and not
+    started: started_at_utc, completed_at_utc and executed_by empty); otherwise what it holds, for a message."""
+    review = data.get('security_review') if isinstance(data, dict) else None
+    review = review if isinstance(review, dict) else {}
+    started = any(nonempty(review.get(key)) for key in ('started_at_utc', 'completed_at_utc', 'executed_by'))
+    audit_status = data.get('audit_status') if isinstance(data, dict) else None
+    if audit_status == 'PARTIAL' and review.get('status') == 'PENDING' and not started:
+        return None
+    return (f'audit_status {status_value(audit_status)} and security review {status_value(review.get("status"))}'
+            + (', started' if started else ''))
+
+
+def closed_run_remedy(run: Path) -> str | None:
+    """None for an open run; for a closed run the closed-run way out (a closed run is not changed), for a closure that
+    close did not record how to repair it, since such a run is open for runs and close."""
+    try:
+        state = read_json(run / 'RUN-STATE.json')
+    except (OSError, ValueError):
+        return None
+    if not closure_marked(state):
+        return None
+    if closure_receipt_state(state, run) == 'UNRECORDED':
+        return f'{unrecorded_closure(state)}. {CLOSURE_UNRECORDED_REMEDY}'
+    return CLOSED_WAY_OUT
+
+
+def checkpoint_remedy(run: Path, anchor_missing: bool) -> str:
+    """The way out of an interim checkpoint that does not verify, for the phase of the live security review (a closed
+    run is not changed); with a missing anchor first checkpoint reanchor for a run state rebuilt after damage."""
+    try:
+        data = read_json(run / 'audit.json')
+    except (OSError, ValueError):
+        data = None
+    closed = closed_run_remedy(run)
+    review = data.get('security_review') if isinstance(data, dict) else None
+    if closed:
+        way_out = closed
+    elif not isinstance(review, dict):
+        way_out = CHECKPOINT_WAY_OUT  # phase unknown: both ways
+    elif review.get('status') == 'PENDING' and not nonempty(review.get('started_at_utc')):
+        way_out = BEFORE_REVIEW_WAY_OUT
+    else:
+        way_out = AFTER_REVIEW_WAY_OUT
+    if not anchor_missing:
+        return way_out
+    return REANCHOR_WAY_OUT + (' ' + way_out if closed else ' Otherwise: ' + way_out[0].lower() + way_out[1:])
+
+
+def checkpoint_way_out(checked: dict[str, Any]) -> str:
+    """The remedy of a checkpoint that does not verify, to append to a message that quotes its error."""
+    return ' ' + str(checked.get('remedy') or CHECKPOINT_WAY_OUT)
+
+
+def absent_checkpoint_note(run: Path) -> str:
+    """What a run without an interim checkpoint means for the phase of its security review."""
+    try:
+        data = read_json(run / 'audit.json')
+    except (OSError, ValueError):
+        data = None
+    review = data.get('security_review') if isinstance(data, dict) else None
+    text = 'The run has no interim checkpoint (checkpoints/interim/ does not exist): nothing to verify, restore or re-anchor. '
+    closed = closed_run_remedy(run)
+    if closed:
+        return text + closed
+    if not isinstance(review, dict):
+        return text + ('audit.json is unreadable or has no security_review: repair the live state; without a checkpoint '
+                       'there is no earlier state to fall back on.')
+    if review.get('status') == 'PENDING' and not nonempty(review.get('started_at_utc')):
+        return text + ('The security review has not started: complete P7 with validate --final, then create it with '
+                       'checkpoint create before P8.')
+    return text + (f'The security review has started (status {status_value(review.get("status"))!r}): P8 never starts or '
+                   'continues without a verified interim checkpoint; keep the run open with its results and offer a new '
+                   'linked re-audit run or a recorded user decision (security_review NOT_PERFORMED with its decision '
+                   'source).')
+
+
+def verify_checkpoint(run: Path, *, require_anchor: bool = True) -> dict[str, Any]:
+    """VALID, or INVALID with the reason (error) and the way out (remedy, checkpoint_remedy); require_anchor False
+    (checkpoint reanchor) accepts the run state of a current run (see current_run) whose anchor is missing and verifies
+    the checkpoint against its manifest alone."""
     directory = run / 'checkpoints' / 'interim'
     if not directory.exists():
         return {'state': 'ABSENT'}
+    anchor_missing = False
     try:
         manifest = read_json(directory / 'manifest.json')
         snapshot = directory / 'files'
@@ -3363,9 +7443,14 @@ def verify_checkpoint(run: Path) -> dict[str, Any]:
                 or manifest.get('baseline') != data.get('baseline')
                 or manifest.get('validation') != {'result': 'PASS', 'final': True, 'errors': 0}):
             raise ToolError('Checkpoint identity or validation metadata mismatch.')
+        problem = interim_state_problem(data)
+        if problem is not None:
+            raise ToolError(f'Checkpoint snapshot is no interim state: its audit.json has {problem}; an interim '
+                            'checkpoint holds PARTIAL with the security review PENDING and not started.')
         saved_state = read_json(snapshot / 'RUN-STATE.json')
         if not isinstance(saved_state, dict) or saved_state.get('run_id') != manifest['run_id']:
             raise ToolError('Checkpoint RUN-STATE.json run_id mismatch.')
+        live_ids = []
         for name in ('RUN-STATE.json', 'audit.json'):
             try:
                 live = read_json(run / name)
@@ -3373,33 +7458,87 @@ def verify_checkpoint(run: Path) -> dict[str, Any]:
                 continue  # Recovery must work when a live file was interrupted.
             if isinstance(live, dict) and live.get('run_id') is not None and live['run_id'] != manifest['run_id']:
                 raise ToolError(f'Checkpoint does not belong to this run: {name} run_id mismatch.')
+            if isinstance(live, dict) and live.get('run_id') is not None:
+                live_ids.append(live['run_id'])
+        if not live_ids and manifest['run_id'] != run.name:
+            raise ToolError('Checkpoint does not belong to this run: no live run_id is readable and the checkpoint '
+                            'run_id differs from the run directory name.')
         hashes = manifest.get('sha256')
-        actual_files = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob('*') if p.is_file()}
-        not_snapshotted = manifest.get('not_snapshotted', [])
+        listed = set(hashes) if isinstance(hashes, dict) else set()
+        actual_files = {rel for rel in (p.relative_to(snapshot).as_posix() for p in snapshot.rglob('*') if p.is_file())
+                        if rel in listed or rel.rsplit('/', 1)[-1].lower() not in OS_METADATA_FILES}
+        not_snapshotted = manifest.get('not_snapshotted')  # required, also when nothing was left out
         if not isinstance(not_snapshotted, list) or not all(isinstance(item, dict) for item in not_snapshotted):
-            raise ToolError('Checkpoint not_snapshotted inventory malformed.')
+            raise ToolError('Checkpoint not_snapshotted inventory missing or malformed.')
         expected, omitted, directories = checkpoint_files(snapshot, data)
         if not isinstance(hashes, dict) or set(hashes) != actual_files or set(hashes) != expected:
-            raise ToolError('Checkpoint artifact inventory mismatch.')
-        if 'not_snapshotted' in manifest and not_snapshotted != omitted:
+            raise ToolError('Checkpoint artifact inventory mismatch: ' + ('; '.join(
+                f'{where}: {difference}' for where, difference in (
+                    ('files/ against the manifest', inventory_difference(actual_files, listed)),
+                    ('manifest against the artifact closure', inventory_difference(listed, expected))) if difference)
+                if isinstance(hashes, dict) else 'sha256 inventory malformed') + '.')
+        if not_snapshotted != omitted:
             raise ToolError('Checkpoint not_snapshotted inventory mismatch.')
         expected_entries = {'manifest.json'} | {(Path('files') / rel).as_posix() for rel in expected | directories}
         expected_entries |= {parent.as_posix() for rel in expected_entries for parent in Path(rel).parents if parent != Path('.')}
         expected_entries = {'interim'} | {'interim/' + rel for rel in expected_entries}
         actual_entries = set()
         for parent, dirs, files in os.walk(directory.parent):
-            if Path(parent) == directory.parent:
-                dirs[:] = [name for name in dirs if not name.startswith('.interim-')]
+            if Path(parent) == directory.parent:  # staging and replaced checkpoints (invalid-<UTC>) beside it
+                dirs[:] = [name for name in dirs if not name.startswith(('.interim-', 'invalid-'))]
             actual_entries.update((Path(parent) / name).relative_to(directory.parent).as_posix() for name in dirs + files)
+            # operating-system metadata (Finder, Explorer) outside the manifest is no part of the snapshot
+            actual_entries -= {(Path(parent) / name).relative_to(directory.parent).as_posix() for name in files
+                               if name.lower() in OS_METADATA_FILES} - expected_entries
         if actual_entries != expected_entries:
-            raise ToolError('Checkpoint directory inventory mismatch.')
+            raise ToolError('Checkpoint directory inventory mismatch: '
+                            + inventory_difference(actual_entries, expected_entries) + ' (paths below checkpoints/).')
         for rel, digest in hashes.items():
             path = snapshot / rel
             if not is_within(path, snapshot) or sha256_file(path) != digest:
                 raise ToolError(f'Checkpoint hash mismatch: {rel}')
-        return {'state': 'VALID', 'directory': str(directory), 'run_id': manifest['run_id'], 'files': len(hashes)}
+        notes = []
+        # the anchor in RUN-STATE.json detects a changed or hand-made manifest, not a party that rewrites both files; a
+        # current run (current_run) comes from a tool that anchors its checkpoints. A null or malformed anchor counts
+        # as missing. The snapshot's own RUN-STATE.json is hashed into the manifest, so it never holds that manifest's
+        # anchor (after a replacement it holds the old one): with RUN-STATE.json unreadable the anchor is unknown.
+        try:
+            live_state = read_json(run / 'RUN-STATE.json')
+        except (OSError, ValueError):
+            live_state = None
+        anchor = live_state.get('interim_checkpoint') if isinstance(live_state, dict) else None
+        if valid_anchor(anchor):
+            if anchor['manifest_sha256'] != sha256_file(directory / 'manifest.json'):
+                raise ToolError('Checkpoint manifest differs from the interim_checkpoint anchor in RUN-STATE.json: the '
+                                'checkpoint or the anchor was changed after creation.')
+        elif not isinstance(live_state, dict):
+            notes.append('RUN-STATE.json is unreadable: the interim_checkpoint anchor could not be read; verified '
+                         'against its manifest only.')
+        elif current_run(live_state, run) and require_anchor:
+            anchor_missing = True
+            raise ToolError('RUN-STATE.json has no valid interim_checkpoint anchor: the checkpoint was not created by '
+                            'checkpoint create for this run state, the anchor was removed, or RUN-STATE.json was '
+                            'rebuilt after damage.')
+        elif current_run(live_state, run):
+            notes.append('RUN-STATE.json has no interim_checkpoint anchor: verified against its manifest only.')
+        else:
+            notes.append('RUN-STATE.json has no interim_checkpoint anchor (checkpoint of an earlier tool version): '
+                         'verified against its manifest only.')
+        if manifest['tool_version'] == TOOL_VERSION:
+            issues, _ = validate_audit(data, snapshot, None, final=True)
+            # a project changed since the checkpoint is a re-audit matter, not a damaged checkpoint
+            codes = {issue['code'] for issue in issues.errors} - SNAPSHOT_DRIFT_CODES
+            if codes:
+                raise ToolError('Checkpoint snapshot audit.json fails the final validation (' + ', '.join(sorted(codes))
+                                + ').')
+        else:
+            notes.append(f'Snapshot audit.json not revalidated: created by tool version {manifest["tool_version"]}, this '
+                         f'is {TOOL_VERSION}.')
+        return {'state': 'VALID', 'directory': str(directory), 'run_id': manifest['run_id'], 'files': len(hashes),
+                'notes': notes}
     except (OSError, ValueError, TypeError, ToolError) as exc:
-        return {'state': 'INVALID', 'directory': str(directory), 'error': str(exc)}
+        return {'state': 'INVALID', 'directory': str(directory), 'error': str(exc),
+                'remedy': checkpoint_remedy(run, anchor_missing)}
 
 
 def create_checkpoint(run: Path, project: Path | None) -> dict[str, Any]:
@@ -3410,11 +7549,27 @@ def create_checkpoint(run: Path, project: Path | None) -> dict[str, Any]:
     data = read_json(run / 'audit.json')
     if not isinstance(data, dict) or not isinstance(data.get('security_review'), dict):
         raise ToolError('Checkpoint requires an audit object with security_review.')
-    if data['security_review'].get('status') != 'PENDING' or data.get('audit_status') != 'PARTIAL':
-        raise ToolError('Interim checkpoint requires PARTIAL with security review PENDING.')
     destination = run / 'checkpoints' / 'interim'
+    replaced = None
     if destination.exists():
-        raise ToolError('Interim checkpoint already exists; never overwrite it.')
+        existing = verify_checkpoint(run)
+        if existing['state'] == 'VALID':
+            raise ToolError('Interim checkpoint already exists and verifies; never overwrite it.')
+        review = data['security_review']
+        if review.get('status') != 'PENDING' or nonempty(review.get('started_at_utc')):
+            raise ToolError(f'The interim checkpoint does not verify ({existing.get("error")}) and the security review '
+                            'has started: the checkpoint is replaced only before P8; nothing written.'
+                            + checkpoint_way_out(existing))
+        replaced = existing.get('error')
+    if interim_state_problem(data) is not None:
+        raise ToolError('Interim checkpoint requires PARTIAL with security review PENDING.'
+                        if data['security_review'].get('status') != 'PENDING' or data.get('audit_status') != 'PARTIAL' else
+                        'Interim checkpoint requires the security review not started: started_at_utc, completed_at_utc '
+                        'and executed_by must be empty; nothing written.')
+    live_state = read_json(run / 'RUN-STATE.json')
+    if not isinstance(live_state, dict) or live_state.get('run_id') != data.get('run_id'):
+        raise ToolError('RUN-STATE.json must be an object whose run_id equals the audit.json run_id '
+                        f'({data.get("run_id")!r}); repair RUN-STATE.json, then create the checkpoint. Nothing written.')
     files, not_snapshotted, directories = checkpoint_files(run, data)
     hashes = {rel: sha256_file(run / rel) for rel in sorted(files)}
     manifest = {'format': 'audit-interim-checkpoint/1', 'package': 'production-readiness-audit',
@@ -3438,24 +7593,209 @@ def create_checkpoint(run: Path, project: Path | None) -> dict[str, Any]:
             raise ToolError('Live audit.json changed during checkpoint creation.')
         issues, _ = validate_audit(saved, staging / 'files', project, final=True)
         if issues.errors:
-            raise ToolError('Checkpoint requires validate --final PASS: ' + ', '.join(sorted(issues.codes())))
+            raise ToolError('Checkpoint requires validate --final PASS: ' + ', '.join(sorted(issues.codes())) + (
+                '; record the authorizations of the start request verbatim in RUN-STATE.json authorization (an '
+                'empty list when there are none)' if 'E_RUN_AUTHORIZATION' in issues.codes() else '')
+                + '. Run validate --final for the details; nothing written.')
         write_json_new(staging / 'manifest.json', manifest)
+        if replaced is not None:  # kept, never deleted
+            moved_to = unique_path(destination.parent, 'invalid-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
+            destination.rename(moved_to)
         staging.rename(destination)
     finally:
         if staging.exists():
             remove_tree(staging)
-    return verify_checkpoint(run)
+    anchor = {'manifest_sha256': sha256_file(destination / 'manifest.json'), 'created_at_utc': utc_now(),
+              'tool_version': TOOL_VERSION}
+    state_path = run / 'RUN-STATE.json'
+    try:
+        state = json.loads(state_path.read_bytes().decode('utf-8-sig'))
+        state['interim_checkpoint'] = anchor
+        replace_file_atomic(state_path, (json.dumps(state, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ToolError(f'Checkpoint created, but its anchor could not be written to RUN-STATE.json ({exc}); add '
+                        f'"interim_checkpoint": {json.dumps(anchor)} to RUN-STATE.json by hand.') from exc
+    result = verify_checkpoint(run)
+    if replaced is not None:
+        result['replaced'] = {'reason': replaced, 'moved_to': str(moved_to),
+                              'note': 'The checkpoint that did not verify was moved, not deleted.'}
+    return result
+
+
+def unique_path(directory: Path, name: str) -> Path:
+    path, counter = directory / name, 2
+    while os.path.lexists(path):
+        path, counter = directory / f'{name}-{counter}', counter + 1
+    return path
+
+
+def path_through_link(run: Path, rel: str) -> str | None:
+    """The first existing part of the live path rel below the run directory that is a link or a junction, wherever it
+    points (or whose physical path leaves the run), as 'rel (part -> target)'; None when no part is a link."""
+    current = run
+    for part in Path(rel).parts:
+        current = current / part
+        if not os.path.lexists(current):
+            return None
+        if is_link_or_junction(current) or not is_within(current, run):
+            return f'{rel} ({current.relative_to(run).as_posix()} -> {os.path.realpath(current)})'
+    return None
+
+
+def restore_checkpoint(run: Path, dry_run: bool) -> dict[str, Any]:
+    """Restores the files the verified interim checkpoint lists, file by file: the live one moves to recovery-<UTC>/
+    inside the run, the checkpoint copy replaces it, RUN-STATE.json last with the anchor; files created later stay in
+    place. A failure stops the restore with a report of what moved and what was restored; a second run completes it."""
+    directory = run / 'checkpoints' / 'interim'
+    if not directory.exists():
+        raise ToolError(absent_checkpoint_note(run) + ' Nothing restored.')
+    checked = verify_checkpoint(run)
+    if checked['state'] != 'VALID':
+        raise ToolError(f'The interim checkpoint does not verify ({checked.get("error", checked["state"])}); nothing '
+                        'restored.' + checkpoint_way_out(checked))
+    info = describe_run(run, inspect_live=False) or {}
+    if info.get('status') in ('CLOSED', 'PROBABLY_CLOSED', 'LEGACY_CLOSED_INFERRED'):
+        raise ToolError(f'The run is {info["status"]}: a closed or probably closed run is never restored to its interim '
+                        'checkpoint; nothing restored. Start a new linked run instead.')
+    manifest_path = directory / 'manifest.json'
+    manifest = read_json(manifest_path)
+    files = sorted(manifest['sha256'], key=lambda rel: (rel == 'RUN-STATE.json', rel))
+    if 'RUN-STATE.json' not in files:
+        raise ToolError('The checkpoint manifest lists no RUN-STATE.json; nothing restored.')
+    linked = [problem for problem in (path_through_link(run, rel) for rel in files) if problem]
+    if linked:
+        raise ToolError('Live paths the checkpoint lists pass through a link: ' + '; '.join(linked) + '. The restore '
+                        'follows no link. Nothing moved or restored: remove the link itself (not what it points to), '
+                        'then run checkpoint restore again.')
+    contents = {rel: (directory / 'files' / rel).read_bytes() for rel in files}
+    changed = sorted(rel for rel in files if sha256_bytes(contents[rel]) != manifest['sha256'][rel])
+    if changed:
+        raise ToolError('Checkpoint files changed after verification: ' + ', '.join(changed) + '; nothing restored. '
+                        'Run checkpoint verify.')
+    try:
+        live_state = read_json(run / 'RUN-STATE.json')
+    except (OSError, ValueError):
+        live_state = None
+    anchor = live_state.get('interim_checkpoint') if isinstance(live_state, dict) else None
+    digest = sha256_file(manifest_path)
+    if not isinstance(anchor, dict) or anchor.get('manifest_sha256') != digest:
+        anchor = {'manifest_sha256': digest, 'created_at_utc': None, 'tool_version': manifest.get('tool_version'),
+                  'reanchored_at_utc': utc_now()}
+    restored_state = json.loads(contents['RUN-STATE.json'].decode('utf-8-sig'))
+    restored_state['interim_checkpoint'] = anchor
+    contents['RUN-STATE.json'] = run_state_bytes(restored_state)
+    recovery = unique_path(run, 'recovery-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
+    present = [rel for rel in files if os.path.lexists(run / rel)]
+    result: dict[str, Any] = {'state': 'DRY_RUN' if dry_run else 'RESTORED', 'run': str(run),
+                              'recovery_dir': str(recovery), 'moved_to_recovery': present, 'copied': files,
+                              'anchor': anchor, 'kept': 'Files created after the checkpoint stay in place.'}
+    if dry_run:
+        return result
+    moved: list[str] = []
+    copied: list[str] = []
+    for rel in files:
+        try:
+            if os.path.lexists(run / rel):
+                target = recovery / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(run / rel, target)
+                moved.append(rel)
+            (run / rel).parent.mkdir(parents=True, exist_ok=True)
+            replace_file_atomic(run / rel, contents[rel])
+            copied.append(rel)
+        except OSError as exc:
+            return restore_stopped(result, rel, exc, moved, copied, files)
+    result['checkpoint'] = verify_checkpoint(run)
+    result['next'] = 'Run validate, review the files created after the checkpoint, then resume with P8.'
+    return result
+
+
+def restore_stopped(result: dict[str, Any], rel: str, exc: OSError, moved: list[str], copied: list[str],
+                    files: list[str]) -> dict[str, Any]:
+    """The report of a restore that stopped at rel: what moved where, what was restored, what is missing live now."""
+    missing = [item for item in moved if item not in copied]
+    result.update(state='INCOMPLETE', failed_at=rel, error=str(exc), moved_to_recovery=moved, copied=copied,
+                  missing_live=missing, not_yet_restored=[item for item in files if item not in copied],
+                  next=(f'The restore stopped at {rel} ({exc}). The files in moved_to_recovery are in recovery_dir; '
+                        'missing_live lists the files that are now missing in the run, not_yet_restored the files that '
+                        'still hold the live or no content. Remove the cause (for example close the program that holds '
+                        'the file open), then run checkpoint restore again: it is safe and completes the restore (live '
+                        'files move into a new recovery-<UTC>/, the earlier one stays as it is, missing files are '
+                        'copied).'))
+    return result
 
 
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     run = Path(args.run_dir).resolve()
+    if args.dry_run and args.action not in ('restore', 'reanchor'):
+        raise ToolError(f'--dry-run applies to checkpoint restore and checkpoint reanchor only; checkpoint {args.action} '
+                        'has no dry run. Nothing written.')
     try:
-        result = (create_checkpoint(run, Path(args.project) if args.project else None)
-                  if args.action == 'create' else verify_checkpoint(run))
+        if args.action == 'create':
+            result = create_checkpoint(run, Path(args.project) if args.project else None)
+        elif args.action == 'restore':
+            result = restore_checkpoint(run, args.dry_run)
+        elif args.action == 'reanchor':
+            result = reanchor_checkpoint(run, args.dry_run)
+        else:
+            result = verify_checkpoint(run)
+            if result['state'] == 'ABSENT':
+                result['note'] = absent_checkpoint_note(run)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ToolError(f'Checkpoint input unreadable: {exc}') from exc
     print_json(result)
-    return 0 if result['state'] == 'VALID' else 1
+    return 0 if result['state'] in ('VALID', 'RESTORED', 'REANCHORED', 'DRY_RUN') else 1
+
+
+def reanchor_checkpoint(run: Path, dry_run: bool) -> dict[str, Any]:
+    """Writes the interim_checkpoint anchor again into a RUN-STATE.json that was rebuilt after damage: only for a run
+    state of a current run (see current_run) without a valid anchor, and a checkpoint of this tool version that verifies against its
+    manifest, the validation of its snapshot included. The anchor records reanchored_at_utc; validate, runs and close
+    report it. A closed run is re-anchored as well: only the anchor is written (closed_at_utc and the closure receipt
+    stay as recorded) and reanchored_at_utc is the trace."""
+    if not (run / 'checkpoints' / 'interim').exists():
+        raise ToolError(absent_checkpoint_note(run) + ' Nothing written.')
+    path = run / 'RUN-STATE.json'
+    try:
+        state = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise ToolError(f'RUN-STATE.json is missing or unreadable ({exc}): rebuild it first from audit.json, RESUME.md '
+                        f'and the evidence ({REBUILT_STATE_FIELDS}), then run checkpoint reanchor; nothing written.') from exc
+    if not isinstance(state, dict):
+        raise ToolError('RUN-STATE.json does not contain a JSON object: rebuild it first, then run checkpoint reanchor; '
+                        'nothing written.')
+    if not current_run(state, run):
+        raise ToolError('RUN-STATE.json has no tool_version: its checkpoint is verified against the manifest alone and '
+                        'needs no anchor (checkpoint verify); nothing written.')
+    if valid_anchor(state.get('interim_checkpoint')):
+        checked = verify_checkpoint(run)
+        if checked['state'] == 'VALID':
+            raise ToolError('RUN-STATE.json has the interim_checkpoint anchor of this checkpoint; nothing to re-anchor, '
+                            'nothing written.')
+        raise ToolError(f'The interim checkpoint does not verify ({checked.get("error")}); an anchor that is present is '
+                        'never replaced, nothing written.' + checkpoint_way_out(checked))
+    checked = verify_checkpoint(run, require_anchor=False)
+    if checked['state'] != 'VALID':
+        raise ToolError(f'The interim checkpoint fails the check against its manifest ({checked.get("error")}); it '
+                        'is not re-anchored, nothing written.' + checkpoint_way_out(checked))
+    manifest_path = run / 'checkpoints' / 'interim' / 'manifest.json'
+    manifest = read_json(manifest_path)
+    if manifest['tool_version'] != TOOL_VERSION:
+        raise ToolError(f'The interim checkpoint was created by tool version {manifest["tool_version"]}, this is '
+                        f'{TOOL_VERSION}: its snapshot cannot be revalidated, so it is not re-anchored; nothing written. '
+                        + checkpoint_remedy(run, False))
+    anchor = {'manifest_sha256': sha256_file(manifest_path), 'created_at_utc': None,
+              'tool_version': manifest['tool_version'], 'reanchored_at_utc': utc_now()}
+    result: dict[str, Any] = {'state': 'DRY_RUN' if dry_run else 'REANCHORED', 'run': str(run),
+                              'anchor': anchor, 'warning': 'W_CHECKPOINT_REANCHORED: ' + REANCHORED_NOTE}
+    if dry_run:
+        return result
+    state['interim_checkpoint'] = anchor
+    write_run_state(path, run_state_bytes(state))
+    result['checkpoint'] = verify_checkpoint(run)
+    result['next'] = ('Run validate (validate --final from P9 on), then continue from the persisted phase; REPORT.md '
+                      'states that the checkpoint was re-anchored.')
+    return result
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -3471,19 +7811,251 @@ def cmd_validate(args: argparse.Namespace) -> int:
     issues, counts = validate_audit(data, run_dir, project, final=args.final)
     result = {'result': 'PASS' if not issues.errors else 'FAIL', 'audit_json': str(audit_path.resolve()),
               'final': args.final, 'errors': issues.errors, 'warnings': issues.warnings, 'counts': counts}
+    if args.final:
+        result['closure_review'] = issues.review
     if args.json:
         print_json(result)
     else:
-        print(f'audit.json: {result["result"]} ({len(issues.errors)} errors, {len(issues.warnings)} warnings'
-              f'{", final check" if args.final else ", interim state"})')
-        for title, items in (('ERRORS', issues.errors), ('WARNINGS', issues.warnings)):
-            if items:
-                print(title)
-                for item in items:
-                    print(f'  {item["code"]:<30} {item["where"]}: {item["message"]}')
+        print_issues(issues, args.final)
         print('COUNTS')
         print(json.dumps(counts, ensure_ascii=False, indent=2))
+        if args.final:
+            print(f'CLOSURE REVIEW ({len(issues.review)} entries for the semantic review; each needs a reader)')
+            for item in issues.review:
+                rest = {key: value for key, value in item.items() if key != 'kind' and value not in (None, [], '')}
+                print(f'  {item["kind"]:<17} {json.dumps(rest, ensure_ascii=False)}')
     return 0 if not issues.errors else 1
+
+
+def print_issues(issues: Issues, final: bool) -> None:
+    print(f'audit.json: {"PASS" if not issues.errors else "FAIL"} ({len(issues.errors)} errors, '
+          f'{len(issues.warnings)} warnings{", final check" if final else ", interim state"})')
+    for title, items in (('ERRORS', issues.errors), ('WARNINGS', issues.warnings)):
+        if items:
+            print(title)
+            for item in items:
+                print(f'  {item["code"]:<30} {item["where"]}: {item["message"]}')
+
+
+def replace_file_atomic(path: Path, content: bytes) -> None:
+    """Write through a temporary sibling and replace, so the file is never partially written; keeps its mode."""
+    mode = os.stat(path).st_mode & 0o7777 if path.exists() else None
+    handle, temp = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp', dir=str(path.parent))
+    try:
+        with os.fdopen(handle, 'wb') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(temp, mode)  # mkstemp creates 0600
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.chmod(temp, 0o600)  # a read-only temporary file cannot be removed on Windows
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def run_state_bytes(state: dict[str, Any]) -> bytes:
+    try:
+        return (json.dumps(state, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    except UnicodeEncodeError as exc:
+        raise ToolError(f'RUN-STATE.json contains text that cannot be written as UTF-8 ({exc}); nothing written.') from exc
+
+
+def write_run_state(path: Path, content: bytes) -> None:
+    try:
+        replace_file_atomic(path, content)
+    except OSError as exc:
+        raise ToolError(f'RUN-STATE.json could not be written (read-only or locked?); nothing written: {exc}') from exc
+
+
+CLOSURE_UNRECORDED_REMEDY = 'Remove closed_at_utc and closure from RUN-STATE.json, then run close.'
+
+
+def closure_marked(state: Any) -> bool:
+    """RUN-STATE.json records a closure: closed_at_utc or closure, either one not empty. close, the run listing and the
+    receipt check decide with this test."""
+    return isinstance(state, dict) and (nonempty(state.get('closed_at_utc')) or nonempty(state.get('closure')))
+
+
+def unrecorded_closure(state: dict[str, Any]) -> str:
+    """What is wrong with a closure that close did not record, for a message."""
+    if not nonempty(state.get('closed_at_utc')):
+        return 'RUN-STATE.json has a closure receipt without closed_at_utc'
+    if not nonempty(state.get('closure')):
+        return 'RUN-STATE.json has closed_at_utc without the closure receipt of close'
+    return 'RUN-STATE.json has closed_at_utc with a closure receipt that close did not write'
+
+
+def json_of_bytes(raw: bytes) -> Any:
+    """JSON of file bytes as read_json reads a file (UTF-8 with or without byte-order mark)."""
+    try:
+        return json.loads(raw.decode('utf-8-sig'))
+    except RecursionError:
+        raise ValueError('JSON nested too deeply to parse') from None
+
+
+def closure_receipt(audit_bytes: bytes | None, *, superseded: bool = False) -> dict[str, Any]:
+    """The receipt close records beside closed_at_utc: recorded by close, the tool version, and the SHA-256 of the
+    audit.json bytes close read (null when there is none). A supersession receipt says superseded and claims no
+    validation."""
+    receipt: dict[str, Any] = {'recorded_by': 'close', 'tool_version': TOOL_VERSION,
+                               'audit_sha256': sha256_bytes(audit_bytes) if audit_bytes is not None else None}
+    if superseded:
+        receipt['superseded'] = True
+    return receipt
+
+
+def current_run(state: Any, run: Path) -> bool:
+    """Whether the run is held to the closure receipt and the interim checkpoint anchor: RUN-STATE.json has
+    tool_version, or audit.json's prompt_version is (5, 1) or later, or the interim checkpoint manifest's tool_version
+    is (3, 1) or later (the first values whose init writes tool_version). A run of an earlier prompt without any of
+    these is legacy. Rebuilding RUN-STATE.json without the field does not make a current run legacy."""
+    if isinstance(state, dict) and 'tool_version' in state:
+        return True
+    try:
+        audit = read_json(run / 'audit.json')
+        raw = audit.get('prompt_version') if isinstance(audit, dict) else None
+        prompt = version_tuple(str(raw) if isinstance(raw, (int, float)) else status_value(raw))
+    except (OSError, ValueError):
+        prompt = None
+    if prompt is not None and prompt >= (5, 1):
+        return True
+    try:
+        manifest = read_json(run / 'checkpoints' / 'interim' / 'manifest.json')
+        tool = version_tuple(manifest.get('tool_version')) if isinstance(manifest, dict) else None
+    except (OSError, ValueError):
+        return False
+    return tool is not None and tool >= (3, 1)
+
+
+def closure_receipt_state(state: Any, run: Path) -> str | None:
+    """RECORDED, UNRECORDED (one of closed_at_utc and the receipt of close without the other) or STALE (audit.json
+    differs from the receipt) for a closed current run (see current_run); None for an open run or a legacy run."""
+    if not isinstance(state, dict) or not closure_marked(state) or not current_run(state, run):
+        return None
+    receipt = state.get('closure')
+    if (not nonempty(state.get('closed_at_utc')) or not isinstance(receipt, dict) or receipt.get('recorded_by') != 'close'
+            or not isinstance(receipt.get('tool_version'), str) or 'audit_sha256' not in receipt):
+        return 'UNRECORDED'
+    path = run / 'audit.json'
+    try:
+        present = sha256_file(path) if path.is_file() else None
+    except OSError:
+        present = None
+    return 'RECORDED' if receipt['audit_sha256'] == present else 'STALE'
+
+
+def closure_receipt_issues(issues: Issues, run_root: Path, final: bool) -> None:
+    """Checks of a current run (see current_run): RUN-STATE.json has tool_version, a re-written interim_checkpoint
+    anchor is reported, and (final) its closure is the one close recorded, for this audit.json."""
+    try:
+        state = read_json(run_root / 'RUN-STATE.json')
+    except (OSError, ValueError):
+        return  # reported as E_RUN_STATE
+    anchor = state.get('interim_checkpoint') if isinstance(state, dict) else None
+    if isinstance(anchor, dict) and nonempty(anchor.get('reanchored_at_utc')):
+        issues.warning('W_CHECKPOINT_REANCHORED', 'RUN-STATE.json', f'interim_checkpoint.reanchored_at_utc '
+                       f'{anchor["reanchored_at_utc"]!r}: ' + REANCHORED_NOTE)
+    if isinstance(state, dict) and 'tool_version' not in state and current_run(state, run_root):
+        issues.error('E_RUN_STATE_TOOL_VERSION', 'RUN-STATE.json', 'tool_version missing: this run is held to the closure '
+                     'receipt and the checkpoint anchor (audit.json prompt_version 5.1 or later, or a checkpoint of tool '
+                     f'version 3.1 or later). Remedy: ' + TOOL_VERSION_REMEDY + '.')
+    receipt = closure_receipt_state(state, run_root) if final else None
+    if receipt == 'UNRECORDED':
+        issues.error('E_CLOSURE_UNRECORDED', 'RUN-STATE.json', unrecorded_closure(state) + ': closure is recorded '
+                     'with close only. ' + CLOSURE_UNRECORDED_REMEDY)
+    elif receipt == 'STALE':
+        issues.error('E_CLOSURE_STALE', 'RUN-STATE.json', 'audit.json differs from the one close recorded '
+                     '(closure.audit_sha256): the registers were changed after closure. A closed run is immutable; '
+                     'restore audit.json as closed and record corrections in a new linked run.')
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    run = Path(args.run_dir).resolve()
+    state_path = run / 'RUN-STATE.json'
+    try:
+        original = state_path.read_bytes()
+        state = read_json(state_path)
+    except (OSError, ValueError) as exc:
+        raise ToolError(f'RUN-STATE.json missing or unreadable; nothing written: {exc}') from exc
+    if not isinstance(state, dict):
+        raise ToolError('RUN-STATE.json does not contain a JSON object; nothing written.')
+    if closure_marked(state):
+        if closure_receipt_state(state, run) == 'UNRECORDED':
+            raise ToolError(unrecorded_closure(state) + ': closure is recorded with close only. '
+                            + CLOSURE_UNRECORDED_REMEDY + ' Nothing written.')
+        raise ToolError(f'Run already closed at {state["closed_at_utc"]!r}; nothing written.'
+                        if nonempty(state.get('closed_at_utc')) else
+                        'Run already closed: RUN-STATE.json carries a closure receipt; nothing written.')
+    audit_bytes = None  # validated and hashed for the receipt as read once
+    try:
+        audit_bytes = (run / 'audit.json').read_bytes()
+        data = json_of_bytes(audit_bytes)
+    except (OSError, ValueError) as exc:
+        if args.superseded_by is None:
+            raise ToolError(f'audit.json unreadable; nothing written: {exc}') from exc
+        data = None  # a superseded run need not be valid
+    now = utc_now()
+    if args.superseded_by is not None:
+        run_id = data.get('run_id') if isinstance(data, dict) and isinstance(data.get('run_id'), str) else state.get('run_id')
+        if not security_closure_allowed({'run_id': run_id}, dict(state, superseded_by_run=args.superseded_by), run):
+            raise ToolError(f'Successor {args.superseded_by!r} is missing beside this run, is the same run, has another '
+                            f'schema identifier or does not list {run_id!r} in previous_run_ids; nothing written.')
+        receipt = closure_receipt(audit_bytes, superseded=True)
+        state.update(closed_at_utc=now, updated_at_utc=now, superseded_by_run=args.superseded_by, closure=receipt)
+        write_run_state(state_path, run_state_bytes(state))
+        print_json({'run_id': run_id, 'closed_at_utc': now, 'superseded_by_run': args.superseded_by, 'closure': receipt})
+        return 0
+    project = Path(args.project) if args.project else None
+    try:
+        issues, _ = validate_audit(data, run, project, final=True)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise ToolError(f'Final validation could not run; nothing written: {exc}') from exc
+    if issues.errors:
+        print_issues(issues, True)
+        print('Error: close refused, final validation failed; nothing written.', file=sys.stderr)
+        return 1
+    review = data.get('security_review') if isinstance(data, dict) else None
+    status = review.get('status') if isinstance(review, dict) else None
+    if status not in ('DONE', 'NOT_APPLICABLE', 'NOT_PERFORMED', 'BLOCKED'):
+        raise ToolError(f'security_review.status {status!r} keeps the run open (interim state); nothing written. '
+                        'Normally use checkpoint create for P7 and close after P8/P9; for a closure the user ordered '
+                        'before the security review, first record NOT_PERFORMED with the user decision '
+                        '(decision_source_ids with a user: source, a HUMAN/VERIFY task, completed_at_utc).')
+    receipt = closure_receipt(audit_bytes)
+    state.update(closed_at_utc=now, updated_at_utc=now, closure=receipt)
+    write_run_state(state_path, run_state_bytes(state))
+    try:
+        issues, _ = validate_audit(data, run, project, final=True)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        issues = Issues()
+        issues.error('E_VALIDATION_ABORTED', 'audit.json', f'Validation could not run: {exc}')
+    if issues.errors:
+        try:
+            replace_file_atomic(state_path, original)
+        except OSError as exc:
+            print_issues(issues, True)
+            raise ToolError(f'Validation failed after recording the closure and RUN-STATE.json could not be restored '
+                            f'({exc}): closed_at_utc {now} was recorded although validation failed; remove '
+                            'closed_at_utc and closure from RUN-STATE.json by hand.') from exc
+        print_issues(issues, True)
+        print('Error: close rolled back, validation failed after recording the closure; RUN-STATE.json restored.',
+              file=sys.stderr)
+        return 1
+    closed = {'run_id': data.get('run_id'), 'closed_at_utc': now, 'audit_status': data.get('audit_status'),
+              'release_status': data.get('release_status'), 'security_review': {'status': status},
+              'warnings': len(issues.warnings), 'closure': receipt, 'closure_review_entries': len(issues.review),
+              'closure_review_note': 'Each closure_review entry needs a reader before the closure counts as '
+                                     'reviewed; validate --final lists them. Closure does not wait for it.'}
+    reanchored = [item['message'] for item in issues.warnings if item['code'] == 'W_CHECKPOINT_REANCHORED']
+    if reanchored:
+        closed['checkpoint_reanchored'] = reanchored[0]
+    print_json(closed)
+    return 0
 
 
 # --------------------------------------------------------------------------- example and selftest
@@ -3497,11 +8069,36 @@ EXAMPLE_SOURCE = (
     '        self._notes[note_id] = text  # in memory only\n'
     '        return {"status": "saved"}\n'
 )
+# The same file after the repair that the GO example (a re-audit) verifies.
+EXAMPLE_FIXED_SOURCE = (
+    'import json\n'
+    '\n'
+    '\n'
+    'class NoteStore:\n'
+    '    def __init__(self, path="notes.jsonl"):\n'
+    '        self._path = path\n'
+    '\n'
+    '    def save(self, note_id, text):\n'
+    '        with open(self._path, "a", encoding="utf-8") as handle:\n'
+    '            handle.write(json.dumps({"id": note_id, "text": text}) + "\\n")  # persisted as JSON data\n'
+    '        return {"status": "saved"}\n'
+    '\n'
+    '    def load(self, note_id):\n'
+    '        with open(self._path, encoding="utf-8") as handle:\n'
+    '            notes = {item["id"]: item["text"] for item in map(json.loads, handle)}\n'
+    '        return notes.get(note_id)\n'
+)
 EXAMPLE_README = '# Notes\n\n## Goal\n\nNotes survive a restart.\n'
 EXAMPLE_TEST = 'def test_save_returns_status():\n    assert NoteStore().save(1, "x") == {"status": "saved"}\n'
+EXAMPLE_FIXED_TEST = EXAMPLE_TEST + ('\n\ndef test_note_survives_restart(tmp_path):\n'
+                                     '    NoteStore(tmp_path / "notes.jsonl").save(1, "x")\n'
+                                     '    assert NoteStore(tmp_path / "notes.jsonl").load(1) == "x"\n')
 EXAMPLE_FAIL_LOG = 'test_note_survives_restart FAILED\nAssertionError: Note not found after restart\n1 failed\n'
 EXAMPLE_PASS_LOG = 'test_note_survives_restart PASSED\n1 passed\n'
 TASK_TEXT = '# {id}\n\nCopyable implementation request: ... Report only `candidate_complete`.\n'
+
+
+EXAMPLE_RUN_ID = '2026-01-01T0000Z_nogit'  # RUN_ID suffix nogit: the example project has no Git metadata
 
 
 def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
@@ -3520,7 +8117,7 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
     return {
         '_note': 'Example structure with fictional contents - use only as a format template.',
         'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION,
-        'run_id': '2026-01-01T0000Z_example', 'run_type': 'INITIAL', 'previous_run_ids': [],
+        'run_id': EXAMPLE_RUN_ID, 'run_type': 'INITIAL', 'previous_run_ids': [],
         'baseline': {'fingerprint': fingerprint, 'captured_at_utc': '2026-01-01T00:00:00Z', 'head': None,
                      'evidence_id': None},
         'scope': {'in_scope': ['Note app (src/)'], 'out_of_scope': [], 'scope_gaps': [], 'size_profile': 'S'},
@@ -3542,8 +8139,8 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
                       'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-002'], 'status': 'VIOLATED', 'gap': None}],
         'domain_matrix': domains,
         'security_review': {'status': 'DONE', 'reason': 'Defined local scope reviewed.',
-                            'started_at_utc': '2026-01-01T00:00:00Z',
-                            'completed_at_utc': '2026-01-01T00:06:00Z', 'executed_by': 'Synthetic reviewer'},
+                            'started_at_utc': '2026-01-01T00:06:00Z',
+                            'completed_at_utc': '2026-01-01T00:08:00Z', 'executed_by': 'Synthetic reviewer'},
         'security_scope': [{'id': 'SEC-001', 'ref': 'src/store.py', 'component_ids': ['CMP-001'],
                             'journey_ids': ['J-001'], 'relevance': 'EXTERNAL_INPUT',
                             'reason': 'The note store receives user-supplied text.', 'check_ids': ['CHK-001']}],
@@ -3551,10 +8148,11 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
                     'basis': 'OBSERVED', 'assessment': 'VIOLATED', 'evidence_ids': ['EV-001'],
                     'counter_evidence_ids': []}],
         'checks': [
-            {'id': 'CHK-001', 'title': 'Hypothesis: NoteStore stores in memory only (static)',
-             'purpose': 'INVESTIGATION', 'method': 'STATIC', 'required_for_audit': True, 'required_for_release': True,
-             'required_reason': 'Cause investigation for REQ-001', 'execution': 'PASS', 'exit_code': None,
-             'claim_ids': [], 'evidence_ids': ['EV-002'], 'catch_up_plan': None},
+            {'id': 'CHK-001', 'title': 'User-supplied note text is stored as data, never evaluated (static)',
+             'purpose': 'ACCEPTANCE_REGRESSION', 'method': 'STATIC', 'required_for_audit': True,
+             'required_for_release': True, 'required_reason': 'Security scope SEC-001 (external input)',
+             'execution': 'PASS', 'exit_code': None, 'claim_ids': [], 'evidence_ids': ['EV-005'],
+             'catch_up_plan': None, 'security': True},
             {'id': 'CHK-002', 'title': 'Save a note, restart the process, read the note',
              'purpose': 'ACCEPTANCE_REGRESSION', 'method': 'INTEGRATION', 'required_for_audit': True,
              'required_for_release': True, 'required_reason': 'Core objective OBJ-001', 'execution': 'FAIL',
@@ -3566,6 +8164,10 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
              'freshness': 'CURRENT', 'limits': 'Only a local restart in the working copy.'},
             {'id': 'EV-002', 'kind': 'STATIC_REF', 'ref': 'src/store.py:5-6', 'captured_at_utc': None,
              'freshness': 'CURRENT', 'limits': 'Static evidence; for runtime see EV-001.',
+             'code_refs': [{'path': 'src/store.py', 'line_start': 5, 'line_end': 6,
+                            'excerpt': 'def save(self, note_id, text):\n        self._notes[note_id] = text'}]},
+            {'id': 'EV-005', 'kind': 'STATIC_REF', 'ref': 'src/store.py:5-6', 'captured_at_utc': None,
+             'freshness': 'CURRENT', 'limits': 'Static reading of the only input path; no input was executed.',
              'code_refs': [{'path': 'src/store.py', 'line_start': 5, 'line_end': 6,
                             'excerpt': 'def save(self, note_id, text):\n        self._notes[note_id] = text'}]},
         ],
@@ -3599,15 +8201,31 @@ def example_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
 
 
 def example_go_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
-    """The same fictional project after a verified repair: GO for the defined scope."""
+    """The same fictional project re-audited after the repair (EXAMPLE_FIXED_SOURCE): GO for the defined scope.
+
+    Evidence of the initial run stays visible as a STALE run:<RUN_ID>/... reference; current evidence describes the
+    repaired code.
+    """
     data = example_audit(fingerprint)
-    data['run_id'], data['run_type'], data['previous_run_ids'] = ('2026-02-01T0000Z_example', 'REAUDIT',
-                                                                  ['2026-01-01T0000Z_example'])
+    data['run_id'], data['run_type'], data['previous_run_ids'] = ('2026-02-01T0000Z_nogit', 'REAUDIT', [EXAMPLE_RUN_ID])
+    data['baseline']['captured_at_utc'] = '2026-02-01T00:00:00Z'
+    data['security_review'].update(started_at_utc='2026-02-01T00:06:00Z', completed_at_utc='2026-02-01T00:08:00Z')
     data['objectives'][0]['fulfillment'] = 'DEMONSTRATED'
     data['journeys'][0]['status'] = 'SUPPORTED'
     data['claims'][0].update(assessment='SUPPORTED', evidence_ids=['EV-003'])
     data['checks'][1].update(execution='PASS', exit_code=0, evidence_ids=['EV-003'])
-    data['evidence'][0]['freshness'] = 'STALE'
+    initial_log = entry(data, 'evidence', 'EV-001')
+    del initial_log['path'], initial_log['sha256']
+    initial_log.update(ref=f'run:{EXAMPLE_RUN_ID}/evidence/logs/CHK-002.log', freshness='STALE',
+                       limits='Failed restart before the repair, recorded in the initial run.')
+    entry(data, 'evidence', 'EV-002').update(
+        ref='src/store.py:9-10', limits='Static evidence of the repaired persistence; for runtime see EV-003.',
+        code_refs=[{'path': 'src/store.py', 'line_start': 9, 'line_end': 10,
+                    'excerpt': 'with open(self._path, "a", encoding="utf-8") as handle:\n            handle.write(json.dumps({"id": note_id, "text": text}) + "\\n")'}])
+    entry(data, 'evidence', 'EV-005').update(
+        ref='src/store.py:10', limits='Static reading of the only input path: the text is JSON-encoded, never evaluated.',
+        code_refs=[{'path': 'src/store.py', 'line_start': 10, 'line_end': 10,
+                    'excerpt': 'handle.write(json.dumps({"id": note_id, "text": text})'}])
     data['evidence'].append({'id': 'EV-003', 'kind': 'LOG', 'path': 'evidence/logs/CHK-002-2.log',
                              'sha256': sha256_bytes(EXAMPLE_PASS_LOG.encode('utf-8')),
                              'captured_at_utc': '2026-02-01T00:05:00Z', 'freshness': 'CURRENT',
@@ -3623,14 +8241,31 @@ def example_go_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
 
 
 def example_interim_audit(fingerprint: str = '0' * 64) -> dict[str, Any]:
-    data = example_go_audit(fingerprint)
+    """The initial run at the P7 interim checkpoint: verdict before the deferred security review (P8), which is next."""
+    return interim_state(example_audit(fingerprint))
+
+
+def interim_state(data: dict[str, Any]) -> dict[str, Any]:
+    """An example at its P7 interim checkpoint: the security review (P8) and its check still open."""
+    data = copy.deepcopy(data)
     data['security_review'].update(status='PENDING', reason='Deferred review is next.', started_at_utc=None,
                                     completed_at_utc=None, executed_by=None)
     data['checks'][0].update(execution='NOT_RUN', evidence_ids=[], catch_up_plan='P8 security review')
-    data['release_gates'][0]['status'] = 'NOT_DEMONSTRATED'
-    data['audit_status'], data['release_status'] = 'PARTIAL', 'NOT_DEMONSTRATED'
+    data['evidence'] = [item for item in data['evidence'] if item['id'] != 'EV-005']
+    data['audit_status'] = 'PARTIAL'
+    if data['release_status'] == 'GO_FOR_DEFINED_SCOPE':
+        data['release_status'] = 'NOT_DEMONSTRATED'
     data['next_actions'] = ['Verify the interim checkpoint, then continue P8 and P9.']
     return data
+
+
+def write_fixture_marker(workspace: Path, **fields: Any) -> None:
+    """Selftest: a valid working-copy marker for a synthetic copy; its project is a sibling directory."""
+    original = workspace.parent / (workspace.name + '-original')
+    original.mkdir(parents=True, exist_ok=True)
+    write_text_file(workspace / WORKSPACE_MARKER, json.dumps({
+        'project_root': str(original.resolve()), 'baseline_fingerprint': 'selftest',
+        'workspace_root': str(workspace.resolve()), **fields}))
 
 
 def write_text_file(path: Path, text: str) -> None:
@@ -3641,46 +8276,130 @@ def write_text_file(path: Path, text: str) -> None:
 
 def write_example_run(root: Path, variant: str) -> tuple[Path, Path, dict[str, Any]]:
     """Project, start baseline, run directory and matching audit.json for a positive control."""
-    project, run_dir = root / 'project', root / 'run'
+    # the results directory (run_dir.parent) is a sibling of the project: init refuses one that contains the project
+    project, run_dir = root / 'project', root / 'results' / 'run'
+    repaired =variant == 'go'  # the GO example re-audits the repaired project
     write_text_file(project / 'README.md', EXAMPLE_README)
-    write_text_file(project / 'src' / 'store.py', EXAMPLE_SOURCE)
-    write_text_file(project / 'tests' / 'test_store.py', EXAMPLE_TEST)
+    write_text_file(project / 'src' / 'store.py', EXAMPLE_FIXED_SOURCE if repaired else EXAMPLE_SOURCE)
+    write_text_file(project / 'tests' / 'test_store.py', EXAMPLE_FIXED_TEST if repaired else EXAMPLE_TEST)
     snap, _ = take_snapshot(project, mode='filesystem', with_side_effects=False)
     stamp = snap['captured_at_utc']
     write_json_new(run_dir / 'evidence' / 'baseline' / 'baseline-start.json', snap)
-    for stem, text, code in (('CHK-002', EXAMPLE_FAIL_LOG, 1), ('CHK-002-2', EXAMPLE_PASS_LOG, 0)):
-        write_text_file(run_dir / 'evidence' / 'logs' / f'{stem}.log', text)
-        write_json_new(run_dir / 'evidence' / 'logs' / f'{stem}.meta.json',
-                       {'id': 'CHK-002', 'tool': 'audit_tools.py', 'command': ['synthetic-test'],
-                        'started_at_utc': stamp, 'ended_at_utc': stamp,
-                        'exit_code': code, 'log_sha256': sha256_bytes(text.encode('utf-8'))})
     data = {'nogo': example_audit, 'go': example_go_audit, 'interim': example_interim_audit}[variant](snap['content_fingerprint'])
+    logs = {'evidence/logs/CHK-002.log': (EXAMPLE_FAIL_LOG, 1), 'evidence/logs/CHK-002-2.log': (EXAMPLE_PASS_LOG, 0)}
+    for path, (text, code) in logs.items():
+        if any(item.get('path') == path for item in data['evidence']):
+            write_text_file(run_dir / path, text)
+            write_json_new(run_dir / (path[:-4] + '.meta.json'),
+                           {'id': 'CHK-002', 'tool': 'audit_tools.py', 'command': ['synthetic-test'],
+                            'started_at_utc': stamp, 'ended_at_utc': stamp,
+                            'exit_code': code, 'log_sha256': sha256_bytes(text.encode('utf-8'))})
     data['baseline']['captured_at_utc'] = stamp
     for item in data['evidence']:
-        if item['captured_at_utc'] is not None:
+        if item['captured_at_utc'] is not None and item['freshness'] == 'CURRENT':
             item['captured_at_utc'] = stamp
     if variant != 'interim':
         data['security_review'].update(started_at_utc=stamp, completed_at_utc=stamp)
     write_text_file(run_dir / 'findings' / 'F-001-notes-not-persistent.md', '# F-001\n\nCategory: F\n')
     write_text_file(run_dir / 'tasks' / 'T-001-persistence.md', TASK_TEXT.format(id='T-001'))
     write_text_file(run_dir / 'tasks' / 'T-002-verification.md', TASK_TEXT.format(id='T-002'))
-    write_text_file(run_dir / 'REPORT.md', f'# Report\n\n## Executive summary\n\n{data["audit_status"]}, '
-                                           f'{data["release_status"]}\n\n## Security review\n{data["security_review"]["status"]}\n')
     write_text_file(run_dir / 'VISION.md', '# Vision\n\nStatus: EVIDENCED\n')
     write_text_file(run_dir / 'RESUME.md', '# Resume\n')
     write_text_file(run_dir / 'RUN-STATE.json', json.dumps({'run_id': data['run_id'], 'schema_version': SCHEMA_VERSION,
-                                                            'prompt_version': PROMPT_VERSION, 'phase': 'P7',
-                                                            'updated_at_utc': '2026-01-01T01:00:00Z',
+                                                            'prompt_version': PROMPT_VERSION,
+                                                            'tool_version': TOOL_VERSION, 'phase': 'P7',
+                                                            'updated_at_utc': stamp,
                                                             'authorization': ['Synthetic start request: execute the audit.'],
                                                             'next_steps': []}))
-    write_json_new(run_dir / 'audit.json', data)
+    write_example_state(run_dir, interim_state(data) if variant != 'interim' else data, INTERIM_LABEL)
+    if variant != 'interim':  # a closed run builds on its interim checkpoint (P7), created by the real function
+        EXAMPLE_CHECKPOINT(run_dir, project)
+        write_example_state(run_dir, data)
     return run_dir, project, data
 
 
-def remove_tree(path: Path) -> None:
-    def on_error(function: Callable, target: str, _info: Any) -> None:
+INTERIM_LABEL = 'Interim verdict - security review (P8) pending\n\n'
+# Examples get their checkpoint from the real function, also while a control replaces create_checkpoint by a failure.
+EXAMPLE_CHECKPOINT = create_checkpoint
+
+
+def write_example_state(run: Path, state: dict[str, Any], label: str = '') -> None:
+    """REPORT.md with the verdict of an example state, and its audit.json."""
+    write_text_file(run / 'REPORT.md', f'# Report\n\n## Executive summary\n\n{label}{state["audit_status"]}, '
+                                       f'{state["release_status"]}\n\n## Security review\n'
+                                       f'{state["security_review"]["status"]}\n')
+    write_text_file(run / 'audit.json', json_text(state) + '\n')
+
+
+def renew_checkpoint(data: dict[str, Any], run: Path, project: Path) -> None:
+    """Selftest: a fixture changed what its closed run recorded before the interim checkpoint (start baseline, security
+    scope); the checkpoint is created again from the interim state of the changed record, the old one set aside."""
+    directory = run / 'checkpoints' / 'interim'
+    if not directory.is_dir():
+        return
+    directory.rename(run.parent / ('replaced-checkpoint-' + os.urandom(4).hex()))
+    state = read_json(run / 'RUN-STATE.json')
+    state.pop('interim_checkpoint', None)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    report = (run / 'REPORT.md').read_bytes()
+    write_example_state(run, interim_state(data), INTERIM_LABEL)
+    EXAMPLE_CHECKPOINT(run, project)
+    (run / 'REPORT.md').write_bytes(report)
+    write_text_file(run / 'audit.json', json_text(data) + '\n')
+
+
+def remove_tree(path: Path | str) -> None:
+    """Remove a directory tree without following links. Windows: every operation on extended-length paths, every
+    entry classified from the listing (entry_kind), links and other reparse points removed as links and never entered.
+    POSIX: shutil.rmtree, which does not follow links either. Read-only directories inside the tree are made
+    writable; file modes change only where no other hard link shares them (unlink_entry)."""
+    if os.name == 'nt':
+        pending = [(extended_path(path), False)]
         try:
-            os.chmod(target, 0o700)
+            if os.lstat(pending[0][0]).st_file_attributes & 0x400:  # a link itself: never entered (as shutil.rmtree)
+                return
+        except OSError:
+            return
+        while pending:
+            directory, emptied = pending.pop()
+            if not emptied:
+                pending.append((directory, True))
+                try:
+                    with os.scandir(directory) as listing:
+                        items = list(listing)
+                except OSError:
+                    items = []
+                for item in items:
+                    try:
+                        if entry_kind(item) == 'dir':
+                            pending.append((item.path, False))
+                        else:
+                            remove_entry(item)
+                    except OSError:
+                        pass
+                continue
+            try:
+                os.rmdir(directory)
+            except OSError:
+                try:  # the read-only attribute of a directory blocks its removal; a directory has no other hard links
+                    os.chmod(directory, 0o700)
+                    os.rmdir(directory)
+                except OSError:
+                    pass
+        return
+    root = os.path.abspath(path)
+
+    def on_error(function: Callable, target: str, _info: Any) -> None:
+        # Read-only directories (a Go module cache) block removing their entries: make the containing directory
+        # writable, but only inside the tree and never through a link. File modes are left to unlink_entry, which
+        # never changes a mode that another hard link (possibly outside the tree) shares.
+        try:
+            open_parent(target, root)
+            if function in (os.unlink, os.remove):
+                unlink_entry(target)
+                return
+            if S_ISDIR(os.lstat(target).st_mode) and not is_link_or_junction(Path(target)):
+                os.chmod(target, 0o700)  # directories only: a directory has no other hard links
             function(target)
         except OSError:
             pass
@@ -3761,27 +8480,42 @@ def valid_security_na(data: dict[str, Any], run: Path, project: Path) -> None:
                                    started_at_utc=None, completed_at_utc=utc_now(), executed_by=None)
     next(row for row in data['domain_matrix'] if row['domain'] == 'H').update(
         applicability='NOT_APPLICABLE', reason='No applicable areas in this synthetic variation.', check_ids=[])
+    renew_checkpoint(data, run, project)  # the scope was empty already at the interim checkpoint
+
+
+def report_lists(*ids: str) -> Mutation:
+    """REPORT.md names the deferred checks and the user decisions they rest on."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        with open(run / 'REPORT.md', 'a', encoding='utf-8', newline='\n') as handle:
+            handle.write('\n## Deferred checks and user decisions\n\n' + ', '.join(ids) + '\n')
+    return mutate
 
 
 def valid_not_performed(data: dict[str, Any], run: Path, project: Path) -> None:
-    data['sources'].append({'id': 'SRC-DECISION', 'ref': 'user:StopDecision', 'authority': 'User decision'})
+    data['sources'].append({'id': 'SRC-DECISION', 'ref': 'user:StopDecision', 'authority': 'User decision',
+                            'excerpt': 'Close the audit now; skip the security review.'})
+    report_lists('SRC-DECISION')(data, run, project)
     data['security_review'].update(status='NOT_PERFORMED', reason='User chose closure without the deferred review.',
                                    started_at_utc=None, completed_at_utc=utc_now(), executed_by=None,
                                    decision_source_ids=['SRC-DECISION'], task_ids=['T-002'])
 
 
-def close_review_run(data: dict[str, Any], run: Path, project: Path) -> None:
-    state = read_json(run / 'RUN-STATE.json')
-    state.update(phase='P9', closed_at_utc=utc_now())
+def record_closure(run: Path, receipt: bool = True, **changes: Any) -> None:
+    """Selftest: closed_at_utc and, as close records it for the audit.json on disk, the closure receipt (a run state of
+    the current tool is held to it); without receipt the closure is typed by hand."""
+    state = {**read_json(run / 'RUN-STATE.json'), 'closed_at_utc': utc_now(), **changes}
+    if receipt:
+        state['closure'] = closure_receipt((run / 'audit.json').read_bytes())
     write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+
+
+def close_review_run(data: dict[str, Any], run: Path, project: Path) -> None:
+    record_closure(run, receipt=False, phase='P9')
 
 
 def superseded_review_run(data: dict[str, Any], run: Path, project: Path) -> None:
-    close_review_run(data, run, project)
     successor_id = 'linked-successor'
-    state = read_json(run / 'RUN-STATE.json')
-    state['superseded_by_run'] = successor_id
-    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    record_closure(run, phase='P9', superseded_by_run=successor_id)
     write_json_new(run.parent / successor_id / 'RUN-STATE.json', {
         'run_id': successor_id, 'schema_version': SCHEMA_VERSION, 'run_type': 'REAUDIT',
         'previous_run_ids': [data['run_id']]})
@@ -3794,16 +8528,18 @@ def initialized_supersession(data: dict[str, Any], run: Path, project: Path, lin
         raise ToolError('Synthetic supersession init failed: ' + output)
     successor = Path(json.loads(output)['run_dir'])
     successor_state = read_json(successor / 'RUN-STATE.json')
-    assert successor_state['previous_run_ids'] == []
+    # The skeleton itself is checked by INIT_WRITES_VALID_AUDIT_SKELETON; its absence must not abort the selftest.
+    successor_audit = (read_json(successor / 'audit.json') if (successor / 'audit.json').is_file() else
+                       {'run_id': successor.name, 'schema_version': SCHEMA_VERSION, 'previous_run_ids': []})
+    assert successor_state['previous_run_ids'] == [] and successor_audit['previous_run_ids'] == []
     if link == 'audit':
-        write_json_new(successor / 'audit.json', {'run_id': successor.name, 'schema_version': SCHEMA_VERSION,
-                                                'previous_run_ids': [data['run_id']]})
+        successor_audit['previous_run_ids'] = [data['run_id']]
+        write_text_file(successor / 'audit.json', json.dumps(successor_audit))
     elif link == 'state':
         successor_state['previous_run_ids'] = [data['run_id']]
         write_text_file(successor / 'RUN-STATE.json', json.dumps(successor_state))
-    state = read_json(run / 'RUN-STATE.json')
-    state.update(closed_at_utc=utc_now(), superseded_by_run=successor.name)
-    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    # an unlinked successor is no supersession: the closure typed beside the open review stays open
+    record_closure(run, receipt=link != 'none', superseded_by_run=successor.name)
 
 
 def contradict_successor(field: str, value: str, file: str = 'RUN-STATE.json') -> Mutation:
@@ -3828,6 +8564,11 @@ def pending_security(data: dict[str, Any], run: Path, project: Path) -> None:
 
 def started_security(data: dict[str, Any], run: Path, project: Path) -> None:
     data['security_review'].update(started_at_utc=data['baseline']['captured_at_utc'], executed_by='Synthetic reviewer')
+
+
+def checkpointed(data: dict[str, Any], run: Path, project: Path) -> None:
+    """The interim checkpoint of the example run, created by the real function before the security review starts."""
+    EXAMPLE_CHECKPOINT(run, project)
 
 
 def optional_security_check(data: dict[str, Any], run: Path, project: Path) -> None:
@@ -3865,12 +8606,11 @@ WORKFLOW_POSITIVE_CONTROLS: list[tuple[str, str, Mutation | None]] = [
     ('VALID_SUPERSESSION_INIT_STATE_LINK', 'interim',
         lambda d, r, p: initialized_supersession(d, r, p, 'state')),
     ('VALID_SUPERSEDED_PENDING_RUN', 'interim', superseded_review_run),
-    ('VALID_SUPERSEDED_IN_PROGRESS_RUN', 'interim', chain(superseded_review_run, started_security,
+    ('VALID_SUPERSEDED_IN_PROGRESS_RUN', 'interim', chain(checkpointed, superseded_review_run, started_security,
         lambda d, r, p: d['security_review'].update(status='IN_PROGRESS'))),
-    ('PENDING_AFTER_STARTED_REVIEW', 'interim', started_security),
+    ('PENDING_AFTER_STARTED_REVIEW', 'interim', chain(checkpointed, started_security)),
     ('NOT_PERFORMED_AFTER_REFUSAL', 'interim', chain(valid_not_performed, started_security,
-        lambda d, r, p: write_text_file(r / 'RUN-STATE.json', json.dumps({
-            **read_json(r / 'RUN-STATE.json'), 'closed_at_utc': utc_now()})))),
+        lambda d, r, p: record_closure(r))),
     ('DONE_WITH_OPTIONAL_DOMAIN_H_CHECK', 'go', optional_security_check),
     ('SECURITY_HEADING_NUMBERED', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\n## 8. Security review\n')),
     ('SECURITY_HEADING_SUFFIX_CASE', 'nogo', overwrite('REPORT.md', '# Executive summary\nPARTIAL NO_GO\n## security REVIEW (interim)\n')),
@@ -4173,16 +8913,116 @@ POSITIVE_CONTROLS: list[tuple[str, str, Mutation | None]] = [
 ]
 
 
+USER_DECISION_SOURCE = {'id': 'SRC-USER', 'ref': 'user:BudgetDecision', 'authority': 'User decision in the start request',
+                        'excerpt': 'One day of budget; defer what does not fit.'}
+
+
+def unexecuted_check(execution: str = 'NOT_RUN', deferral: Any = None, *, sources: Iterable[str] = (),
+                     **changes: Any) -> Mutation:
+    """A mandatory non-security check outside every journey that was not executed."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        if 'SRC-USER' in sources:
+            data['sources'].append(dict(USER_DECISION_SOURCE))
+        check = copy.deepcopy(EXTRA_REQUIRED_CHECK)
+        check.update(id='CHK-006', required_for_release=True, execution=execution)
+        check.update(changes)
+        if deferral is not None:
+            check['deferral'] = deferral
+            report_lists(check['id'], *sources)(data, run, project)
+        data['checks'].append(check)
+    return mutate
+
+
+def defer_journey_check(source_id: str) -> Mutation:
+    """The own check of J-001 deferred: unexecuted, with a deferral citing source_id."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        if source_id == 'SRC-USER':
+            data['sources'].append(dict(USER_DECISION_SOURCE))
+        entry(data, 'checks', 'CHK-002').update(
+            execution='NOT_RUN', exit_code=None, evidence_ids=[], catch_up_plan='Run after the budget is extended.',
+            deferral={'reason': 'User ended the run early.', 'decision_source_ids': [source_id]})
+        report_lists('CHK-002', source_id)(data, run, project)
+    return mutate
+
+
+def second_t1_journey(check_id: str = 'CHK-002', own_check: bool = False) -> Mutation:
+    """A second T1 journey; with own_check, it gets a check of its own that reuses the log of CHK-002."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        if own_check:
+            check = copy.deepcopy(entry(data, 'checks', 'CHK-002'))
+            check.update(id=check_id, title='Edit a note, restart the process, read the edit')
+            data['checks'].append(check)
+        data['journeys'].append({'id': 'J-002', 'name': 'Edit a note and read it after a restart', 'tier': 'T1',
+                                 'objective_ids': ['OBJ-001'], 'check_ids': [check_id], 'status': 'VIOLATED',
+                                 'gap': None})
+    return mutate
+
+
+VALID_DEFERRAL = {'reason': 'User limited the run to one day.', 'decision_source_ids': ['SRC-USER']}
+
+CLOSURE_POSITIVE_CONTROLS: list[tuple[str, str, Mutation | None]] = [
+    ('UNDECIDED_VALID_USER_DEFERRAL', 'nogo', unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER'])),
+    ('UNDECIDED_SKIPPED_VALID_USER_DEFERRAL', 'nogo', unexecuted_check('SKIPPED', deferral=dict(
+        VALID_DEFERRAL, decision_source_ids=['SRC-001', 'SRC-USER']), sources=['SRC-USER'])),
+    ('UNDECIDED_EXEMPTS_FLAGGED_SECURITY_CHECK', 'interim', unexecuted_check(security=True)),
+    ('UNDECIDED_IGNORES_OPTIONAL_CHECK', 'nogo', unexecuted_check(required_for_audit=False, required_for_release=False)),
+    ('T1_OWN_CHECK_BLOCKED_PARTIAL', 'nogo', set_fields('checks', 'CHK-002', execution='BLOCKED',
+                                                         catch_up_plan='Request a restartable environment.')),
+    ('T1_SEPARATE_CHECKS_SHARE_EVIDENCE', 'nogo', second_t1_journey('CHK-008', own_check=True)),
+    ('T1_OWN_CHECK_USER_DEFERRED_PARTIAL', 'nogo', defer_journey_check('SRC-USER')),
+    ('UNDECIDED_EXEMPTS_SCOPE_ONLY_CHECK', 'interim', chain(unexecuted_check(),
+        lambda d, r, p: d['security_scope'][0]['check_ids'].append('CHK-006'))),
+    ('UNDECIDED_EXEMPTS_DOMAIN_H_ONLY_CHECK', 'interim', chain(unexecuted_check(), lambda d, r, p:
+        next(row for row in d['domain_matrix'] if row['domain'] == 'H')['check_ids'].append('CHK-006'))),
+    ('T1_OWN_CHECK_LISTED_TWICE', 'nogo', set_fields('journeys', 'J-001', check_ids=['CHK-002', 'CHK-002'])),
+]
+
+CLOSURE_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('UNDECIDED_NOT_RUN_WITHOUT_DEFERRAL', 'nogo', unexecuted_check(), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_SKIPPED_WITHOUT_DEFERRAL', 'nogo', unexecuted_check('SKIPPED'), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_NULL_OBLIGATION_WITHOUT_DEFERRAL', 'nogo', unexecuted_check(
+        required_for_audit=None, required_for_release=False), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_WITHOUT_USER_SOURCE', 'nogo', unexecuted_check(deferral=dict(
+        VALID_DEFERRAL, decision_source_ids=['SRC-001'])), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_UNKNOWN_SOURCE', 'nogo', unexecuted_check(deferral=dict(
+        VALID_DEFERRAL, decision_source_ids=['SRC-USER', 'SRC-MISSING']), sources=['SRC-USER']), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_NOT_OBJECT', 'nogo', unexecuted_check(deferral='Decided later.'), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_MALFORMED_FIELDS', 'nogo', unexecuted_check(deferral={
+        'reason': ['budget'], 'decision_source_ids': 'SRC-USER'}, sources=['SRC-USER']), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_BLANK_REASON', 'nogo', unexecuted_check(deferral=dict(VALID_DEFERRAL, reason=' '),
+                                                                  sources=['SRC-USER']), 'E_CHECK_UNDECIDED'),
+    ('UNDECIDED_DEFERRAL_NESTED_SOURCE', 'nogo', unexecuted_check(deferral=dict(
+        VALID_DEFERRAL, decision_source_ids=[['SRC-USER']]), sources=['SRC-USER']), 'E_CHECK_UNDECIDED'),
+    ('T1_ONLY_SHARED_CHECK', 'nogo', second_t1_journey(), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_STATIC', 'nogo', set_fields('checks', 'CHK-002', method='STATIC', exit_code=None), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_UNIT', 'nogo', set_fields('checks', 'CHK-002', method='UNIT'), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_NOT_RUN', 'nogo', set_fields('checks', 'CHK-002', execution='NOT_RUN', exit_code=None, evidence_ids=[],
+                                                catch_up_plan='Execute the restart check.'), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_INVALID_DEFERRAL', 'nogo', defer_journey_check('SRC-001'), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_NOT_MANDATORY_FOR_BOTH', 'nogo', set_fields('checks', 'CHK-002', required_for_release=False),
+     'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_IS_SECURITY_CHECK', 'nogo', set_fields('checks', 'CHK-002', security=True), 'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_NOT_MANDATORY_FOR_AUDIT', 'nogo', set_fields('checks', 'CHK-002', required_for_audit=False),
+     'E_T1_UNEXERCISED'),
+    ('T1_OWN_CHECK_UNOBSERVED', 'nogo', observation_only(), 'E_T1_UNEXERCISED'),
+    ('FINAL_EMPTY_OBJECTIVES', 'nogo', lambda d, r, p: d.update(objectives=[]), 'E_FINAL_EMPTY'),
+    ('FINAL_EMPTY_JOURNEYS', 'nogo', lambda d, r, p: d.update(journeys=[]), 'E_FINAL_EMPTY'),
+    ('FINAL_EMPTY_COMPONENTS', 'nogo', lambda d, r, p: d.update(components=[]), 'E_FINAL_EMPTY'),
+    ('FINAL_EMPTY_CHECKS', 'nogo', lambda d, r, p: d.update(checks=[]), 'E_FINAL_EMPTY'),
+]
+
+
 def run_validator_controls(root: Path) -> list[dict[str, Any]]:
     results = []
-    for control_id, variant, mutation in POSITIVE_CONTROLS + WORKFLOW_POSITIVE_CONTROLS:
+    for control_id, variant, mutation in POSITIVE_CONTROLS + WORKFLOW_POSITIVE_CONTROLS + CLOSURE_POSITIVE_CONTROLS:
         run_dir, project, data = write_example_run(root / control_id.lower(), variant)
         if mutation is not None:
             mutation(data, run_dir, project)
         issues, _ = validate_audit(data, run_dir, project, final=True)
         results.append({'id': control_id, 'kind': 'POSITIVE_CONTROL', 'result': 'PASS' if not issues.errors else 'FAIL',
                         'observed_errors': sorted(issues.codes()), 'warnings': sorted({w['code'] for w in issues.warnings})})
-    for control_id, variant, mutation, expected in VALIDATOR_CONTROLS + CORE2_CONTROLS + WORKFLOW_NEGATIVE_CONTROLS:
+    for control_id, variant, mutation, expected in (VALIDATOR_CONTROLS + CORE2_CONTROLS + WORKFLOW_NEGATIVE_CONTROLS
+                                                    + CLOSURE_NEGATIVE_CONTROLS):
         run_dir, project, data = write_example_run(root / control_id.lower(), variant)
         mutation(data, run_dir, project)
         try:
@@ -4198,13 +9038,1933 @@ def run_validator_controls(root: Path) -> list[dict[str, Any]]:
     results.append({'id': 'VALIDATE_ACCEPTS_UTF8_BOM', 'kind': 'TOOL_CONTROL', 'result': 'PASS' if code == 0 else 'FAIL'})
     workspace = root / 'ws-as-project'
     write_example_run(workspace, 'nogo')
-    write_text_file(workspace / 'project' / WORKSPACE_MARKER, '{}')
+    write_fixture_marker(workspace / 'project')
     run_dir, project, data = workspace / 'run', workspace / 'project', example_audit()
     issues, _ = validate_audit(data, run_dir, project, final=True)
     results.append({'id': 'PROJECT_IS_WORKSPACE', 'kind': 'NEGATIVE_CONTROL', 'expected_rejection': 'E_PROJECT_IS_WORKSPACE',
                     'result': 'PASS' if 'E_PROJECT_IS_WORKSPACE' in issues.codes() else 'FAIL',
                     'observed_errors': sorted(issues.codes())})
     return results
+
+
+def add_project_file(rel: str, content: bytes) -> Mutation:
+    """A further project file that belongs to the start baseline (re-captured, original capture time kept)."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        (project / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel).write_bytes(content)
+        path = run / 'evidence' / 'baseline' / 'baseline-start.json'
+        snap, _ = take_snapshot(project, mode='filesystem', with_side_effects=False)
+        snap['captured_at_utc'] = read_json(path)['captured_at_utc']
+        write_text_file(path, json.dumps(snap))
+        data['baseline']['fingerprint'] = snap['content_fingerprint']
+        renew_checkpoint(data, run, project)
+    return mutate
+
+
+def add_source(ref: str, excerpt: str) -> Mutation:
+    return lambda data, run, project: data['sources'].append(
+        {'id': 'SRC-009', 'ref': ref, 'authority': 'Project document', 'excerpt': excerpt})
+
+
+def add_code_ref(path: str, line: int, excerpt: str) -> Mutation:
+    return lambda data, run, project: data['findings'][0]['code_refs'].append(
+        {'path': path, 'line_start': line, 'line_end': line, 'excerpt': excerpt})
+
+
+def add_run_log(evidence_id: str, stem: str, text: str, exit_code: int, newline: str = '\n',
+                command: Any = ('synthetic-suite',)) -> Mutation:
+    """A run log with metadata as audit_tools.py run writes it, captured inside the run."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        content, stamp = text.replace('\n', newline).encode('utf-8'), data['baseline']['captured_at_utc']
+        (run / 'evidence' / 'logs').mkdir(parents=True, exist_ok=True)
+        (run / 'evidence' / 'logs' / f'{stem}.log').write_bytes(content)
+        write_json_new(run / 'evidence' / 'logs' / f'{stem}.meta.json',
+                       {'id': stem, 'tool': 'audit_tools.py', 'command': list(command) if isinstance(command, tuple)
+                        else command, 'started_at_utc': stamp,
+                        'ended_at_utc': stamp, 'exit_code': exit_code, 'log_sha256': sha256_bytes(content)})
+        data['evidence'].append({'id': evidence_id, 'kind': 'LOG', 'path': f'evidence/logs/{stem}.log',
+                                 'sha256': sha256_bytes(content), 'captured_at_utc': stamp, 'freshness': 'CURRENT',
+                                 'limits': 'Synthetic run in the working copy.'})
+    return mutate
+
+
+def add_note(evidence_id: str = 'EV-NOTE', freshness: str = 'CURRENT') -> Mutation:
+    """A stored, hashed handwritten note: verifiable, never qualifying."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        text = 'I looked at it and it works.\n'
+        write_text_file(run / 'evidence' / f'{evidence_id.lower()}.txt', text)
+        data['evidence'].append({'id': evidence_id, 'kind': 'NOTE', 'path': f'evidence/{evidence_id.lower()}.txt',
+                                 'sha256': sha256_bytes(text.encode('utf-8')), 'freshness': freshness,
+                                 'captured_at_utc': data['baseline']['captured_at_utc'], 'limits': 'Handwritten.'})
+    return mutate
+
+
+def add_check(check_id: str, **changes: Any) -> Mutation:
+    """A passed acceptance check, mandatory for audit and release, outside every journey; changes adapt it."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        check = {'id': check_id, 'title': 'Synthetic check', 'purpose': 'ACCEPTANCE_REGRESSION', 'method': 'INTEGRATION',
+                 'required_for_audit': True, 'required_for_release': True, 'required_reason': 'Synthetic duty',
+                 'execution': 'PASS', 'exit_code': None, 'claim_ids': [], 'evidence_ids': [], 'catch_up_plan': None}
+        check.update(copy.deepcopy(changes))
+        data['checks'].append(check)
+    return mutate
+
+
+def add_claim(claim_id: str, evidence_ids: list[str], assessment: str = 'SUPPORTED') -> Mutation:
+    return lambda data, run, project: data['claims'].append(
+        {'id': claim_id, 'statement': 'Synthetic claim', 'basis': 'OBSERVED', 'assessment': assessment,
+         'evidence_ids': evidence_ids, 'counter_evidence_ids': []})
+
+
+def met_gate(claim_id: str) -> Mutation:
+    return lambda data, run, project: data['release_gates'].append(
+        {'id': 'G-002', 'statement': 'Synthetic gate', 'status': 'MET', 'claim_ids': [claim_id], 'finding_ids': []})
+
+
+def add_finding(state: str, finding_id: str = 'F-009', **changes: Any) -> Mutation:
+    """A confirmed CRITICAL/P0 release blocker in the given processing state."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        write_text_file(run / 'findings' / f'{finding_id}.md', f'# {finding_id}\n')
+        item = copy.deepcopy(data['findings'][0])
+        item.update(id=finding_id, title='Other users can read every note', category='SECURITY', state=state,
+                    severity='CRITICAL', priority='P0', claim_ids=[], evidence_ids=['EV-002'], code_refs=[],
+                    task_ids=[], file=f'findings/{finding_id}.md')
+        item.update(copy.deepcopy(changes))
+        data['findings'].append(item)
+    return mutate
+
+
+def accepted_blocker(decision_ref: str, **changes: Any) -> Mutation:
+    return chain(lambda d, r, p: d['sources'].append({'id': 'SRC-DECISION', 'ref': decision_ref,
+                                                      'authority': 'Release decision',
+                                                      'excerpt': 'Release with the known read issue; I accept it.'}),
+                 report_lists('SRC-DECISION'),
+                 add_finding('ACCEPTED_RISK', acceptance={'authorized_by': 'Product owner', 'scope': 'Release 1',
+                                                          'date': '2026-02-01', 'source_ids': ['SRC-DECISION']},
+                             **changes))
+
+
+def failed_run_check(**changes: Any) -> Mutation:
+    """A check marked PASS without exit code whose only run log failed; its quoted section does not help."""
+    return chain(add_run_log('EV-FAILED', 'failed-run', EXAMPLE_FAIL_LOG, 1),
+                 add_check('CHK-011', evidence_ids=['EV-FAILED'], log_excerpts=[
+                     {'evidence_id': 'EV-FAILED', 'excerpt': 'test_note_survives_restart FAILED'}], **changes))
+
+
+def nothing_security_checked(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['security_scope'] = []
+    entry(data, 'checks', 'CHK-001').pop('security')
+    add_check('CHK-009', purpose='INVESTIGATION', method='STATIC', required_for_audit=False,
+              required_for_release=False, execution='NOT_RUN')(data, run, project)
+    next(row for row in data['domain_matrix'] if row['domain'] == 'H')['check_ids'] = ['CHK-009']
+
+
+def critical_blocker_undecided(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['findings'][0].update(severity='CRITICAL', priority='P0', release_blocker=None)
+    data['release_gates'][0]['status'] = 'NOT_DEMONSTRATED'
+    data['release_status'] = 'NOT_DEMONSTRATED'
+    write_text_file(run / 'REPORT.md', '# Executive summary\nPARTIAL NOT_DEMONSTRATED\n## Security review\nDONE\n')
+
+
+def blocked_on_note(data: dict[str, Any], run: Path, project: Path) -> None:
+    """The T1 journey's own check BLOCKED on a claim without any attempt or cited blocker."""
+    data['evidence'].append({'id': 'EV-CLAIM', 'kind': 'NOTE', 'ref': 'agent says no environment',
+                             'captured_at_utc': None, 'freshness': 'UNKNOWN', 'limits': ''})
+    entry(data, 'checks', 'CHK-002').update(execution='BLOCKED', exit_code=None, evidence_ids=['EV-CLAIM'],
+                                            catch_up_plan='Request a restartable environment.')
+
+
+def domain_row(domain: str, **changes: Any) -> Mutation:
+    return lambda data, run, project: next(row for row in data['domain_matrix'] if row['domain'] == domain).update(changes)
+
+
+def run_state_field(**changes: Any) -> Mutation:
+    return lambda data, run, project: write_text_file(run / 'RUN-STATE.json', json.dumps(
+        {**read_json(run / 'RUN-STATE.json'), **changes}))
+
+
+SUITE_LOG = 'test_note_survives_restart PASSED\ntest_export_markdown FAILED\n1 passed, 1 failed\n'
+RESTART_QUOTE = [{'evidence_id': 'EV-SUITE', 'excerpt': 'test_note_survives_restart PASSED'}]
+
+
+def suite_checks(quotes: Any = RESTART_QUOTE, *, second: bool = False, newline: str = '\n') -> Mutation:
+    """Optional checks that borrow one suite log (exit code 1, exit_code null); the second one quotes nothing."""
+    steps = [add_run_log('EV-SUITE', 'suite', SUITE_LOG, 1, newline),
+             add_check('CHK-012', title='Restart suite test', method='UNIT', required_for_audit=False,
+                       required_for_release=False, evidence_ids=['EV-SUITE'], log_excerpts=quotes)]
+    if second:
+        steps.append(add_check('CHK-013', title='Markdown export suite test', method='UNIT', execution='FAIL',
+                               required_for_audit=False, required_for_release=False, evidence_ids=['EV-SUITE']))
+    return chain(*steps)
+
+
+VALIDATOR_CONTRACT_POSITIVE_CONTROLS: list[tuple[str, str, Mutation]] = [
+    ('GO_NEGATIVE_TEST_OWN_EXIT_CODE', 'go', chain(add_run_log('EV-REJECT', 'reject-run', 'invalid id rejected\n', 2),
+                                                   add_check('CHK-011', exit_code=2, evidence_ids=['EV-REJECT'],
+                                                             log_excerpts=[{'evidence_id': 'EV-REJECT',
+                                                                            'excerpt': 'invalid id rejected'}]))),
+    ('GO_OBJECTIVE_SECOND_CLAIM_QUALIFIES', 'go', chain(add_claim('CLM-NT', [], 'NOT_TESTED'),
+        set_fields('objectives', 'OBJ-001', claim_ids=['CLM-NT', 'CLM-001']))),
+    ('GO_ACCEPTED_BLOCKER_USER_DECISION', 'go', accepted_blocker('user:ReleaseDecision')),
+    ('SUPERSEDED_BY_SUCCESSOR', 'nogo', add_finding('SUPERSEDED', superseded_by='F-001', severity='HIGH',
+                                                    priority='P1')),
+    ('SUPERSEDED_BLOCKER_EVIDENCED_REASON', 'nogo', add_finding('SUPERSEDED', superseded_reason='Duplicate of F-001.',
+                                                                 evidence_ids=[], counter_evidence_ids=['EV-002'])),
+    ('VERIFIED_FIXED_ON_EARLIER_RUN', 'go', set_fields('findings', 'F-001', evidence_ids=['EV-001'], severity='MEDIUM',
+                                                       priority='P2', release_blocker=False)),
+    ('SOURCE_PROSE_SUFFIX_VERBATIM', 'nogo', add_source('README.md section Goal', 'Notes survive a restart.')),
+    ('SOURCE_EXTENSIONLESS_VERBATIM', 'nogo', chain(add_project_file('Dockerfile', b'FROM python:3.12-slim\n'),
+                                                    add_source('Dockerfile', 'FROM python:3.12-slim'))),
+    ('REPORT_EXECUTIVE_SUMMARY_ANY_CASE', 'nogo', overwrite('REPORT.md', '# EXECUTIVE SUMMARY\nPARTIAL NO_GO\n'
+                                                                          '## Security review\nDONE\n')),
+    ('CODE_REF_UTF16_FILE', 'nogo', chain(add_project_file('src/legacy.py', '# Legacy\ntotal = compute_total(items)\n'
+                                                           .encode('utf-16')),
+                                          add_code_ref('src/legacy.py', 2, 'total = compute_total(items)'))),
+    ('CODE_REF_UTF8_BOM_FILE', 'nogo', chain(add_project_file('src/legacy.py', b'\xef\xbb\xbftotal = compute_total(items)\n'),
+                                             add_code_ref('src/legacy.py', 1, 'total = compute_total(items)'))),
+    ('SOURCE_UTF16_FILE', 'nogo', chain(add_project_file('docs/spec.md', '# Spec\n\nNotes are kept after a restart.\n'
+                                                         .encode('utf-16')),
+                                        add_source('docs/spec.md', 'Notes are kept after a restart.'))),
+    ('CODE_REF_DOT_SLASH_PATH', 'nogo', lambda d, r, p: d['findings'][0]['code_refs'][0].update(path='./src/store.py')),
+    ('LOG_SECTION_QUOTED_SUITE_CHECK', 'nogo', suite_checks()),
+    ('LOG_SECTION_CRLF_LOG_LF_EXCERPT', 'nogo', suite_checks([{'evidence_id': 'EV-SUITE', 'excerpt':
+        'test_note_survives_restart PASSED\ntest_export_markdown FAILED\n'}], newline='\r\n')),
+    ('LOG_SECTION_OWN_EXIT_CODE', 'nogo', chain(add_run_log('EV-SUITE', 'suite', SUITE_LOG, 1), add_check(
+        'CHK-012', method='UNIT', execution='FAIL', exit_code=1, required_for_audit=False, required_for_release=False,
+        evidence_ids=['EV-SUITE']))),
+    ('BLOCKED_WITH_FAILED_ATTEMPT_LOG', 'nogo', chain(
+        add_run_log('EV-ATTEMPT', 'attempt', 'Connection refused: staging database not reachable\n', 1),
+        set_fields('checks', 'CHK-002', execution='BLOCKED', exit_code=None, evidence_ids=['EV-ATTEMPT'],
+                   catch_up_plan='Request access to the staging database.'))),
+    ('BLOCKED_WITH_VERIFIED_CODE_REFS', 'nogo', chain(
+        add_project_file('deploy/settings.toml', b'[storage]\nurl = "${STAGING_DB_URL}"  # staging credentials\n'),
+        lambda d, r, p: d['evidence'].append({
+            'id': 'EV-BLOCKER', 'kind': 'STATIC_REF', 'ref': 'deploy/settings.toml:2', 'captured_at_utc': None,
+            'freshness': 'CURRENT', 'limits': 'Storage needs staging credentials that the assignment does not grant.',
+            'code_refs': [{'path': 'deploy/settings.toml', 'line_start': 2, 'line_end': 2,
+                           'excerpt': 'url = "${STAGING_DB_URL}"'}]}),
+        set_fields('checks', 'CHK-002', execution='BLOCKED', exit_code=None, evidence_ids=['EV-BLOCKER'],
+                   catch_up_plan='Request staging credentials.'))),
+]
+
+VALIDATOR_CONTRACT_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('GO_RELEASE_CHECK_ON_FAILED_LOG', 'go', failed_run_check(), 'E_GO_FAILED_LOG'),
+    ('GO_GATE_CARRIER_ON_FAILED_LOG', 'go', failed_run_check(required_for_release=False, claim_ids=['CLM-001']),
+     'E_GO_FAILED_LOG'),
+    ('GO_GATE_CLAIM_UNQUALIFIED', 'go', chain(
+        lambda d, r, p: d['evidence'].append({'id': 'EV-TXT', 'kind': 'NOTE', 'ref': 'auditor memory: works fine',
+                                              'captured_at_utc': None, 'freshness': 'CURRENT', 'limits': ''}),
+        add_claim('CLM-G2', ['EV-TXT']), met_gate('CLM-G2'),
+        lambda d, r, p: entry(d, 'checks', 'CHK-002')['claim_ids'].append('CLM-G2')), 'E_GO_EVIDENCE'),
+    ('GO_OBJECTIVE_ON_STALE_CLAIM', 'go', chain(add_claim('CLM-OBJ', ['EV-001']),
+        set_fields('objectives', 'OBJ-001', claim_ids=['CLM-OBJ'])), 'E_GO_EVIDENCE'),
+    ('GO_RELEASE_CHECK_UNQUALIFIED', 'go', chain(add_note(), add_check('CHK-011', method='STATIC',
+                                                                       evidence_ids=['EV-NOTE'])), 'E_GO_EVIDENCE'),
+    ('GO_GATE_ON_HANDWRITTEN_NOTE', 'go', chain(add_note(), add_claim('CLM-G2', ['EV-003']), met_gate('CLM-G2'),
+        add_check('CHK-011', method='MANUAL', required_for_release=False, claim_ids=['CLM-G2'], evidence_ids=['EV-NOTE'])),
+     'E_GO_EVIDENCE'),
+    ('GO_ACCEPTED_BLOCKER_PROJECT_SOURCE', 'go', accepted_blocker('README.md#goal'), 'E_GO_ACCEPTED_RISK'),
+    ('SUPERSEDED_BY_ITSELF', 'nogo', add_finding('SUPERSEDED', superseded_by='F-009'), 'E_SUPERSEDED'),
+    ('SUPERSEDED_CYCLE', 'nogo', chain(add_finding('SUPERSEDED', superseded_by='F-010'),
+                                       add_finding('SUPERSEDED', 'F-010', superseded_by='F-009')), 'E_SUPERSEDED'),
+    ('SUPERSEDED_BLOCKER_UNEVIDENCED_REASON', 'nogo', add_finding('SUPERSEDED', superseded_reason='n/a', evidence_ids=[]),
+     'E_SUPERSEDED'),
+    ('VERIFIED_FIXED_ON_STALE_EVIDENCE', 'go', chain(add_note('EV-OLD', 'STALE'),
+        set_fields('findings', 'F-001', evidence_ids=['EV-OLD'])), 'E_VERIFIED_FIXED'),
+    ('CRITICAL_BLOCKER_UNDECIDED_WITHOUT_REASON', 'nogo', critical_blocker_undecided, 'E_BLOCKER_REASON'),
+    ('GO_WITH_PARKED_CRITICAL_SUSPICION', 'go', chain(open_critical_suspicion,
+        set_fields('findings', 'F-002', state='CANDIDATE_FIXED')), 'E_GO_OPEN_SUSPICION'),
+    ('COMPLETE_BINDING_REQUIREMENT_UNCHECKED', 'go', lambda d, r, p: d['requirements'].append({
+        'id': 'REQ-002', 'statement': 'Notes can be exported.', 'binding': 'BINDING', 'source_ids': ['SRC-001'],
+        'check_ids': [], 'gap': 'Export not checked.'}), 'E_COMPLETE_REQUIREMENT'),
+    ('SECURITY_DONE_NOTHING_EXECUTED', 'go', nothing_security_checked, 'E_SECURITY_DONE_CHECKS'),
+    ('SOURCE_EXTENSIONLESS_FILE_EXCERPT', 'nogo', chain(add_project_file('Dockerfile', b'FROM python:3.12-slim\n'),
+        add_source('Dockerfile', 'All notes are end-to-end encrypted.')), 'E_SOURCE_EXCERPT'),
+    ('SOURCE_PATH_WITH_SPACE_EXCERPT', 'nogo', chain(add_project_file('docs/Product Spec.md', b'# Spec\n\nNotes stay.\n'),
+        add_source('docs/Product Spec.md#goal', 'All notes are end-to-end encrypted.')), 'E_SOURCE_EXCERPT'),
+    ('SOURCE_PROSE_SUFFIX_EXCERPT', 'nogo', add_source('README.md section Goal', 'All notes are end-to-end encrypted.'),
+     'E_SOURCE_EXCERPT'),
+    ('NULL_REGISTER_FINDINGS', 'nogo', lambda d, r, p: d.update(findings=None), 'E_TYPE'),
+    ('NULL_REGISTER_JOURNEYS', 'go', lambda d, r, p: d.update(journeys=None), 'E_TYPE'),
+    ('CHECK_METHOD_NOT_TEXT', 'nogo', set_fields('checks', 'CHK-002', method=['INTEGRATION']), 'E_TYPE'),
+    ('EVIDENCE_KIND_NOT_TEXT', 'nogo', set_fields('evidence', 'EV-001', kind=['UI']), 'E_TYPE'),
+    ('SECURITY_TIMESTAMP_OUT_OF_RANGE', 'nogo', lambda d, r, p: d['security_review'].update(
+        started_at_utc='0001-01-01T00:00:00+01:00'), 'E_SECURITY_REVIEW'),
+    ('EVIDENCE_TIMESTAMP_OUT_OF_RANGE', 'nogo', chain(set_fields('findings', 'F-001', code_refs=[], evidence_ids=['EV-001']),
+        set_fields('evidence', 'EV-001', captured_at_utc='9999-12-31T23:00:00-05:00')), 'E_FINDING_EVIDENCE'),
+    ('EVIDENCE_DUPLICATE_PATH', 'nogo', lambda d, r, p: d['evidence'].append(dict(d['evidence'][0], id='EV-001B')),
+     'E_EVIDENCE_DUPLICATE'),
+    ('DOMAIN_APPLICABLE_WITHOUT_REASON', 'nogo', domain_row('A', reason=''), 'E_DOMAIN_REASON'),
+    ('DOMAIN_UNKNOWN_AT_CLOSURE', 'nogo', domain_row('B', applicability='UNKNOWN', reason='Not yet assessed.'),
+     'E_DOMAIN_UNDECIDED'),
+    ('DOMAIN_APPLICABLE_UNPLANNED', 'nogo', domain_row('B', applicability='APPLICABLE', reason='Public API.'),
+     'E_DOMAIN_UNPLANNED'),
+    ('RUN_ID_MISMATCH_AT_CLOSURE', 'nogo', run_state_field(run_id='another-run'), 'E_RUN_ID'),
+    ('LOG_SECTION_MISSING', 'nogo', suite_checks(second=True), 'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_NOT_IN_LOG', 'nogo', suite_checks([{'evidence_id': 'EV-SUITE',
+                                                      'excerpt': 'test_note_survives_restart SKIPPED'}]),
+     'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_NOT_CONTIGUOUS', 'nogo', suite_checks([{'evidence_id': 'EV-SUITE', 'excerpt':
+        'test_note_survives_restart PASSED\n1 passed, 1 failed'}]), 'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_FOREIGN_EVIDENCE', 'nogo', suite_checks([{'evidence_id': 'EV-001',
+                                                            'excerpt': 'test_note_survives_restart FAILED'}]),
+     'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_TOO_SHORT', 'nogo', suite_checks([{'evidence_id': 'EV-SUITE', 'excerpt': ' PASSED '}]),
+     'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_MALFORMED', 'nogo', suite_checks([{'evidence_id': ['EV-SUITE'], 'excerpt': 'test_note_survives'}]),
+     'E_CHECK_LOG_SECTION'),
+    ('BLOCKED_WITH_NOTE_ONLY', 'nogo', blocked_on_note, 'E_BLOCKED_UNEVIDENCED'),
+    ('T1_OWN_CHECK_BLOCKED_ON_NOTE', 'nogo', blocked_on_note, 'E_T1_UNEXERCISED'),
+]
+
+# Rejections whose message has to name the cause: (control, variant, mutation, error code, phrase of the message).
+VALIDATOR_CONTRACT_MESSAGE_CONTROLS: list[tuple[str, str, Mutation, str, str]] = [
+    ('CODE_REF_LATIN1_FILE', 'nogo', chain(add_project_file('src/owner.py', 'owner = "M\u00fcller"  # maintainer\n'
+                                                            .encode('latin-1')),
+                                           add_code_ref('src/owner.py', 1, 'owner = "M\u00f6ller"  # maintainer')),
+     'E_CODE_REF', 'is not valid UTF-8'),
+    ('CODE_REF_PATH_WITH_LINES', 'nogo', lambda d, r, p: d['findings'][0]['code_refs'][0].update(path='src/store.py:6'),
+     'E_CODE_REF_NOT_IN_BASELINE', 'without #anchor or :lines'),
+    ('SOURCE_LATIN1_FILE', 'nogo', chain(add_project_file('docs/owner.md', 'Maintainer: M\u00fcller\n'.encode('latin-1')),
+                                         add_source('docs/owner.md', 'Maintainer: M\u00f6ller')),
+     'E_SOURCE_EXCERPT', 'is not valid UTF-8'),
+    ('BLOCKED_ON_NOTE_NAMES_NOT_RUN', 'nogo', blocked_on_note, 'E_BLOCKED_UNEVIDENCED', 'stays NOT_RUN'),
+]
+
+# Soft rules: a warning while the run is in progress, never an error.
+VALIDATOR_CONTRACT_WARNING_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('SOURCE_UNVERIFIABLE_EXCERPT_WARNS', 'nogo', add_source('Product brief, section 2', 'Notes survive a restart.'),
+     'W_SOURCE_UNVERIFIED'),
+    ('COMPLETE_WITH_OPEN_SCOPE_GAP_WARNS', 'go', lambda d, r, p: d['scope']['scope_gaps'].append(
+        'Export format not inspected (irrelevant to the release gates).'), 'W_COMPLETE_OPEN_SCOPE'),
+    ('LOG_SECTION_MISSING_DURING_WORK', 'nogo', suite_checks(second=True), 'W_CHECK_LOG_SECTION'),
+    ('BLOCKED_WITH_NOTE_DURING_WORK', 'nogo', blocked_on_note, 'W_BLOCKED_UNEVIDENCED'),
+    ('RUN_ID_MISMATCH_DURING_WORK', 'nogo', run_state_field(run_id='another-run'), 'W_RUN_ID'),
+    ('EVIDENCE_DUPLICATE_DURING_WORK', 'nogo',
+     lambda d, r, p: d['evidence'].append(dict(d['evidence'][0], id='EV-001B')), 'W_EVIDENCE_DUPLICATE'),
+    ('DOMAIN_APPLICABLE_WITHOUT_REASON_DURING_WORK', 'nogo', domain_row('A', reason=''), 'W_DOMAIN_REASON'),
+]
+
+# Portable timestamp forms (Python 3.10 through current) and forms rejected on every version.
+UTC_ACCEPTED = ('2026-01-01T00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00.5Z', '2026-01-01T00:00:00.123456789Z',
+                '2026-01-01T01:00:00+01:00', '2026-01-01T01:00:00+0100', '2025-12-31T21:30:00-02:30')
+UTC_REJECTED = ('20260101T000000Z', '2026-01-01 00:00:00Z', '2026-01-01T00:00:00', '2026-01-01', '2026-01-01T00Z',
+                '2026-01-01T00:00:00.Z', '2026-W01-1T00:00:00Z', '9999-12-31T23:00:00-05:00',
+                '0001-01-01T00:00:00+01:00')
+
+
+def run_validator_contract_controls(root: Path) -> list[dict[str, Any]]:
+    """Data-contract rules: GO evidence, findings, closure decisions, log sections, inputs and the selftest guard."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    for control_id, variant, mutation in VALIDATOR_CONTRACT_POSITIVE_CONTROLS:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        mutation(data, run_dir, project)
+        issues, _ = validate_audit(data, run_dir, project, final=True)
+        results.append({'id': control_id, 'kind': 'POSITIVE_CONTROL', 'result': 'PASS' if not issues.errors else 'FAIL',
+                        'observed_errors': sorted(issues.codes()), 'warnings': sorted({w['code'] for w in issues.warnings})})
+    for control_id, variant, mutation, expected in VALIDATOR_CONTRACT_NEGATIVE_CONTROLS:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        mutation(data, run_dir, project)
+        try:
+            issues, _ = validate_audit(data, run_dir, project, final=True)
+            observed = sorted(issues.codes())
+        except Exception as exc:  # a crash is a failed control, not a pass
+            observed = [f'CRASH:{exc.__class__.__name__}']
+        results.append({'id': control_id, 'kind': 'NEGATIVE_CONTROL', 'expected_rejection': expected,
+                        'result': 'PASS' if expected in observed else 'FAIL', 'observed_errors': observed})
+    for control_id, variant, mutation, expected, phrase in VALIDATOR_CONTRACT_MESSAGE_CONTROLS:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        mutation(data, run_dir, project)
+        issues, _ = validate_audit(data, run_dir, project, final=True)
+        control(results, control_id, any(item['code'] == expected and phrase in item['message'] for item in issues.errors),
+                issues.errors)
+    for control_id, variant, mutation, expected in VALIDATOR_CONTRACT_WARNING_CONTROLS:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        mutation(data, run_dir, project)
+        issues, _ = validate_audit(data, run_dir, project, final=False)
+        warnings = sorted({w['code'] for w in issues.warnings})
+        control(results, control_id, not issues.errors and expected in warnings,
+                {'errors': sorted(issues.codes()), 'warnings': warnings})
+    def parsed(value: str) -> Any:
+        try:
+            return utc_stamp(value)
+        except Exception as exc:  # a crash fails this control, not the group
+            return exc
+    stamps = {value: parsed(value) for value in UTC_ACCEPTED + UTC_REJECTED + ('2026-01-01T01:00:00.5+0100',)}
+    control(results, 'UTC_STAMP_PORTABLE_FORMS', all(isinstance(stamps[value], datetime) for value in UTC_ACCEPTED)
+            and all(stamps[value] is None for value in UTC_REJECTED)
+            and stamps['2026-01-01T01:00:00.5+0100'] == datetime(2026, 1, 1, 0, 0, 0, 500000, tzinfo=timezone.utc),
+            {value: repr(stamp) for value, stamp in stamps.items()})
+
+    def example_consistent(example: dict[str, Any]) -> bool:
+        stamps = [utc_stamp(example['baseline']['captured_at_utc'])]
+        stamps += [utc_stamp(item['captured_at_utc']) for item in example['evidence']
+                   if item['freshness'] == 'CURRENT' and item['captured_at_utc'] is not None]
+        stamps += [utc_stamp(example['security_review'][key]) for key in ('started_at_utc', 'completed_at_utc')
+                   if example['security_review'][key] is not None]
+        evidence = {item['id']: item for item in example['evidence']}
+        security_checks = [entry(example, 'checks', cid) for area in example['security_scope'] for cid in area['check_ids']]
+        stale = [item for item in example['evidence'] if item['freshness'] != 'CURRENT']
+        return (example['run_id'].endswith('_nogit') and None not in stamps and stamps == sorted(stamps)
+                and bool(security_checks) and all(
+                    check['purpose'] != 'INVESTIGATION' and check['security'] is True
+                    and (check['execution'] == 'NOT_RUN' or any(evidence[eid].get('code_refs')
+                                                               for eid in check['evidence_ids']))
+                    for check in security_checks)
+                and all(item.get('ref', '').startswith(f'run:{example["previous_run_ids"][0]}/') for item in stale)
+                and (example['run_type'] == 'REAUDIT'
+                     or not any(f['state'] == 'VERIFIED_FIXED' for f in example['findings'])))
+    go = example_go_audit()
+    current_refs = [ref['excerpt'] for item in go['evidence'] if item['freshness'] == 'CURRENT'
+                    for ref in item.get('code_refs', [])]
+    control(results, 'EXAMPLES_CONSISTENT_WITH_CONTRACT', all(
+        example_consistent(example) for example in (example_audit(), go, example_interim_audit()))
+            and example_interim_audit()['run_type'] == 'INITIAL'
+            and all(excerpt in EXAMPLE_FIXED_SOURCE and excerpt not in EXAMPLE_SOURCE for excerpt in current_refs))
+
+    run_dir, project, data = write_example_run(root / 'large-log', 'nogo')
+    log = run_dir / 'evidence' / 'logs' / 'large.log'
+    with open(log, 'w', encoding='utf-8', newline='\n') as handle:
+        for number in range(200_000):
+            handle.write(f'test_case_{number} PASSED\n')
+    excerpts = ['test_case_199998 PASSED\ntest_case_199999 PASSED', 'test_case_0 PASSED', 'test_case_200000 PASSED']
+    control(results, 'LOG_SECTION_SCANS_LARGE_LOG', log_contains(log, excerpts) == [True, True, False])
+
+    # A failed control precondition or a crashing control group fails its controls; the report is still written.
+    runners = SELFTEST_RUNNERS
+    for control_id, failing, injected in (
+            ('SELFTEST_SURVIVES_FAILED_PRECONDITION', 'run_core2_controls',
+             patch(f'{__name__}.create_checkpoint', side_effect=ToolError('Synthetic checkpoint failure'))),
+            ('SELFTEST_SURVIVES_CRASHED_CONTROL_GROUP', 'run_closure_controls',
+             patch(f'{__name__}.run_closure_controls', side_effect=RuntimeError('Synthetic control crash')))):
+        out = root / (control_id.lower() + '.json')
+        try:
+            with contextlib.ExitStack() as stack:
+                for name in runners:
+                    if name != failing:
+                        stack.enter_context(patch(f'{__name__}.{name}', return_value=[]))
+                stack.enter_context(injected)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                code = cmd_selftest(argparse.Namespace(out=str(out)))
+            report = read_json(out)
+        except Exception as exc:
+            code, report = None, {'error': f'{exc.__class__.__name__}: {exc}'}
+        failed = {r['id']: str(r.get('detail')) for r in report.get('results', []) if r['result'] == 'FAIL'}
+        if failing == 'run_core2_controls':
+            ok = (failed.get('CHECKPOINT_ROUNDTRIP_REFERENCES', '').count('Synthetic checkpoint failure') == 1
+                  and 'Synthetic checkpoint failure' in failed.get('CORE2_CONTROLS_COMPLETE', '')
+                  and any(r['id'].startswith('INIT_SUPERSESSION_') and r['result'] == 'PASS'
+                          for r in report.get('results', [])))
+        else:
+            ok = 'Synthetic control crash' in failed.get('CLOSURE_CONTROLS_COMPLETE', '')
+        control(results, control_id, code == 1 and ok and sorted(failed) == sorted(report['summary']['failed']),
+                report.get('summary', report))
+    return results
+
+
+# ----- Closure evidence: cheap paths to a hollow GO or COMPLETE, and honest records that must still pass.
+
+ESC = '\x1b'
+COLOURED_SUITE_LOG = (f'{ESC}[32mtest_note_survives_restart PASSED{ESC}[0m   \n'
+                      f'{ESC}[31mtest_export_markdown FAILED{ESC}[0m\n1 passed, 1 failed\n')
+RULER_LOG = '==========\ntest_note_survives_restart PASSED\n'
+FAILED_ATTEMPT = 'test_note_survives_restart FAILED'
+
+
+def quoted_suite(log: str, excerpt: str, newline: str = '\n') -> Mutation:
+    """An optional suite check quoting one section of its own suite log (exit code 1, exit_code null)."""
+    return chain(add_run_log('EV-SUITE', 'suite', log, 1, newline),
+                 add_check('CHK-012', title='Restart suite test', method='UNIT', required_for_audit=False,
+                           required_for_release=False, evidence_ids=['EV-SUITE'],
+                           log_excerpts=[{'evidence_id': 'EV-SUITE', 'excerpt': excerpt}]))
+
+
+def two_suite_quotes(first: str, second: str) -> Mutation:
+    """Two optional checks on one suite log, each quoting a section."""
+    return chain(quoted_suite(SUITE_LOG, first),
+                 add_check('CHK-013', title='Markdown export suite test', method='UNIT', execution='FAIL',
+                           required_for_audit=False, required_for_release=False, evidence_ids=['EV-SUITE'],
+                           log_excerpts=[{'evidence_id': 'EV-SUITE', 'excerpt': second}]))
+
+
+def stored_observation(kind: str, text: str) -> Mutation:
+    """The own check of J-001 as MANUAL on a stored observation file with observer and description."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        write_text_file(run / 'evidence' / 'observation.txt', text)
+        data['evidence'].append({'id': 'EV-OBS', 'kind': kind, 'path': 'evidence/observation.txt',
+                                 'sha256': sha256_bytes(text.encode('utf-8')),
+                                 'captured_at_utc': data['baseline']['captured_at_utc'], 'freshness': 'CURRENT',
+                                 'limits': 'One local observation.',
+                                 'observation': {'observer': 'Synthetic reviewer',
+                                                 'description': 'Reopened the notes view; the saved note was shown.'}})
+        entry(data, 'checks', 'CHK-002').update(method='MANUAL', exit_code=None, evidence_ids=['EV-OBS'])
+    return mutate
+
+
+def blocked_on_log(text: str, exit_code: int) -> Mutation:
+    return chain(add_run_log('EV-ATTEMPT', 'attempt', text, exit_code),
+                 set_fields('checks', 'CHK-002', execution='BLOCKED', exit_code=None, evidence_ids=['EV-ATTEMPT'],
+                            catch_up_plan='Request a restartable environment.'))
+
+
+def failed_log_cited(freshness: str) -> Mutation:
+    """CHK-002 of the GO example also cites a failed run log of the same procedure (the same program)."""
+    return chain(add_run_log('EV-FAILED', 'failed-run', EXAMPLE_FAIL_LOG, 1, command=['synthetic-test']),
+                 set_fields('evidence', 'EV-FAILED', freshness=freshness),
+                 lambda d, r, p: entry(d, 'checks', 'CHK-002')['evidence_ids'].append('EV-FAILED'))
+
+
+def failed_release_check(purpose: str) -> Mutation:
+    return chain(add_run_log('EV-FAILED', 'failed-run', EXAMPLE_FAIL_LOG, 1),
+                 add_check('CHK-011', purpose=purpose, execution='FAIL', exit_code=1, evidence_ids=['EV-FAILED']))
+
+
+def second_t1_journey_own_check(status: str = 'SUPPORTED', **changes: Any) -> Mutation:
+    """A second T1 journey with an own end-to-end check that failed."""
+    return chain(add_run_log('EV-FAILED', 'failed-run', EXAMPLE_FAIL_LOG, 1),
+                 add_check('CHK-008', title='Edit a note, restart the process, read the edit', purpose='CHARACTERIZATION',
+                           execution='FAIL', exit_code=1, evidence_ids=['EV-FAILED'], **changes),
+                 lambda d, r, p: d['journeys'].append({
+                     'id': 'J-002', 'name': 'Edit a note and read it after a restart', 'tier': 'T1',
+                     'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-008'], 'status': status, 'gap': None}))
+
+
+def fake_run_reference(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['evidence'].append({'id': 'EV-FAKE', 'kind': 'LOG', 'ref': 'run:2025-06-01T0000Z_nogit/evidence/logs/verify.log',
+                             'captured_at_utc': None, 'freshness': 'STALE', 'limits': 'Verification of an earlier run.'})
+    entry(data, 'findings', 'F-001')['evidence_ids'] = ['EV-FAKE']
+
+
+def earlier_run_beside(with_file: bool) -> Mutation:
+    """The initial run's directory beside the GO re-audit, with or without the log its run: reference names."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        earlier = run.parent / EXAMPLE_RUN_ID
+        earlier.mkdir()
+        if with_file:
+            write_text_file(earlier / 'evidence' / 'logs' / 'CHK-002.log', EXAMPLE_FAIL_LOG)
+        entry(data, 'findings', 'F-001')['evidence_ids'] = ['EV-001']
+    return mutate
+
+
+def security_blocked(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['security_review'].update(status='BLOCKED', reason='Staging access was withdrawn during the review.',
+                                   completed_at_utc=None)
+
+
+def flagged_check_not_run(**changes: Any) -> Mutation:
+    return set_fields('checks', 'CHK-001', **{'execution': 'NOT_RUN', 'evidence_ids': [],
+                                              'catch_up_plan': 'Repeat with access.', **changes})
+
+
+def without_excerpt(source_id: str) -> Mutation:
+    return lambda data, run, project: entry(data, 'sources', source_id).pop('excerpt')
+
+
+def add_claim_basis(basis: str, assessment: str) -> Mutation:
+    return lambda data, run, project: data['claims'].append(
+        {'id': 'CLM-B', 'statement': 'Synthetic claim', 'basis': basis, 'assessment': assessment,
+         'evidence_ids': ['EV-002'], 'counter_evidence_ids': []})
+
+
+def project_file_cited(rel: str, content: bytes, excerpt: str, *, source: bool = False) -> Mutation:
+    return chain(add_project_file(rel, content), add_source(rel, excerpt) if source else add_code_ref(rel, 1, excerpt))
+
+
+CP1252_LINE = 'owner = "Müller"  # maintainer – café'
+LATIN1_ONLY_LINE = 'label = "café crème"  # \x81 marker'
+
+CLOSURE_EVIDENCE_POSITIVE_CONTROLS: list[tuple[str, str, Mutation]] = [
+    ('NONCRITICAL_OBJECTIVE_OUTSIDE_T1', 'nogo', lambda d, r, p: d['objectives'].append({
+        'id': 'OBJ-002', 'statement': 'Notes can be exported.', 'source_ids': ['SRC-001'], 'critical': False,
+        'fulfillment': 'NOT_DEMONSTRATED', 'claim_ids': []})),
+    ('MANUAL_DESCRIPTIVE_KIND_OBSERVATION', 'nogo',
+     stored_observation('MANUAL_OBSERVATION', 'Reopened the notes view; the saved note was shown.\n')),
+    ('CLAIM_ASSUMED_INCONCLUSIVE', 'nogo', add_claim_basis('ASSUMED', 'INCONCLUSIVE')),
+    ('GO_PASS_KEEPS_STALE_FAILED_ATTEMPT', 'go', failed_log_cited('STALE')),
+    ('DISPROVEN_BLOCKER_COUNTER_EVIDENCE', 'nogo', add_finding('OPEN', assessment='DISPROVEN',
+                                                               disproof='Notes are kept per user.',
+                                                               counter_evidence_ids=['EV-005'])),
+    ('SUPERSEDED_CHAIN_ENDS_EQUAL', 'nogo', chain(add_finding('SUPERSEDED', superseded_by='F-010'),
+                                                  add_finding('SUPERSEDED', 'F-010', superseded_by='F-011'),
+                                                  add_finding('OPEN', 'F-011', task_ids=['T-001']))),
+    ('VERIFIED_FIXED_RUN_REF_FILE_PRESENT', 'go', earlier_run_beside(True)),
+    ('GO_UNCONFIRMED_BLOCKER_USER_ACCEPTED', 'go', accepted_blocker('user:ReleaseDecision', assessment='UNCONFIRMED')),
+    ('GO_UNCONFIRMED_BLOCKER_SUPERSEDED_BY_FIX', 'go', chain(
+        add_finding('SUPERSEDED', assessment='UNCONFIRMED', superseded_by='F-010'),
+        add_finding('VERIFIED_FIXED', 'F-010', evidence_ids=['EV-003']))),
+    ('GO_FAILED_CHECK_USER_ACCEPTED_RISK', 'go', chain(failed_release_check('CHARACTERIZATION'),
+                                                       accepted_blocker('user:ReleaseDecision',
+                                                                        evidence_ids=['EV-002', 'EV-FAILED']))),
+    ('GO_BUG_REPRODUCTION_NOT_REPRODUCED', 'go', failed_release_check('BUG_REPRODUCTION')),
+    ('LOG_SECTION_TWO_CHECKS_OWN_LINES', 'nogo', two_suite_quotes('test_note_survives_restart PASSED',
+                                                                  'test_export_markdown FAILED')),
+    ('DOMAIN_MANDATORY_CHECK_DEFERRED', 'nogo', chain(
+        unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']),
+        domain_row('B', applicability='APPLICABLE', reason='Public API.', check_ids=['CHK-006']))),
+    ('SILENT_COMMAND_LOG_QUALIFIES', 'go', chain(add_run_log('EV-QUIET', 'quiet', '', 0),
+                                                 add_check('CHK-011', exit_code=0, evidence_ids=['EV-QUIET']))),
+    ('SECURITY_NA_FLAGGED_CHECK_OPTIONAL', 'go', chain(valid_security_na, flagged_check_not_run(
+        required_for_audit=False, required_for_release=False, catch_up_plan=None,
+        required_reason='Nothing to check: no external input in the defined scope.'))),
+    ('SECURITY_BLOCKED_CHECK_DEFERRED', 'nogo', chain(security_blocked, flagged_check_not_run(deferral=VALID_DEFERRAL),
+        lambda d, r, p: d['sources'].append(dict(USER_DECISION_SOURCE)), report_lists('CHK-001', 'SRC-USER'))),
+    ('LOG_SECTION_COLOURED_LOG', 'nogo', quoted_suite(COLOURED_SUITE_LOG,
+                                                      'test_note_survives_restart PASSED\ntest_export_markdown FAILED')),
+    ('LOG_SECTION_COLOURED_EXCERPT', 'nogo', quoted_suite(SUITE_LOG, f'{ESC}[32mtest_note_survives_restart PASSED{ESC}[0m')),
+    ('LOG_SECTION_CR_ONLY_LOG', 'nogo', quoted_suite(SUITE_LOG, 'test_note_survives_restart PASSED\ntest_export_markdown',
+                                                     newline='\r')),
+    ('CODE_REF_CP1252_FILE', 'nogo', project_file_cited('src/owner.py', (CP1252_LINE + '\n').encode('cp1252'),
+                                                        CP1252_LINE)),
+    ('SOURCE_CP1252_FILE', 'nogo', project_file_cited('docs/owner.md', (CP1252_LINE + '\n').encode('cp1252'),
+                                                      CP1252_LINE, source=True)),
+    ('CODE_REF_LATIN1_ONLY_FILE', 'nogo', project_file_cited('src/label.py', (LATIN1_ONLY_LINE + '\n').encode('latin-1'),
+                                                             'label = "café crème"')),
+]
+
+CLOSURE_EVIDENCE_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('CORE_OBJECTIVE_WITHOUT_T1_JOURNEY', 'nogo', set_fields('journeys', 'J-001', tier='T2', objective_ids=[]),
+     'E_TIER_DOWNGRADE'),
+    ('MANUAL_PASS_ON_CODE_REF', 'nogo', set_fields('checks', 'CHK-002', method='MANUAL', exit_code=None,
+                                                   evidence_ids=['EV-002']), 'E_CHECK_NEEDS_OBSERVATION'),
+    ('MANUAL_ON_EMPTY_OBSERVATION', 'nogo', stored_observation('MANUAL_OBSERVATION', ''), 'E_CHECK_NEEDS_OBSERVATION'),
+    ('BLOCKED_ON_EMPTY_FAILED_LOG', 'nogo', blocked_on_log('', 1), 'E_BLOCKED_UNEVIDENCED'),
+    ('BLOCKED_ON_EMPTY_SUCCESS_LOG', 'nogo', blocked_on_log('', 0), 'E_BLOCKED_UNEVIDENCED'),
+    ('E2E_ON_EMPTY_FAILED_LOG', 'nogo', chain(add_run_log('EV-ATTEMPT', 'attempt', '', 1), set_fields(
+        'checks', 'CHK-002', method='E2E', evidence_ids=['EV-ATTEMPT'])), 'E_CHECK_NEEDS_OBSERVATION'),
+    ('CLAIM_ASSUMED_SUPPORTED', 'go', set_fields('claims', 'CLM-001', basis='ASSUMED'), 'E_CLAIM_BASIS'),
+    ('GO_PASS_CITES_FAILED_AND_PASSING_LOG', 'go', failed_log_cited('CURRENT'), 'E_GO_FAILED_LOG'),
+    ('DISPROVEN_BLOCKER_BY_PROSE', 'nogo', add_finding('OPEN', assessment='DISPROVEN', disproof='Not reproducible.'),
+     'E_DISPROVEN'),
+    ('SUPERSEDED_BY_WEAKER_FINDING', 'nogo', chain(
+        add_finding('SUPERSEDED', superseded_by='F-010'),
+        add_finding('OPEN', 'F-010', severity='LOW', priority='P3', release_blocker=False)), 'E_SUPERSEDED'),
+    ('SUPERSEDED_CHAIN_ENDS_WEAKER', 'nogo', chain(
+        add_finding('SUPERSEDED', superseded_by='F-010'), add_finding('SUPERSEDED', 'F-010', superseded_by='F-011'),
+        add_finding('OPEN', 'F-011', severity='LOW', priority='P3', release_blocker=False)), 'E_SUPERSEDED'),
+    ('SUPERSEDED_REASON_OWN_EVIDENCE', 'nogo', add_finding('SUPERSEDED', superseded_reason='Duplicate of F-001.',
+                                                           evidence_ids=['EV-002'], counter_evidence_ids=[]),
+     'E_SUPERSEDED'),
+    ('VERIFIED_FIXED_RUN_REF_NOT_PREVIOUS', 'go', fake_run_reference, 'E_VERIFIED_FIXED'),
+    ('VERIFIED_FIXED_RUN_REF_FILE_MISSING', 'go', earlier_run_beside(False), 'E_VERIFIED_FIXED'),
+    ('GO_UNCONFIRMED_BLOCKER_SELF_ACCEPTED', 'go', accepted_blocker('README.md#goal', assessment='UNCONFIRMED'),
+     'E_GO_OPEN_SUSPICION'),
+    ('GO_UNCONFIRMED_BLOCKER_SUPERSEDED_REASON', 'go', add_finding(
+        'SUPERSEDED', assessment='UNCONFIRMED', superseded_reason='Duplicate.', counter_evidence_ids=['EV-002']),
+     'E_GO_OPEN_SUSPICION'),
+    ('GO_T1_OWN_CHECK_FAILED', 'go', second_t1_journey_own_check(), 'E_GO_T1'),
+    ('GO_T1_OWN_CHECK_UNOBSERVED', 'go', set_fields('checks', 'CHK-002', method='MANUAL', exit_code=None,
+                                                    evidence_ids=['EV-002']), 'E_GO_T1'),
+    ('GO_T1_JOURNEY_INCONCLUSIVE', 'go', set_fields('journeys', 'J-001', status='INCONCLUSIVE'), 'E_GO_T1'),
+    ('GO_RELEASE_CHECK_FAILED_CHARACTERIZATION', 'go', failed_release_check('CHARACTERIZATION'), 'E_GO_REQUIRED_CHECK'),
+    ('GO_FAILED_CHECK_SELF_ACCEPTED_RISK', 'go', chain(failed_release_check('CHARACTERIZATION'),
+                                                       accepted_blocker('README.md#goal',
+                                                                        evidence_ids=['EV-002', 'EV-FAILED'])),
+     'E_GO_REQUIRED_CHECK'),
+    ('JOURNEY_SUPPORTED_WITHOUT_PASS', 'nogo', set_fields('journeys', 'J-001', status='SUPPORTED'), 'E_JOURNEY_STATUS'),
+    ('LOG_SECTION_SHARED_BY_TWO_CHECKS', 'nogo', two_suite_quotes('test_note_survives_restart PASSED',
+                                                                  'test_note_survives_restart PASSED'),
+     'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_NESTED_IN_OTHER_CHECK', 'nogo', two_suite_quotes('test_note_survives_restart PASSED',
+                                                                   'test_note_survives_restart'), 'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_SYMBOLS_ONLY', 'nogo', quoted_suite(RULER_LOG, '=========='), 'E_CHECK_LOG_SECTION'),
+    ('DOMAIN_ONLY_OPTIONAL_CHECK', 'nogo', chain(
+        unexecuted_check(required_for_audit=False, required_for_release=False),
+        domain_row('B', applicability='APPLICABLE', reason='Public API.', check_ids=['CHK-006'])), 'E_DOMAIN_UNPLANNED'),
+    ('COMPLETE_DOMAIN_ONLY_DEFERRED', 'go', chain(
+        unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']),
+        domain_row('B', applicability='APPLICABLE', reason='Public API.', check_ids=['CHK-006'])), 'E_COMPLETE_DOMAIN'),
+    ('USER_DECISION_WITHOUT_WORDS', 'nogo', chain(unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']),
+                                                  without_excerpt('SRC-USER')), 'E_USER_DECISION'),
+    ('REPORT_OMITS_DEFERRED_CHECK', 'nogo', chain(unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']),
+                                                  overwrite('REPORT.md', '# Report\n\n## Executive summary\n\nPARTIAL, '
+                                                            'NO_GO\n\n## Security review\nDONE\n')), 'E_FINAL_CONTENT'),
+    ('SECURITY_NA_MANDATORY_CHECK_NOT_RUN', 'go', chain(valid_security_na, flagged_check_not_run()),
+     'E_SECURITY_NA_REASON'),
+    ('SECURITY_BLOCKED_CHECK_UNDECIDED', 'nogo', chain(security_blocked, flagged_check_not_run()), 'E_CHECK_UNDECIDED'),
+    ('SOURCE_EXCERPT_TRIVIAL', 'nogo', add_source('README.md#goal', 'Notes'), 'E_SOURCE_TRIVIAL'),
+    ('CHECK_METHOD_UNKNOWN', 'nogo', set_fields('checks', 'CHK-002', method='Integration'), 'E_ENUM'),
+    ('CHECK_METHOD_NULL', 'nogo', set_fields('checks', 'CHK-002', method=None), 'E_ENUM'),
+]
+
+CLOSURE_EVIDENCE_MESSAGE_CONTROLS: list[tuple[str, str, Mutation, str, str]] = [
+    ('GO_FAILED_LOG_NAMES_EVIDENCE', 'go', failed_log_cited('CURRENT'), 'E_GO_FAILED_LOG',
+     'EV-FAILED: the run log does not exit with 0'),
+    ('GO_T1_NAMES_OUT_OF_SCOPE', 'go', set_fields('journeys', 'J-001', status='INCONCLUSIVE'), 'E_GO_T1',
+     'exclusion {reason, source_ids}'),
+    ('LOG_SECTION_SHARED_NAMES_OTHER_CHECK', 'nogo', two_suite_quotes('test_note_survives_restart PASSED',
+                                                                      'test_note_survives_restart PASSED'),
+     'E_CHECK_LOG_SECTION', 'excerpt of CHK-013'),
+    ('REPORT_OMISSION_NAMES_REMEDY', 'nogo', chain(unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']),
+                                                   overwrite('REPORT.md', '# Report\n\n## Executive summary\n\nPARTIAL, '
+                                                             'NO_GO\n\n## Security review\nDONE\n')),
+     'E_FINAL_CONTENT', 'Does not contain CHK-006, SRC-USER: list deferred checks'),
+    ('CODE_REF_ASCII_MISMATCH_IN_CP1252_FILE', 'nogo', project_file_cited(
+        'src/owner.py', (CP1252_LINE + '\n').encode('cp1252'), 'maintainer = "nobody"  # owner'),
+     'E_CODE_REF', 'Excerpt does not match src/owner.py:1-1 exactly'),
+    ('SOURCE_ASCII_MISMATCH_IN_CP1252_FILE', 'nogo', project_file_cited(
+        'docs/owner.md', (CP1252_LINE + '\n').encode('cp1252'), 'Maintainer: nobody in particular', source=True),
+     'E_SOURCE_EXCERPT', 'copy the passage from the file'),
+    ('RUN_ID_MISMATCH_NAMES_REMEDY', 'nogo', run_state_field(run_id='another-run'), 'E_RUN_ID',
+     'correct the file that differs'),
+    ('VERIFIED_FIXED_NAMES_PREVIOUS_RUNS', 'go', fake_run_reference, 'E_VERIFIED_FIXED', 'listed in previous_run_ids'),
+]
+
+CLOSURE_EVIDENCE_WARNING_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('MANUAL_PASS_ON_CODE_REF_DURING_WORK', 'nogo', set_fields('checks', 'CHK-002', method='MANUAL', exit_code=None,
+                                                               evidence_ids=['EV-002']), 'W_CHECK_NEEDS_OBSERVATION'),
+    ('CLAIM_ASSUMED_DURING_WORK', 'go', set_fields('claims', 'CLM-001', basis='ASSUMED'), 'W_CLAIM_BASIS'),
+    ('JOURNEY_SUPPORTED_WITHOUT_PASS_DURING_WORK', 'nogo', set_fields('journeys', 'J-001', status='SUPPORTED'),
+     'W_JOURNEY_STATUS'),
+    ('USER_DECISION_WITHOUT_WORDS_DURING_WORK', 'nogo', chain(
+        unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']), without_excerpt('SRC-USER')), 'W_USER_DECISION'),
+    ('SOURCE_EXCERPT_TRIVIAL_DURING_WORK', 'nogo', add_source('README.md#goal', 'Notes'), 'W_SOURCE_TRIVIAL'),
+    ('CHECK_METHOD_UNKNOWN_DURING_WORK', 'nogo', set_fields('checks', 'CHK-002', method='Integration'), 'W_METHOD'),
+    ('EMPTY_EVIDENCE_FILE_WARNS', 'nogo', blocked_on_log('', 1), 'W_EVIDENCE_EMPTY'),
+    ('VERIFIED_FIXED_RUN_REF_UNCHECKED_WARNS', 'go', set_fields('findings', 'F-001', evidence_ids=['EV-001']),
+     'W_RUN_REF_UNVERIFIED'),
+]
+
+
+def finish_interim(run: Path, interim: dict[str, Any]) -> dict[str, Any]:
+    """The NO_GO example as the continuation of a materialised interim run (after its checkpoint)."""
+    data = example_audit(interim['baseline']['fingerprint'])
+    stamp = interim['baseline']['captured_at_utc']
+    data['baseline']['captured_at_utc'] = stamp
+    for item in data['evidence']:
+        if item['captured_at_utc'] is not None and item['freshness'] == 'CURRENT':
+            item['captured_at_utc'] = stamp
+    data['security_review'].update(started_at_utc=stamp, completed_at_utc=stamp)
+    write_text_file(run / 'REPORT.md', '# Report\n\n## Executive summary\n\nPARTIAL, NO_GO\n\n## Security review\nDONE\n')
+    return data
+
+
+def run_closure_evidence_controls(root: Path) -> list[dict[str, Any]]:
+    """Evidence behind GO and COMPLETE, findings that leave the open set, decisions, checkpoint and closure_review."""
+    results: list[dict[str, Any]] = []
+
+    def validated(control_id: str, variant: str, mutation: Mutation | None = None,
+                  final: bool = True) -> tuple[Issues, Path, Path, dict[str, Any]]:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        if mutation is not None:
+            mutation(data, run_dir, project)
+        return validate_audit(data, run_dir, project, final=final)[0], run_dir, project, data
+
+    for control_id, variant, mutation in CLOSURE_EVIDENCE_POSITIVE_CONTROLS:
+        issues = validated(control_id, variant, mutation)[0]
+        results.append({'id': control_id, 'kind': 'POSITIVE_CONTROL', 'result': 'PASS' if not issues.errors else 'FAIL',
+                        'observed_errors': sorted(issues.codes()), 'warnings': sorted({w['code'] for w in issues.warnings})})
+    for control_id, variant, mutation, expected in CLOSURE_EVIDENCE_NEGATIVE_CONTROLS:
+        try:
+            observed = sorted(validated(control_id, variant, mutation)[0].codes())
+        except Exception as exc:  # a crash is a failed control, not a pass
+            observed = [f'CRASH:{exc.__class__.__name__}']
+        results.append({'id': control_id, 'kind': 'NEGATIVE_CONTROL', 'expected_rejection': expected,
+                        'result': 'PASS' if expected in observed else 'FAIL', 'observed_errors': observed})
+    for control_id, variant, mutation, expected, phrase in CLOSURE_EVIDENCE_MESSAGE_CONTROLS:
+        issues = validated(control_id, variant, mutation)[0]
+        control(results, control_id, any(item['code'] == expected and phrase in item['message'] for item in issues.errors),
+                issues.errors)
+    for control_id, variant, mutation, expected in CLOSURE_EVIDENCE_WARNING_CONTROLS:
+        issues = validated(control_id, variant, mutation, final=False)[0]
+        warnings = sorted({w['code'] for w in issues.warnings})
+        control(results, control_id, not issues.errors and expected in warnings,
+                {'errors': sorted(issues.codes()), 'warnings': warnings})
+
+    # A journey the user excluded from the release scope (exclusion with the user decision) is no T1 journey of it.
+    excluded = [sorted(validated(f'go-t1-scope-{index}', 'go', excluded_journey(exclusion))[0].codes())
+                for index, exclusion in enumerate((None, USER_EXCLUSION))]
+    control(results, 'GO_T1_OUT_OF_SCOPE_EXEMPT', 'E_GO_T1' in excluded[0] and not excluded[1], excluded)
+
+    # A path differing only in case names the same file on Windows.
+    issues = validated('evidence-duplicate-case', 'nogo', lambda d, r, p: d['evidence'].append(
+        dict(d['evidence'][0], id='EV-001B', path='evidence/logs/chk-002.log')))[0]
+    control(results, 'EVIDENCE_DUPLICATE_PATH_CASE', ('E_EVIDENCE_DUPLICATE' in issues.codes()) == (os.name == 'nt'),
+            sorted(issues.codes()))
+
+    # Many checks quoting one large log: one bounded pass, linear in the log.
+    issues, run_dir, project, data = validated('many-quotes', 'nogo', add_run_log('EV-BIG', 'big', ''.join(
+        f'tests/test_suite.py::test_case_{number} PASSED\n' for number in range(150_000)), 1))
+    data['checks'] += [{'id': f'CHK-Q{number}', 'title': f'Suite case {number}', 'purpose': 'CHARACTERIZATION',
+                        'method': 'UNIT', 'required_for_audit': False, 'required_for_release': False,
+                        'required_reason': 'Synthetic', 'execution': 'PASS', 'exit_code': None, 'claim_ids': [],
+                        'evidence_ids': ['EV-BIG'], 'catch_up_plan': None,
+                        'log_excerpts': [{'evidence_id': 'EV-BIG',
+                                          'excerpt': f'tests/test_suite.py::test_case_{number * 37 % 150_000} PASSED'}]}
+                       for number in range(3000)]
+    started = time.monotonic()
+    issues, _ = validate_audit(data, run_dir, project, final=True)
+    elapsed = time.monotonic() - started
+    control(results, 'LOG_SECTION_MANY_CHECKS_LINEAR', not issues.errors and elapsed < 60,
+            {'seconds': round(elapsed, 1), 'errors': sorted(issues.codes())})
+    long_line = root / 'long-line.log'
+    head = 'x' * ((1 << 20) - 8) + 'BOUNDARY-NEEDLE-123'  # crosses the first piece of 1 << 20 characters
+    with open(long_line, 'w', encoding='utf-8', newline='') as handle:
+        handle.write(head + 'x' * (3_000_000 - len(head)) + f'{ESC}[32m needle{ESC}[0m in a log without line breaks'
+                     + 'y' * 3_000_000)
+    control(results, 'LOG_SECTION_LONG_LINE_BOUNDED', log_contains(
+        long_line, ['needle in a log', 'BOUNDARY-NEEDLE-123', 'absent text'], chunk_chars=1 << 20) == [True, True, False])
+
+    # A long supersession chain is walked once.
+    issues, run_dir, project, data = validated('supersession-chain', 'nogo', lambda d, r, p: None)
+    count = 30_000
+    data['findings'] += [{'id': f'F-C{number}', 'title': 'Chained suspicion', 'type': 'DEFECT', 'category': 'F',
+                          'assessment': 'UNCONFIRMED', 'state': 'SUPERSEDED' if number < count - 1 else 'ACCEPTED_RISK',
+                          'severity': 'LOW', 'priority': 'P3', 'confidence': 'LOW', 'release_blocker': False,
+                          'cause_status': None, 'claim_ids': [], 'evidence_ids': [], 'code_refs': [], 'task_ids': [],
+                          'file': None, 'superseded_by': f'F-C{number + 1}' if number < count - 1 else None,
+                          'acceptance': {'authorized_by': 'Owner', 'scope': 'All', 'date': '2026-01-01',
+                                         'source_ids': ['SRC-001']}} for number in range(count)]
+    started = time.monotonic()
+    issues, _ = validate_audit(data, run_dir, project, final=True)
+    elapsed = time.monotonic() - started
+    control(results, 'SUPERSESSION_LONG_CHAIN_LINEAR', not issues.errors and elapsed < 20,
+            {'seconds': round(elapsed, 1), 'errors': sorted(issues.codes())})
+
+    # Nothing recorded at the interim checkpoint disappears before closure.
+    checkpoint_ids = ('CHECKPOINT_THEN_CLOSURE_STATE', 'CHECKPOINT_ENTRY_REMOVED', 'CHECKPOINT_BASELINE_REWRITTEN',
+                      'CHECKPOINT_TAMPERED_AT_CLOSURE')
+    run, project, interim = write_example_run(root / 'checkpoint-kept', 'interim')
+    checkpoint_precondition(results, checkpoint_ids, run, project)
+    data = finish_interim(run, interim)
+    issues, _ = validate_audit(data, run, project, final=True)
+    control(results, 'CHECKPOINT_THEN_CLOSURE_STATE', not issues.errors, sorted(issues.codes()))
+    issues, _ = validate_audit(dict(data, findings=[], tasks=[]), run, project, final=True)
+    control(results, 'CHECKPOINT_ENTRY_REMOVED', any(item['code'] == 'E_CHECKPOINT_REGRESSION' and 'findings[F-001]'
+                                                     in item['message'] for item in issues.errors), issues.errors)
+    baseline = run / 'evidence' / 'baseline' / 'baseline-start.json'
+    original = baseline.read_bytes()
+    baseline.write_bytes(json.dumps(read_json(baseline), indent=1).encode('utf-8'))  # same content, other bytes
+    issues, _ = validate_audit(data, run, project, final=True)
+    baseline.write_bytes(original)
+    control(results, 'CHECKPOINT_BASELINE_REWRITTEN', issues.codes() == {'E_CHECKPOINT_REGRESSION'}, sorted(issues.codes()))
+    with open(run / 'checkpoints' / 'interim' / 'files' / 'REPORT.md', 'a', encoding='utf-8') as handle:
+        handle.write('Edited after the checkpoint.\n')
+    issues, _ = validate_audit(data, run, project, final=True)
+    control(results, 'CHECKPOINT_TAMPERED_AT_CLOSURE', issues.codes() == {'E_CHECKPOINT_INVALID'}, sorted(issues.codes()))
+
+    # Deeply nested JSON is reported like any unparsable file.
+    deep = '[' * 200_000
+    run_dir, project, data = write_example_run(root / 'deep-json', 'nogo')
+    write_text_file(run_dir / 'RUN-STATE.json', deep)
+    write_text_file(run_dir / 'evidence' / 'logs' / 'CHK-002.meta.json', deep)
+    try:
+        codes = sorted(validate_audit(data, run_dir, project, final=True)[0].codes())
+    except Exception as exc:  # a crash fails this control, not the group
+        codes = [f'CRASH:{exc.__class__.__name__}']
+    control(results, 'DEEP_JSON_IN_RUN_FILES_REPORTED', {'E_RUN_STATE', 'E_LOG_META_MISSING'} <= set(codes), codes)
+    write_text_file(run_dir / 'audit.json', deep)
+    outputs = [run_cli('validate', str(run_dir), '--final'), run_cli('checkpoint', 'create', str(run_dir)),
+               run_cli('runs', '--results-dir', str(run_dir.parent), '--inspect-all')]
+    control(results, 'DEEP_JSON_AUDIT_NO_TRACEBACK', outputs[0][0] == 2 and 'not valid JSON' in outputs[0][1]
+            and outputs[1][0] != 0 and all('Traceback' not in output for _, output in outputs),
+            [(code, output[-300:]) for code, output in outputs])
+
+    # closure_review lists what only a reader can judge.
+    def review(control_id: str, variant: str, mutation: Mutation | None = None) -> list[dict[str, Any]]:
+        return validated(control_id, variant, mutation)[0].review
+
+    def keyed(entries: list[dict[str, Any]]) -> list[tuple[str, ...]]:
+        return sorted((item['kind'], str(item.get('journey') or item.get('gate') or item.get('subject')
+                                         or item.get('finding') or ''), str(item.get('check') or item.get('source') or ''))
+                      for item in entries)
+    go, nogo = review('review-go', 'go'), review('review-nogo', 'nogo')
+    first = next((item for item in go if item['kind'] == 'T1_OWN_CHECK'), {})
+    control(results, 'CLOSURE_REVIEW_EXAMPLES', keyed(go) == [
+        ('BLOCKING_FINDING', 'F-001', ''), ('GATE_CARRIER', 'G-001', 'CHK-002'), ('T1_OWN_CHECK', 'J-001', 'CHK-002')]
+        and keyed(nogo) == [('FAILED_CHECK', '', 'CHK-002'), ('T1_OWN_CHECK', 'J-001', 'CHK-002')]
+        and first.get('evidence') == [{'evidence': 'EV-003', 'kind': 'LOG', 'command': 'synthetic-test', 'exit_code': 0,
+                                       'freshness': 'CURRENT', 'outside_workspace': False}],
+        {'go': go, 'nogo': nogo})
+    blocked = review('review-blocked', 'nogo', blocked_on_log('Connection refused: staging database not reachable\n', 1))
+    control(results, 'CLOSURE_REVIEW_BLOCKED_CHECK', any(
+        item['kind'] == 'BLOCKED_CHECK' and item['check'] == 'CHK-002'
+        and item['evidence'][0].get('exit_code') == 1 and item['evidence'][0].get('command') == 'synthetic-suite'
+        for item in blocked), blocked)
+    deferred = review('review-deferral', 'nogo', unexecuted_check(deferral=VALID_DEFERRAL, sources=['SRC-USER']))
+    control(results, 'CLOSURE_REVIEW_DEFERRAL', {'kind': 'USER_DECISION', 'subject': 'checks[CHK-006].deferral',
+                                                 'reason': VALID_DEFERRAL['reason'], 'source': 'SRC-USER',
+                                                 'excerpt': USER_DECISION_SOURCE['excerpt']} in deferred, deferred)
+    accepted = review('review-accepted', 'go', accepted_blocker('user:ReleaseDecision'))
+    control(results, 'CLOSURE_REVIEW_ACCEPTED_BLOCKER', any(
+        item['kind'] == 'BLOCKING_FINDING' and item['finding'] == 'F-009' and item['state'] == 'ACCEPTED_RISK'
+        and item['acceptance_sources'][0]['source'] == 'SRC-DECISION' for item in accepted)
+        and ('USER_DECISION', 'findings[F-009].acceptance', 'SRC-DECISION') in keyed(accepted), accepted)
+    cut = review('review-cut', 'nogo', set_fields('checks', 'CHK-002', title='Restart ' * 100))
+    title = next((item['title'] for item in cut if item['kind'] == 'T1_OWN_CHECK'), '')
+    control(results, 'CLOSURE_REVIEW_CUTS_LONG_TEXT', title.endswith(' [cut]') and len(title) == REVIEW_TEXT_LIMIT + 6,
+            title)
+    run_dir, project, _ = write_example_run(root / 'review-cli', 'go')
+    code, output = run_cli('validate', str(run_dir), '--project', str(project), '--final', '--json')
+    listed = json_head(output).get('closure_review')
+    text_code, text = run_cli('validate', str(run_dir), '--project', str(project), '--final')
+    work_code, work = run_cli('validate', str(run_dir), '--project', str(project), '--json')
+    control(results, 'CLOSURE_REVIEW_IN_FINAL_OUTPUT', code == 0 and isinstance(listed, list) and len(listed) == 3
+            and text_code == 0 and 'CLOSURE REVIEW (3 entries' in text and work_code == 0
+            and 'closure_review' not in json_head(work), output[-500:])
+    return results
+
+
+def relabelled_nogo(**finding: Any) -> Mutation:
+    """The NO_GO example declared GO without executing anything: the failed own check of J-001 relabelled PASS (its
+    exit_code 1 kept), claim, objective, journey and gate set positive; F-001 changed as given."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        entry(data, 'checks', 'CHK-002')['execution'] = 'PASS'
+        entry(data, 'claims', 'CLM-001')['assessment'] = 'SUPPORTED'
+        entry(data, 'objectives', 'OBJ-001')['fulfillment'] = 'DEMONSTRATED'
+        entry(data, 'journeys', 'J-001')['status'] = 'SUPPORTED'
+        entry(data, 'release_gates', 'G-001').update(status='MET', finding_ids=[])
+        entry(data, 'findings', 'F-001').update(copy.deepcopy(finding))
+        data.update(audit_status='COMPLETE_FOR_DEFINED_SCOPE', release_status='GO_FOR_DEFINED_SCOPE')
+        write_example_state(run, data)
+    return mutate
+
+
+def open_finding(evidence_ids: list[str], **changes: Any) -> Mutation:
+    """A confirmed, open MEDIUM finding (no release blocker) with its task, citing the given evidence."""
+    return chain(lambda d, r, p: write_text_file(r / 'tasks' / 'T-009-export.md', TASK_TEXT.format(id='T-009')),
+                 lambda d, r, p: d['tasks'].append(dict(copy.deepcopy(entry(d, 'tasks', 'T-001')), id='T-009',
+                                                        finding_ids=['F-009'], depends_on=[],
+                                                        file='tasks/T-009-export.md')),
+                 add_finding('OPEN', **{'title': 'Markdown export drops notes', 'category': 'F', 'severity': 'MEDIUM',
+                                        'priority': 'P2', 'release_blocker': False, 'evidence_ids': evidence_ids,
+                                        'task_ids': ['T-009'], 'target': {'requirement_ids': ['REQ-001']}, **changes}))
+
+
+def suite_beside_targeted_run(data: dict[str, Any], run: Path, project: Path) -> None:
+    """GO example: one suite run (exit 1) shows an open defect (CHK-013, F-009) and another test passing (CHK-012,
+    optional, its own line quoted); J-001's own check rests on its targeted run (EV-003, exit 0)."""
+    suite_checks(second=True)(data, run, project)
+    entry(data, 'checks', 'CHK-013')['log_excerpts'] = [{'evidence_id': 'EV-SUITE', 'excerpt': 'test_export_markdown FAILED'}]
+    open_finding(['EV-SUITE'])(data, run, project)
+
+
+def own_check_on_suite(exit_code: Any, quote: str) -> Mutation:
+    """GO example: a second T1 journey whose own check is a PASS on the failed suite run, quoting a line of it."""
+    return chain(suite_checks(), add_check('CHK-008', title='Edit a note, restart, read the edit', exit_code=exit_code,
+                                           evidence_ids=['EV-SUITE'],
+                                           log_excerpts=[{'evidence_id': 'EV-SUITE', 'excerpt': quote}]),
+                 lambda d, r, p: d['journeys'].append({
+                     'id': 'J-002', 'name': 'Edit a note and read it after a restart', 'tier': 'T1',
+                     'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-008'], 'status': 'SUPPORTED', 'gap': None}))
+
+
+def failed_requirement_check(purpose: str) -> Mutation:
+    """A second BINDING requirement whose only, release-mandatory check failed (exit 1) with the given purpose."""
+    return chain(add_run_log('EV-X', 'export-run', 'test_export_markdown FAILED\n1 failed\n', 1),
+                 lambda d, r, p: d['requirements'].append({
+                     'id': 'REQ-002', 'statement': 'Export keeps every note.', 'binding': 'BINDING',
+                     'source_ids': ['SRC-001'], 'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-004'], 'gap': None}),
+                 add_check('CHK-004', title='Export keeps every note', purpose=purpose, execution='FAIL', exit_code=1,
+                           required_reason='REQ-002', evidence_ids=['EV-X']))
+
+
+USER_EXCLUSION = {'reason': 'The user left note editing out of this release.', 'source_ids': ['SRC-USER']}
+
+
+def excluded_journey(exclusion: Any, fulfillment: str = 'NOT_DEMONSTRATED',
+                     listed: tuple[str, ...] = ('J-002', 'SRC-USER')) -> Mutation:
+    """GO example: a second T1 journey of a non-core objective, exercised by its own check but INCONCLUSIVE;
+    exclusion as given (None: absent)."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        data['sources'].append(dict(USER_DECISION_SOURCE))
+        data['objectives'].append({'id': 'OBJ-002', 'statement': 'Saved notes can be edited.', 'source_ids': ['SRC-001'],
+                                   'critical': False, 'fulfillment': fulfillment, 'claim_ids': []})
+        add_run_log('EV-EDIT', 'CHK-008', 'test_edit_survives_restart PASSED\n', 0,
+                    command=['synthetic-edit-test'])(data, run, project)
+        add_check('CHK-008', title='Edit a note, restart, read the edit', exit_code=0,
+                  evidence_ids=['EV-EDIT'])(data, run, project)
+        journey = {'id': 'J-002', 'name': 'Edit a note and read it after a restart', 'tier': 'T1',
+                   'objective_ids': ['OBJ-002'], 'check_ids': ['CHK-008'], 'status': 'INCONCLUSIVE',
+                   'gap': 'Edits of two sessions at once were not exercised.'}
+        if exclusion is not None:
+            journey['exclusion'] = copy.deepcopy(exclusion)
+        data['journeys'].append(journey)
+        if listed:  # REPORT.md names these IDs
+            report_lists(*listed)(data, run, project)
+    return mutate
+
+
+def failed_attempt(command: Any, rerun_reason: Any = None) -> Mutation:
+    """GO example: CHK-002 also cites a failed attempt of this run, set aside as STALE, run with the given command."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        add_run_log('EV-ATTEMPT', 'attempt', EXAMPLE_FAIL_LOG, 1, command=command)(data, run, project)
+        entry(data, 'evidence', 'EV-ATTEMPT')['freshness'] = 'STALE'
+        check = entry(data, 'checks', 'CHK-002')
+        check['evidence_ids'].append('EV-ATTEMPT')
+        if rerun_reason is not None:
+            check['rerun_reason'] = rerun_reason
+    return mutate
+
+
+def rerun_commands(attempt: list[str], rerun: list[str]) -> Mutation:
+    """GO example: the passing run of CHK-002 (EV-003) recorded with command rerun, beside a failed attempt."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        path = run / 'evidence' / 'logs' / 'CHK-002-2.meta.json'
+        write_text_file(path, json.dumps(dict(read_json(path), command=rerun)))
+        failed_attempt(attempt)(data, run, project)
+    return mutate
+
+
+def prefix_test_names(first: str, second: str) -> Mutation:
+    """Two optional checks on one suite run whose test names share a beginning, each quoting the given section."""
+    return chain(add_run_log('EV-NAMES', 'names-suite', 'test_save_note PASSED\ntest_save_note_unicode PASSED\n'
+                                                         '2 passed\n', 0),
+                 *(add_check(cid, title=f'Suite test {cid}', method='UNIT', required_for_audit=False,
+                             required_for_release=False, evidence_ids=['EV-NAMES'],
+                             log_excerpts=[{'evidence_id': 'EV-NAMES', 'excerpt': quote}])
+                   for cid, quote in (('CHK-014', first), ('CHK-015', second))))
+
+
+def checkpoint_set_aside(anchor: bool) -> Mutation:
+    """The interim checkpoint moved out of the run after it was created; with anchor False also its RUN-STATE anchor."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        (run / 'checkpoints' / 'interim').rename(run.parent / 'moved-checkpoint')
+        if not anchor:
+            state = read_json(run / 'RUN-STATE.json')
+            state.pop('interim_checkpoint', None)
+            write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    return mutate
+
+
+def log_meta(**changes: Any) -> Mutation:
+    """Fields of the metadata of EV-003, the passing run log of the GO example."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        path = run / 'evidence' / 'logs' / 'CHK-002-2.meta.json'
+        write_text_file(path, json.dumps(dict(read_json(path), **changes)))
+    return mutate
+
+
+DOWNGRADE_POSITIVE_CONTROLS: list[tuple[str, str, Mutation]] = [
+    ('GO_SUITE_SHARED_BESIDE_TARGETED_RUN', 'go', suite_beside_targeted_run),
+    ('OPEN_HIGH_NOT_BLOCKING_WITH_REASON', 'nogo', open_finding(['EV-002'], severity='HIGH', priority='P1',
+                                                                release_blocker_reason='Demo data only.')),
+    ('GO_DISPROVEN_BY_OTHER_EVIDENCE', 'go', add_finding('OPEN', assessment='DISPROVEN', disproof='Notes are kept per '
+                                                         'user.', evidence_ids=['EV-002'], counter_evidence_ids=['EV-003'])),
+    ('GO_REQUIREMENT_MET_BESIDE_FAILED_INVESTIGATION', 'go', chain(
+        failed_requirement_check('INVESTIGATION'), lambda d, r, p: entry(d, 'requirements', 'REQ-002')['check_ids'].append(
+            'CHK-002'))),
+    ('GO_REQUIREMENT_USER_ACCEPTED_RISK', 'go', chain(
+        failed_requirement_check('BUG_REPRODUCTION'),
+        accepted_blocker('user:ReleaseDecision', target={'requirement_ids': ['REQ-002']}, evidence_ids=['EV-X']))),
+    ('FAILED_CHECK_FINDING_SHARES_EVIDENCE', 'nogo', chain(failed_requirement_check('ACCEPTANCE_REGRESSION'),
+                                                           open_finding(['EV-X']))),
+    ('GO_T1_EXCLUDED_BY_USER', 'go', excluded_journey(USER_EXCLUSION)),
+    ('GO_CORRECTED_RERUN_SAME_PROGRAM', 'go', rerun_commands(
+        ['python', '-m', 'pytest', 'tests/test_store.py'],
+        ['C:\\Python312\\python3.12.exe', '-X', 'utf8', '-m', 'pytest', '-p', 'no:cacheprovider',
+         'tests/test_store.py::test_note_survives_restart'])),
+    ('GO_CORRECTED_RERUN_FIXED_ENVIRONMENT', 'go', rerun_commands(
+        ['npm', 'test'], ['npm', 'test', '--', '--runInBand'])),
+    ('GO_RERUN_OF_OTHER_PROGRAM_WITH_REASON', 'go', failed_attempt(
+        ['python', '-m', 'pytest', 'tests'], 'The suite runner crashed on start; the test runs under the restart script.')),
+    ('LOG_SECTION_PREFIX_TEST_NAMES_WHOLE_LINES', 'nogo', prefix_test_names('test_save_note PASSED',
+                                                                           'test_save_note_unicode PASSED')),
+    ('GO_T1_RUN_IN_PROJECT_AS_WORKSPACE', 'go', chain(log_meta(outside_workspace=True), lambda d, r, p: write_text_file(
+        r / 'RUN-STATE.json', json.dumps(dict(read_json(r / 'RUN-STATE.json'), workspace=str(p)))))),
+]
+
+DOWNGRADE_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('PASS_ON_FAILED_RUN_UNQUOTED', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'), 'E_CHECK_LOG_SECTION'),
+    ('OPEN_HIGH_NOT_BLOCKING_UNREASONED', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'),
+     'E_BLOCKER_REASON'),
+    ('GO_PASS_ON_DEFECT_EVIDENCE', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'), 'E_GO_EVIDENCE'),
+    ('GO_DISPROVEN_BY_OWN_EVIDENCE', 'nogo', relabelled_nogo(assessment='DISPROVEN', counter_evidence_ids=['EV-001'],
+                                                             disproof='Not reproducible.'), 'E_DISPROVEN'),
+    ('GO_REQUIREMENT_FAILED_INVESTIGATION', 'go', failed_requirement_check('INVESTIGATION'), 'E_GO_REQUIREMENT'),
+    ('GO_REQUIREMENT_FAILED_BUG_REPRODUCTION', 'go', failed_requirement_check('BUG_REPRODUCTION'), 'E_GO_REQUIREMENT'),
+    ('FAILED_CHECK_WITHOUT_FINDING', 'nogo', failed_requirement_check('CHARACTERIZATION'), 'E_VIOLATION_WITHOUT_FINDING'),
+    ('GO_T1_EXCLUDED_BY_PROSE', 'go', chain(excluded_journey(None), lambda d, r, p: d['scope'].update(
+        out_of_scope=['Editing beyond J-002'])), 'E_GO_T1'),
+    ('EXCLUSION_NOT_OBJECT', 'go', excluded_journey('Excluded by the user.'), 'E_TYPE'),
+    ('EXCLUSION_FIELDS_MALFORMED', 'go', excluded_journey({'reason': 5, 'source_ids': 'SRC-USER'}), 'E_TYPE'),
+    ('EXCLUSION_UNKNOWN_SOURCE', 'go', excluded_journey(dict(USER_EXCLUSION, source_ids=['SRC-USER', 'SRC-MISSING'])),
+     'E_REF'),
+    ('EXCLUDED_JOURNEY_NOT_IN_REPORT', 'go', excluded_journey(USER_EXCLUSION, listed=('SRC-USER',)), 'E_FINAL_CONTENT'),
+    ('GO_STALE_ATTEMPT_OTHER_PROGRAM', 'go', rerun_commands(['python', '-m', 'pytest', 'tests'],
+                                                            ['python', '-c', "print('ok')"]), 'E_GO_SUPERSEDED_ATTEMPT'),
+    ('GO_VERIFIED_FIXED_BLOCKER_UNCHECKED_RUN', 'go', set_fields('findings', 'F-001', evidence_ids=['EV-001']),
+     'E_VERIFIED_FIXED'),
+    ('GO_T1_RUN_OUTSIDE_WORKSPACE', 'go', log_meta(outside_workspace=True), 'E_RUN_OUTSIDE_WORKSPACE'),
+]
+
+DOWNGRADE_MESSAGE_CONTROLS: list[tuple[str, str, Mutation, str, str]] = [
+    ('GO_T1_OWN_CHECK_ON_FAILED_RUN', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'), 'E_GO_T1',
+     "own check shows the journey working on a run that exits with 0"),
+    ('GO_T1_GENERIC_QUOTE_OF_FAILED_SUITE', 'go', own_check_on_suite(1, '1 passed, 1 failed'), 'E_GO_T1',
+     'expected-failure test (a rejected invalid input) belongs in a separate check'),
+    ('PASS_ON_FAILED_RUN_NAMES_EXPECTED_FAILURE', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'),
+     'E_CHECK_LOG_SECTION', 'quotes the lines of that run log which show the expected failure'),
+    ('GO_SUPERSEDED_BY_OWN_EVIDENCE', 'nogo', relabelled_nogo(state='SUPERSEDED', superseded_reason='Obsolete.',
+                                                              counter_evidence_ids=['EV-001']),
+     'E_SUPERSEDED', 'cannot disprove it'),
+    ('VIOLATED_CLAIM_WITHOUT_FINDING', 'nogo', set_fields('findings', 'F-001', claim_ids=[], evidence_ids=['EV-002']),
+     'E_VIOLATION_WITHOUT_FINDING', 'VIOLATED claim without a finding'),
+    ('VIOLATED_JOURNEY_WITHOUT_FINDING', 'nogo', set_fields('findings', 'F-001', claim_ids=[], evidence_ids=['EV-002']),
+     'E_VIOLATION_WITHOUT_FINDING', 'VIOLATED T1 journey without a finding'),
+    ('GO_T1_EXCLUSION_WITHOUT_USER_DECISION', 'go', excluded_journey(dict(USER_EXCLUSION, source_ids=['SRC-001'])),
+     'E_GO_T1', 'only with a recorded user decision'),
+    ('GO_T1_EXCLUDED_WITH_DEMONSTRATED_OBJECTIVE', 'go', excluded_journey(USER_EXCLUSION, 'DEMONSTRATED'), 'E_GO_T1',
+     'OBJ-002 is DEMONSTRATED'),
+    ('LOG_SECTION_PREFIX_TEST_NAMES_NESTED', 'nogo', prefix_test_names('test_save_note', 'test_save_note_unicode'),
+     'E_CHECK_LOG_SECTION', 'quote the whole line'),
+    ('CHECKPOINT_MOVED_AFTER_CREATE', 'go', checkpoint_set_aside(True), 'E_CHECKPOINT_REQUIRED',
+     'the checkpoint was removed or changed'),
+    ('CLOSED_RUN_WITHOUT_CHECKPOINT', 'go', checkpoint_set_aside(False), 'E_CHECKPOINT_REQUIRED',
+     'Review already started: set security_review back to PENDING'),
+]
+
+DOWNGRADE_WARNING_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('REVIEW_STARTED_WITHOUT_CHECKPOINT_DURING_WORK', 'interim', started_security, 'W_CHECKPOINT_REQUIRED'),
+    ('AUTHORIZATION_UNRECORDED_DURING_WORK', 'interim', run_state_field(authorization=None), 'W_RUN_AUTHORIZATION'),
+]
+
+
+def run_downgrade_controls(root: Path) -> list[dict[str, Any]]:
+    """Downgrades of a negative result: refused without other evidence or a user decision, else listed in the review."""
+    results: list[dict[str, Any]] = []
+
+    def validated(control_id: str, variant: str, mutation: Mutation | None = None, final: bool = True) -> Issues:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        if mutation is not None:
+            mutation(data, run_dir, project)
+        return validate_audit(data, run_dir, project, final=final)[0]
+
+    for control_id, variant, mutation in DOWNGRADE_POSITIVE_CONTROLS:
+        issues = validated(control_id, variant, mutation)
+        control(results, control_id, not issues.errors, {'errors': sorted(issues.codes()),
+                                                         'warnings': sorted({w['code'] for w in issues.warnings})})
+    for control_id, variant, mutation, expected in DOWNGRADE_NEGATIVE_CONTROLS:
+        try:
+            observed = sorted(validated(control_id, variant, mutation).codes())
+        except Exception as exc:  # a crash is a failed control, not a pass
+            observed = [f'CRASH:{exc.__class__.__name__}']
+        control(results, control_id, expected in observed, observed)
+    for control_id, variant, mutation, expected, phrase in DOWNGRADE_MESSAGE_CONTROLS:
+        issues = validated(control_id, variant, mutation)
+        control(results, control_id, any(item['code'] == expected and phrase in item['message'] for item in issues.errors),
+                issues.errors)
+    for control_id, variant, mutation, expected in DOWNGRADE_WARNING_CONTROLS:
+        issues = validated(control_id, variant, mutation, final=False)
+        warnings = sorted({w['code'] for w in issues.warnings})
+        control(results, control_id, not issues.errors and expected in warnings,
+                {'errors': sorted(issues.codes()), 'warnings': warnings})
+
+    # closure_review lists every downgrade that stays possible, with the facts a reader needs.
+    def review(control_id: str, variant: str, mutation: Mutation, kind: str) -> list[dict[str, Any]]:
+        return [item for item in validated(control_id, variant, mutation).review if item['kind'] == kind]
+    entries = review('review-pass-on-failed-run', 'go', chain(add_run_log(
+        'EV-REJECT', 'reject-run', 'invalid id rejected\n', 2), add_check('CHK-011', exit_code=2, evidence_ids=['EV-REJECT'],
+        log_excerpts=[{'evidence_id': 'EV-REJECT', 'excerpt': 'invalid id rejected'}])), 'PASS_ON_FAILED_RUN')
+    control(results, 'CLOSURE_REVIEW_PASS_ON_FAILED_RUN', [(e['check'], e['exit_code'], e['excerpts'],
+                                                            e['evidence'][0]['command']) for e in entries]
+            == [('CHK-011', 2, ['invalid id rejected'], 'synthetic-suite')], entries)
+    entries = review('review-not-blocking', 'nogo', open_finding(['EV-002'], severity='HIGH', priority='P1',
+                                                                 release_blocker_reason='Demo data only.'),
+                     'OPEN_FINDING_NOT_BLOCKING')
+    control(results, 'CLOSURE_REVIEW_OPEN_FINDING_NOT_BLOCKING', [
+        (e['finding'], e['severity'], e['priority'], e['reason']) for e in entries] == [
+        ('F-009', 'HIGH', 'P1', 'Demo data only.')], entries)
+    entries = review('review-failed-mandatory', 'go', failed_requirement_check('INVESTIGATION'), 'FAILED_CHECK')
+    control(results, 'CLOSURE_REVIEW_FAILED_CHECK_INVESTIGATION', [
+        (e['check'], e['purpose'], e['meaning'], e['requirements'], e['required_for_release']) for e in entries] == [
+        ('CHK-004', 'INVESTIGATION', FAILURE_MEANING['INVESTIGATION'], ['REQ-002'], True)], entries)
+    entries = review('review-superseded-attempt', 'go', failed_attempt(['python', '-m', 'pytest'], 'Runner crashed.'),
+                     'SUPERSEDED_ATTEMPT')
+    control(results, 'CLOSURE_REVIEW_SUPERSEDED_ATTEMPT', [
+        (e['check'], e['attempts'], e['rerun_reason'], [(v['command'], v['exit_code'], v['freshness'])
+                                                        for v in e['evidence']]) for e in entries] == [
+        ('CHK-002', ['EV-ATTEMPT'], 'Runner crashed.', [('synthetic-test', 0, 'CURRENT'),
+                                                        ('python -m pytest', 1, 'STALE')])], entries)
+    entries = review('review-exclusion', 'go', excluded_journey(USER_EXCLUSION), 'USER_DECISION')
+    control(results, 'CLOSURE_REVIEW_EXCLUSION', [(e['subject'], e['source'], e['reason']) for e in entries] == [
+        ('journeys[J-002].exclusion', 'SRC-USER', USER_EXCLUSION['reason'])], entries)
+    entries = review('review-security-na', 'go', valid_security_na, 'SECURITY_NOT_APPLICABLE')
+    control(results, 'CLOSURE_REVIEW_SECURITY_NOT_APPLICABLE', len(entries) == 1 and bool(entries[0]['reason']), entries)
+    entries = review('review-outside', 'go', chain(log_meta(outside_workspace=True), lambda d, r, p: write_text_file(
+        r / 'RUN-STATE.json', json.dumps(dict(read_json(r / 'RUN-STATE.json'), workspace=str(p))))), 'T1_OWN_CHECK')
+    control(results, 'CLOSURE_REVIEW_LOG_OUTSIDE_WORKSPACE', [
+        v.get('outside_workspace') for e in entries for v in e['evidence']] == [True], entries)
+    return results
+
+
+def verdict_finding(**finding: Any) -> Mutation:
+    """The NO_GO example with the verdict NOT_DEMONSTRATED instead: F-001 changed as given, its gate, claim, objective
+    and journey not demonstrated."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        entry(data, 'findings', 'F-001').update(copy.deepcopy(finding))
+        entry(data, 'release_gates', 'G-001').update(finding_ids=[], status='NOT_DEMONSTRATED')
+        entry(data, 'claims', 'CLM-001').update(assessment='INCONCLUSIVE')
+        entry(data, 'objectives', 'OBJ-001').update(fulfillment='NOT_DEMONSTRATED')
+        entry(data, 'journeys', 'J-001').update(status='INCONCLUSIVE')
+        data['release_status'] = 'NOT_DEMONSTRATED'
+        write_example_state(run, data)
+    return mutate
+
+
+def weakened_nogo(check: dict[str, Any], **finding: Any) -> Mutation:
+    """The NO_GO example declared GO through an added trivial check: the failed check CHK-002 changed as given (it stays
+    FAIL), journey, requirement, claim, objective and gate rest on the passing check CHK-010 that was added, F-001
+    changed as given."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        add_run_log('EV-TRIVIAL', 'trivial', 'ok\n', 0, command=['python', '-c', "print('ok')"])(data, run, project)
+        entry(data, 'checks', 'CHK-002').update(copy.deepcopy(check))
+        add_check('CHK-010', title='Notes persist', exit_code=0, claim_ids=['CLM-001'], evidence_ids=['EV-TRIVIAL'],
+                  required_reason='Core objective OBJ-001')(data, run, project)
+        entry(data, 'journeys', 'J-001').update(check_ids=['CHK-010'], status='SUPPORTED')
+        entry(data, 'requirements', 'REQ-001').update(check_ids=['CHK-010'])
+        entry(data, 'claims', 'CLM-001').update(assessment='SUPPORTED', evidence_ids=['EV-TRIVIAL'])
+        entry(data, 'objectives', 'OBJ-001')['fulfillment'] = 'DEMONSTRATED'
+        entry(data, 'release_gates', 'G-001').update(status='MET', finding_ids=[])
+        entry(data, 'findings', 'F-001').update(copy.deepcopy(finding))
+        for row in data['domain_matrix']:
+            if row['check_ids'] == ['CHK-002']:
+                row['check_ids'] = ['CHK-010']
+        data.update(audit_status='COMPLETE_FOR_DEFINED_SCOPE', release_status='GO_FOR_DEFINED_SCOPE')
+        write_example_state(run, data)
+    return mutate
+
+
+LOWERED_CHECK = {'required_for_audit': False, 'required_for_release': False}
+LOWERED_FINDING = {'severity': 'MEDIUM', 'priority': 'P3', 'release_blocker': False}
+PROSE_DISPROOF = {'assessment': 'DISPROVEN', 'disproof': 'Re-read the code: not reproducible.', 'release_blocker': False,
+                  'priority': 'P3'}
+
+
+def named_tests(log: str, first: str, second: str) -> Mutation:
+    """Two optional checks on one suite run with the given log, each quoting the given section."""
+    return chain(add_run_log('EV-NAMES', 'names-suite', log, 0),
+                 *(add_check(cid, title=f'Suite test {cid}', method='UNIT', required_for_audit=False,
+                             required_for_release=False, evidence_ids=['EV-NAMES'],
+                             log_excerpts=[{'evidence_id': 'EV-NAMES', 'excerpt': quote}])
+                   for cid, quote in (('CHK-014', first), ('CHK-015', second))))
+
+
+PYTEST_NAMES = 'PASSED tests/test_s.py::test_save_note\nPASSED tests/test_s.py::test_save_note_unicode\n2 passed\n'
+MOCHA_NAMES = '  \u2714 saves a note\n  \u2714 saves a note with unicode\n'
+
+
+def excluded_own_check(state: str, **journey: Any) -> Mutation:
+    """GO example: the second T1 journey J-002 is excluded by the user (USER_EXCLUSION) and its own check CHK-008 is in
+    the given state, optional for audit and release: none (no check, no gap), not_run, deferred, blocked, failed
+    (with a non-blocking open finding F-009 and the journey VIOLATED), violated (the same with a blocking finding)."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        excluded_journey(USER_EXCLUSION, listed=('J-002', 'SRC-USER') + (('CHK-008',) if state == 'deferred' else ()))(
+            data, run, project)
+        check = entry(data, 'checks', 'CHK-008')
+        check.update(LOWERED_CHECK, required_reason='Journey J-002 is outside the release by the user decision.')
+        entry(data, 'journeys', 'J-002').update(journey)
+        if state == 'none':
+            entry(data, 'journeys', 'J-002').update(check_ids=[], gap=None)
+            data['checks'] = [item for item in data['checks'] if item['id'] != 'CHK-008']
+        elif state == 'not_run':
+            check.update(execution='NOT_RUN', exit_code=None, evidence_ids=[])
+        elif state == 'deferred':
+            check.update(execution='NOT_RUN', exit_code=None, evidence_ids=[], catch_up_plan='Next release.',
+                         deferral={'reason': 'The user left note editing out of this release.',
+                                   'decision_source_ids': ['SRC-USER']})
+        elif state == 'blocked':
+            check.update(execution='BLOCKED', exit_code=None, catch_up_plan='Needs an editor environment.')
+        elif state in ('failed', 'violated'):
+            add_run_log('EV-EDITF', 'edit-fail', 'test_edit_survives_restart FAILED\n1 failed\n', 1,
+                        command=['synthetic-edit-test'])(data, run, project)
+            check.update(execution='FAIL', exit_code=1, evidence_ids=['EV-EDITF'], purpose='CHARACTERIZATION')
+            entry(data, 'journeys', 'J-002')['status'] = 'VIOLATED'
+            open_finding(['EV-EDITF'], **({'severity': 'HIGH', 'priority': 'P1', 'release_blocker': True,
+                                           'confidence': 'HIGH'} if state == 'violated' else {}))(data, run, project)
+    return mutate
+
+
+def tampered_checkpoint(data: dict[str, Any], run: Path, project: Path) -> None:
+    """A file of the interim checkpoint changed after it was created."""
+    with open(run / 'checkpoints' / 'interim' / 'files' / 'REPORT.md', 'a', encoding='utf-8', newline='\n') as handle:
+        handle.write('Edited after the checkpoint.\n')
+
+
+def loose_run(stem: str, exit_code: Any, **meta: Any) -> Mutation:
+    """A run log with metadata under evidence/logs that no evidence entry registers."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        content = f'{stem} output\n'.encode('utf-8')
+        stamp = data['baseline']['captured_at_utc']
+        (run / 'evidence' / 'logs').mkdir(parents=True, exist_ok=True)
+        (run / 'evidence' / 'logs' / f'{stem}.log').write_bytes(content)
+        write_json_new(run / 'evidence' / 'logs' / f'{stem}.meta.json', dict(
+            {'id': stem, 'tool': 'audit_tools.py', 'command': ['probe', stem], 'started_at_utc': stamp,
+             'ended_at_utc': stamp, 'exit_code': exit_code, 'log_sha256': sha256_bytes(content)}, **meta))
+    return mutate
+
+
+def optional_failed_check(data: dict[str, Any], run: Path, project: Path) -> None:
+    """GO example: an optional investigation that failed (CHK-012) and an exploratory failed run that no check cites."""
+    chain(add_run_log('EV-OPTIONAL', 'optional-run', 'test_export_markdown FAILED\n1 failed\n', 1,
+                      command=['pytest', 'tests/test_export.py']),
+          add_check('CHK-012', title='Export keeps every note', purpose='INVESTIGATION', execution='FAIL', exit_code=1,
+                    required_for_audit=False, required_for_release=False, required_reason='Exploratory.',
+                    evidence_ids=['EV-OPTIONAL']),
+          add_run_log('EV-EXPLORE', 'explore-run', '1 failed\n', 1, command=['pytest', '-k', 'export']))(data, run, project)
+
+
+def set_aside_citing_check(execution: str) -> dict[str, Any]:
+    """The failed own check lowered and set aside unexecuted, still citing its failed run log."""
+    return dict(LOWERED_CHECK, execution=execution, exit_code=None, catch_up_plan='Later.')
+
+
+def finding_removed(data: dict[str, Any], run: Path, project: Path) -> None:
+    """F-001 deleted; its task packages and the doc claims it answered are removed with it."""
+    data['findings'] = [f for f in data['findings'] if f['id'] != 'F-001']
+    data['tasks'] = []
+    for claim in data['doc_claims']:
+        claim.update(verdict='TRUE', reason='Checked.')
+
+
+def check_removed(data: dict[str, Any], run: Path, project: Path) -> None:
+    data['checks'] = [c for c in data['checks'] if c['id'] != 'CHK-002']
+
+
+def relabelled_log_evidence(data: dict[str, Any], run: Path, project: Path) -> None:
+    """EV-001 re-registered as kind NOTE and cited by the added passing check CHK-010."""
+    entry(data, 'evidence', 'EV-001')['kind'] = 'NOTE'
+    entry(data, 'checks', 'CHK-010')['evidence_ids'].append('EV-001')
+
+
+def note_on_log(stem: str) -> Mutation:
+    """A loose failed run whose log file an evidence entry of kind NOTE points at; an optional skipped check cites it."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        loose_run(stem, 1, command=['probe', stem])(data, run, project)
+        content = (run / 'evidence' / 'logs' / f'{stem}.log').read_bytes()
+        data['evidence'].append({'id': 'EV-NOTE-LOG', 'kind': 'NOTE', 'path': f'evidence/logs/{stem}.log',
+                                 'sha256': sha256_bytes(content), 'captured_at_utc': None, 'freshness': 'CURRENT',
+                                 'limits': 'A reading of the run log.'})
+        add_check('CHK-014', execution='SKIPPED', exit_code=None, catch_up_plan='Later.',
+                  required_for_audit=False, required_for_release=False,
+                  evidence_ids=['EV-NOTE-LOG'])(data, run, project)
+    return mutate
+
+
+def shares_with_check(finding_id: str, claim_ids: list[str], evidence_ids: list[str]) -> Mutation:
+    """An open, confirmed, non-blocking MEDIUM finding with its own package, citing the given claims and evidence."""
+    task_id = 'T-' + finding_id[2:]
+    return chain(add_finding('OPEN', finding_id, severity='MEDIUM', priority='P2', release_blocker=False,
+                             claim_ids=claim_ids, evidence_ids=evidence_ids, task_ids=[task_id]),
+                 lambda d, r, p: write_text_file(r / 'tasks' / f'{task_id}.md', TASK_TEXT.format(id=task_id)),
+                 lambda d, r, p: d['tasks'].append({'id': task_id, 'type': 'IMPLEMENT', 'title': f'Fix {finding_id}',
+                                                    'finding_ids': [finding_id], 'depends_on': [], 'wave': 1,
+                                                    'file': f'tasks/{task_id}.md'}))
+
+
+def finding_on_log(stem: str) -> Mutation:
+    """A failed run log that an open finding cites as its evidence and no check cites."""
+    return chain(add_run_log('EV-FINDING-LOG', stem, f'{stem} output\n', 1, command=['probe', stem]),
+                 shares_with_check('F-009', [], ['EV-FINDING-LOG']))
+
+
+def run_record_moved(subdirectory: str) -> Mutation:
+    """The failed run record of CHK-002 (log and metadata) moved to evidence/<subdirectory>, EV-001 pointing there."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        target = run / 'evidence' / subdirectory
+        target.mkdir(parents=True)
+        for suffix in ('.log', '.meta.json'):
+            os.replace(run / 'evidence' / 'logs' / f'CHK-002{suffix}', target / f'CHK-002{suffix}')
+        entry(data, 'evidence', 'EV-001')['path'] = f'evidence/{subdirectory}/CHK-002.log'
+    return mutate
+
+
+def rerun_recorded(attempt: Any, rerun: Any, platform: Any = None) -> Mutation:
+    """GO example: CHK-002 cites a failed attempt (STALE) and its passing run, recorded with the given commands (and the
+    metadata platform of both, when given)."""
+    def mutate(data: dict[str, Any], run: Path, project: Path) -> None:
+        path = run / 'evidence' / 'logs' / 'CHK-002-2.meta.json'
+        write_text_file(path, json.dumps(dict(read_json(path), command=rerun, **({'platform': platform} if platform else {}))))
+        failed_attempt(attempt)(data, run, project)
+        if platform:
+            meta = run / 'evidence' / 'logs' / 'attempt.meta.json'
+            write_text_file(meta, json.dumps(dict(read_json(meta), platform=platform)))
+    return mutate
+
+
+NPM_BATCH = '"C:\\Windows\\System32\\cmd.exe" /d /s /c ""C:\\Program Files\\nodejs\\%s.cmd" %s"'
+# (recorded command, recorded command, same program): strings as recorded by run, lists as the command line was given.
+PROGRAM_PAIRS: list[tuple[Any, Any, bool]] = [
+    (NPM_BATCH % ('npm', 'test'), NPM_BATCH % ('npx', 'jest'), False),
+    (NPM_BATCH % ('npm', 'test'), NPM_BATCH % ('npm', 'run build'), False),
+    (NPM_BATCH % ('npm', 'test'), NPM_BATCH % ('npm', 'test -- --runInBand'), True),
+    (NPM_BATCH % ('npm', 'test'), ['npm', 'run', 'test'], True),
+    ('cmd /c python -m pytest', 'cmd /c echo ok', False),
+    ('cmd /c "python -m pytest"', ['pytest', '-x'], True),
+    ('env FOO=1 pytest tests', 'pytest -k x', True),
+    ('env FOO=1 pytest tests', 'env FOO=1 ruff check', False),
+    ('FOO=1 BAR=2 pytest', ['python', '-m', 'pytest'], True),
+    (['pytest'], ['python', '-m', 'pytest'], True),
+    (['python3.12', '-m', 'pytest'], ['py', '-3', '-m', 'pytest'], True),
+    (['python', '-m', 'pytest'], ['python', '-m', 'unittest'], False),
+    (['npm', 'test'], ['npm', 'run', 'test'], True),
+    (['npm', 'test'], ['npm', 't'], True),
+    (['npm', 'run-script', 'test'], ['pnpm', 'test'], False),
+    (['pnpm', 'test'], ['pnpm', 'run', 'test'], True),
+    (['npm', 'test'], ['npm', 'run', 'test:unit'], False),
+    (['npm', 'test'], ['npx', 'jest'], False),
+    (['npm', '-w', 'pkg', 'test'], ['npm', 'test'], True),
+    (['npm', '--prefix', 'sub', 'test'], ['npm', 'test'], True),
+    (['cargo', '+nightly', 'test'], ['cargo', 'test'], True),
+    (['cargo', 'test'], ['cargo', 'build'], False),
+    (['make', '-f', 'Makefile.ci', 'test'], ['make', 'test'], True),
+    (['make', 'test'], ['make', 'lint'], False),
+    (['uv', 'run', '--with', 'requests', 'pytest'], ['uv', 'run', 'pytest', '-x'], True),
+    (['uv', 'run', 'pytest'], ['uv', 'run', 'python', '-c', 'print(1)'], False),
+    (['poetry', 'run', 'pytest'], ['python', '-m', 'pytest'], True),
+    (['npx', 'jest'], ['pnpm', 'dlx', 'jest'], True),
+    (['bash', '-c', 'pytest -x'], ['pytest'], True),
+    (['sh', '-c', 'cd sub && pytest'], ['sh', '-c', 'cd sub && npm test'], False),
+    (['cmd', '/c', 'npm', 'test'], ['npm', 'test'], True),
+    (['cmd.exe', '/d', '/s', '/c', 'npm test'], ['npm', 'test'], True),
+    (['cmd', '/c', 'npm', 'test'], ['cmd', '/c', 'npx', 'jest'], False),
+    ('env ' * 9 + 'pytest', 'env ' * 9 + 'ruff check', False),
+    ('env ' * 9 + 'pytest tests', 'env ' * 9 + 'pytest tests', True),
+    ('cmd /c ' * 10 + 'pytest', 'cmd /c ' * 10 + 'ruff check', False),
+    ('cmd /c ' * 10 + 'pytest', 'cmd /c ' * 10 + 'pytest', True),
+    ('powershell -NoProfile -Command "pytest tests"', ['pytest'], True),
+    (['time', 'nice', '-n', '10', 'pytest'], ['sudo', '-u', 'ci', 'pytest'], True),
+    (['python', 'a.py'], ['python', 'b.py'], False),
+    (['node', '--test'], ['node', 'e2e.js'], False),
+    (['node', '--max-old-space-size', '4096', 's.js'], ['node', 's.js'], True),
+    (['npm', '--foo', 'bar', 'test'], ['npm', 'test'], False),
+    (['npm', '--foo', 'bar', 'test'], ['npm', '--foo', 'bar', 'test'], True),
+    (['npm', '--foo', 'bar', 'test'], ['npm', '--foo', 'bar', 'lint'], False),
+    ('C:\\Python312\\python.exe -m pytest tests', 'python -m pytest tests', True),
+    (None, None, False),
+]
+
+FOLLOWUP_POSITIVE_CONTROLS: list[tuple[str, str, Mutation]] = [
+    ('DISPROVEN_BY_OTHER_EVIDENCE_NO_GO', 'nogo', verdict_finding(
+        assessment='DISPROVEN', counter_evidence_ids=['EV-005'], disproof='Not reproducible.', release_blocker=False,
+        priority='P2')),
+    ('LOG_SECTION_PREFIX_NAMES_AT_LINE_END', 'nogo', named_tests(
+        PYTEST_NAMES, 'PASSED tests/test_s.py::test_save_note', 'PASSED tests/test_s.py::test_save_note_unicode')),
+    ('LOG_SECTION_INDENTED_NAMES_QUOTED_WITHOUT_INDENT', 'nogo', named_tests(
+        MOCHA_NAMES, '\u2714 saves a note', '\u2714 saves a note with unicode')),
+    ('GO_OPTIONAL_FAILED_CHECK_AND_EXPLORATORY_RUN', 'go', optional_failed_check),
+    ('GO_CORRECTED_RERUN_BATCH_WRAPPER', 'go', rerun_recorded(NPM_BATCH % ('npm', 'test'),
+                                                             NPM_BATCH % ('npm', 'run test'), 'win32')),
+    ('GO_CORRECTED_RERUN_ENV_AND_MODULE', 'go', rerun_recorded('env FOO=1 pytest tests', 'python -m pytest tests')),
+    ('GO_CORRECTED_RERUN_WINDOWS_PATH_PLATFORM_UNKNOWN', 'go', rerun_recorded(
+        'C:\\Python312\\python.exe -m pytest tests', 'python -m pytest tests')),
+    ('GO_T1_EXCLUDED_NO_CHECK_NO_GAP', 'go', excluded_own_check('none')),
+    ('GO_T1_EXCLUDED_OWN_CHECK_NOT_RUN', 'go', excluded_own_check('not_run')),
+    ('GO_T1_EXCLUDED_OWN_CHECK_DEFERRED', 'go', excluded_own_check('deferred')),
+    ('GO_T1_EXCLUDED_OWN_CHECK_BLOCKED', 'go', excluded_own_check('blocked')),
+    ('GO_T1_EXCLUDED_VIOLATED_NONBLOCKING_FINDING', 'go', excluded_own_check('failed')),
+    ('GO_T1_EXCLUDED_OWN_CHECK_ON_DEFECT_EVIDENCE', 'go', chain(excluded_journey(USER_EXCLUSION),
+                                                                open_finding(['EV-EDIT']))),
+    ('GO_T1_EXCLUDED_OWN_RUN_OUTSIDE_WORKSPACE', 'go', chain(excluded_journey(USER_EXCLUSION), lambda d, r, p: write_text_file(
+        r / 'evidence' / 'logs' / 'CHK-008.meta.json', json.dumps(dict(
+            read_json(r / 'evidence' / 'logs' / 'CHK-008.meta.json'), outside_workspace=True))))),
+    ('GO_T1_RUN_IN_PROJECT_AS_RELATIVE_WORKSPACE', 'go', chain(log_meta(outside_workspace=True), run_state_field(
+        workspace='.'))),
+    ('SHARED_EVIDENCE_SEPARATE_LISTS_PASS', 'nogo', open_finding(['EV-002'], counter_evidence_ids=['EV-005'])),
+]
+
+FOLLOWUP_NEGATIVE_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('DISPROVEN_BY_OWN_EVIDENCE_NO_GO', 'nogo', verdict_finding(
+        assessment='DISPROVEN', counter_evidence_ids=['EV-001'], disproof='Not reproducible.', release_blocker=False,
+        priority='P2'), 'E_DISPROVEN'),
+    ('SUPERSEDED_BY_OWN_EVIDENCE_NO_GO', 'nogo', verdict_finding(
+        state='SUPERSEDED', superseded_reason='Obsolete.', counter_evidence_ids=['EV-001'], release_blocker=False,
+        priority='P2'), 'E_SUPERSEDED'),
+    ('GO_PASS_ON_CANDIDATE_FIXED_DEFECT_EVIDENCE', 'nogo', relabelled_nogo(state='CANDIDATE_FIXED', release_blocker=False,
+                                                                           priority='P2'), 'E_GO_EVIDENCE'),
+    ('LOG_SECTION_FRAGMENT_INSIDE_OTHER_LINE', 'nogo', named_tests(PYTEST_NAMES, 'tests/test_s.py::test_save_note',
+                                                                  'PASSED tests/test_s.py::test_save_note_unicode'),
+     'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_LINES_INSIDE_LONGER_QUOTE', 'nogo', named_tests(
+        PYTEST_NAMES, 'PASSED tests/test_s.py::test_save_note',
+        'PASSED tests/test_s.py::test_save_note\nPASSED tests/test_s.py::test_save_note_unicode'), 'E_CHECK_LOG_SECTION'),
+    ('LOG_SECTION_IDENTICAL_LINES', 'nogo', named_tests(
+        PYTEST_NAMES, 'PASSED tests/test_s.py::test_save_note', 'PASSED tests/test_s.py::test_save_note'),
+     'E_CHECK_LOG_SECTION'),
+    ('GO_STALE_ATTEMPT_BATCH_WRAPPER_OTHER_PROGRAM', 'go', rerun_recorded(NPM_BATCH % ('npm', 'test'),
+                                                                         NPM_BATCH % ('npx', 'jest'), 'win32'),
+     'E_GO_SUPERSEDED_ATTEMPT'),
+    ('GO_STALE_ATTEMPT_UNKNOWN_OPTION_VALUE', 'go', rerun_recorded(['npm', '--foo', 'bar', 'test'], ['npm', 'test']),
+     'E_GO_SUPERSEDED_ATTEMPT'),
+    ('GO_T1_EXCLUDED_VIOLATED_BLOCKING_FINDING', 'go', excluded_own_check('violated'), 'E_NO_GO_REQUIRED'),
+    ('GO_T1_EXCLUDED_VIOLATED_WITHOUT_FINDING', 'go', chain(excluded_own_check('not_run'), set_fields(
+        'journeys', 'J-002', status='VIOLATED')), 'E_VIOLATION_WITHOUT_FINDING'),
+    ('GO_T1_EXCLUDED_MANDATORY_OWN_CHECK_NOT_RUN', 'go', chain(excluded_own_check('not_run'), set_fields(
+        'checks', 'CHK-008', required_for_audit=True, required_for_release=True, catch_up_plan='Next release.')),
+     'E_GO_REQUIRED_CHECK'),
+    ('T1_WITHOUT_USER_SOURCE_NOT_RUN', 'go', chain(excluded_own_check('not_run'), set_fields(
+        'journeys', 'J-002', exclusion=dict(USER_EXCLUSION, source_ids=['SRC-001']))), 'E_T1_UNEXERCISED'),
+    ('T1_WITHOUT_USER_SOURCE_NO_CHECK', 'go', chain(excluded_own_check('none'), set_fields(
+        'journeys', 'J-002', exclusion=dict(USER_EXCLUSION, source_ids=['SRC-001']))), 'E_JOURNEY_TRACE'),
+    ('T1_WITHOUT_USER_SOURCE_OPTIONAL_OWN_CHECK', 'go', chain(excluded_own_check('blocked'), set_fields(
+        'journeys', 'J-002', exclusion=dict(USER_EXCLUSION, source_ids=['SRC-001']))), 'E_REQUIRED_MISSING'),
+    ('GO_T1_VIOLATED_WITHOUT_USER_SOURCE', 'go', chain(excluded_own_check('failed'), set_fields(
+        'journeys', 'J-002', exclusion=dict(USER_EXCLUSION, source_ids=['SRC-001']))), 'E_GO_JOURNEY'),
+    ('GO_T1_RUN_IN_OTHER_RELATIVE_WORKSPACE', 'go', chain(log_meta(outside_workspace=True), run_state_field(
+        workspace='elsewhere')), 'E_RUN_OUTSIDE_WORKSPACE'),
+]
+
+FOLLOWUP_MESSAGE_CONTROLS: list[tuple[str, str, Mutation, str, str]] = [
+    ('VERIFIED_FIXED_COUNTER_EVIDENCE_NAMES_PLACE', 'go', set_fields('findings', 'F-001', counter_evidence_ids=['EV-003']),
+     'E_DISPROVEN', 'where VERIFIED_FIXED requires it'),
+    ('GO_PASS_ON_CANDIDATE_FIXED_NAMES_VERIFICATION_RUN', 'nogo', relabelled_nogo(
+        state='CANDIDATE_FIXED', release_blocker=False, priority='P2'), 'E_GO_EVIDENCE',
+     'F-001 is CANDIDATE_FIXED: the run that verifies the fix belongs in the evidence_ids of this check'),
+    ('GO_T1_REJECTION_JOURNEY_NAMES_WRAPPER', 'nogo', relabelled_nogo(release_blocker=False, priority='P2'), 'E_GO_T1',
+     'exits with 0 on the expected rejection; that run is the journey'),
+    ('T1_UNEXERCISED_NAMES_EXCLUSION', 'nogo', set_fields('checks', 'CHK-002', method='STATIC', exit_code=None),
+     'E_T1_UNEXERCISED', 'records exclusion {reason, source_ids}'),
+    ('T1_REQUIRED_MISSING_NAMES_EXCLUSION', 'nogo', set_fields('checks', 'CHK-002', required_for_release=False),
+     'E_REQUIRED_MISSING', 'records exclusion {reason, source_ids}'),
+    ('GO_VIOLATED_JOURNEY_NAMES_EXCLUSION', 'go', set_fields('journeys', 'J-001', status='VIOLATED'), 'E_GO_JOURNEY',
+     'records exclusion {reason, source_ids}'),
+    ('GO_T1_EXCLUDED_WITH_DEMONSTRATED_OBJECTIVE_NAMES_REMOVAL', 'go', excluded_journey(USER_EXCLUSION, 'DEMONSTRATED'),
+     'E_GO_T1', 'Remove the exclusion and exercise the journey'),
+    ('GO_T1_EXCLUDED_MANDATORY_OWN_CHECK_NAMES_FLAG', 'go', chain(excluded_own_check('not_run'), set_fields(
+        'checks', 'CHK-008', required_for_audit=True, required_for_release=True, catch_up_plan='Next release.')),
+     'E_GO_REQUIRED_CHECK', 'set required_for_release false'),
+    ('COMPLETE_EXCLUDED_MANDATORY_OWN_CHECK_NAMES_FLAG', 'go', chain(excluded_own_check('not_run'), set_fields(
+        'checks', 'CHK-008', required_for_audit=True, required_for_release=False, catch_up_plan='Next release.')),
+     'E_COMPLETE_GAP', 'set required_for_audit false'),
+    ('GO_STALE_ATTEMPT_NAMES_REASON_FOR_UNKNOWN_PROGRAM', 'go', rerun_recorded(['npm', '--foo', 'bar', 'test'], ['npm', 'test']),
+     'E_GO_SUPERSEDED_ATTEMPT', 'rerun_reason settles it'),
+    ('CLOSED_RUN_WITHOUT_CHECKPOINT_NAMES_INTERIM_STATE', 'go', checkpoint_set_aside(False), 'E_CHECKPOINT_REQUIRED',
+     'audit_status PARTIAL and a release_status other than GO_FOR_DEFINED_SCOPE'),
+    ('CLOSED_RUN_WITHOUT_CHECKPOINT_NAMES_INTERIM_REPORT', 'go', checkpoint_set_aside(False), 'E_CHECKPOINT_REQUIRED',
+     'REPORT.md marked as the interim result'),
+    ('CHECKPOINT_INVALID_AT_CLOSURE_QUOTES_VERIFY', 'go', tampered_checkpoint, 'E_CHECKPOINT_INVALID',
+     AFTER_REVIEW_WAY_OUT),
+    ('HIGH_BLOCKER_UNDECIDED_ASKS_DECISION', 'nogo', open_finding(['EV-002'], severity='HIGH', priority='P1',
+                                                                 release_blocker=None), 'E_BLOCKER_REASON',
+     'release_blocker is null: decide it'),
+    ('SHARED_EVIDENCE_OPEN_CONFIRMED_MESSAGE', 'nogo', open_finding(['EV-002'], counter_evidence_ids=['EV-002']),
+     'E_DISPROVEN', 'listed in evidence_ids and in counter_evidence_ids: one record cannot both show the defect '
+     'and refute it'),
+    ('SHARED_EVIDENCE_OPEN_DISPROVEN_MESSAGE', 'nogo', open_finding(
+        ['EV-002'], assessment='DISPROVEN', disproof='Not reproducible.', counter_evidence_ids=['EV-002']),
+     'E_DISPROVEN', 'EV-002 also in evidence_ids: the evidence that confirmed a finding cannot disprove it'),
+]
+
+FOLLOWUP_WARNING_CONTROLS: list[tuple[str, str, Mutation, str]] = [
+    ('DISPROVEN_BY_OWN_EVIDENCE_DURING_WORK', 'nogo', verdict_finding(
+        assessment='DISPROVEN', counter_evidence_ids=['EV-001'], disproof='Not reproducible.', release_blocker=False,
+        priority='P2'), 'W_DISPROVEN'),
+    ('HIGH_BLOCKER_UNDECIDED_DURING_WORK', 'nogo', open_finding(['EV-002'], severity='HIGH', priority='P1',
+                                                                release_blocker=None), 'W_BLOCKER_REASON'),
+    ('HIGH_NOT_BLOCKING_UNREASONED_DURING_WORK', 'nogo', open_finding(['EV-002'], severity='HIGH', priority='P1',
+                                                                      release_blocker=False), 'W_BLOCKER_REASON'),
+    ('CHECKPOINT_INVALID_DURING_WORK', 'go', tampered_checkpoint, 'W_CHECKPOINT_REQUIRED'),
+]
+
+
+def run_validator_followup_controls(root: Path) -> list[dict[str, Any]]:
+    """Weakened results shown in the review, user-excluded T1 journeys, quoted log sections, checkpoint messages, program
+    comparison of a re-run, messages."""
+    results: list[dict[str, Any]] = []
+
+    def validated(control_id: str, variant: str, mutation: Mutation | None = None, final: bool = True) -> Issues:
+        run_dir, project, data = write_example_run(root / control_id.lower(), variant)
+        if mutation is not None:
+            mutation(data, run_dir, project)
+        return validate_audit(data, run_dir, project, final=final)[0]
+
+    def review(control_id: str, variant: str, mutation: Mutation | None, kind: str) -> list[dict[str, Any]]:
+        return [item for item in validated(control_id, variant, mutation).review if item['kind'] == kind]
+
+    for control_id, variant, mutation in FOLLOWUP_POSITIVE_CONTROLS:
+        issues = validated(control_id, variant, mutation)
+        control(results, control_id, not issues.errors, {'errors': sorted(issues.codes()),
+                                                         'warnings': sorted({w['code'] for w in issues.warnings})})
+    for control_id, variant, mutation, expected in FOLLOWUP_NEGATIVE_CONTROLS:
+        try:
+            observed = sorted(validated(control_id, variant, mutation).codes())
+        except Exception as exc:  # a crash is a failed control, not a pass
+            observed = [f'CRASH:{exc.__class__.__name__}']
+        control(results, control_id, expected in observed, observed)
+    for control_id, variant, mutation, expected, phrase in FOLLOWUP_MESSAGE_CONTROLS:
+        issues = validated(control_id, variant, mutation)
+        control(results, control_id, any(item['code'] == expected and phrase in item['message'] for item in issues.errors),
+                issues.errors)
+    for control_id, variant, mutation, expected in FOLLOWUP_WARNING_CONTROLS:
+        issues = validated(control_id, variant, mutation, final=False)
+        control(results, control_id, any(item['code'] == expected for item in issues.warnings) and not issues.errors,
+                {'errors': sorted(issues.codes()), 'warnings': sorted({w['code'] for w in issues.warnings})})
+    for control_id, variant, mutation, expected in FOLLOWUP_WARNING_CONTROLS[-1:]:
+        issues = validated(control_id + '-text', variant, mutation, final=False)
+        text = ' '.join(item['message'] for item in issues.warnings if item['code'] == expected)
+        control(results, 'CHECKPOINT_INVALID_DURING_WORK_QUOTES_VERIFY', 'Checkpoint hash mismatch: REPORT.md' in text
+                and AFTER_REVIEW_WAY_OUT in text, text)
+    issues = validated('shared-evidence-open-work', 'nogo', open_finding(
+        ['EV-002'], counter_evidence_ids=['EV-002']), final=False)
+    text = ' '.join(item['message'] for item in issues.warnings if item['code'] == 'W_DISPROVEN')
+    control(results, 'SHARED_EVIDENCE_OPEN_CONFIRMED_MESSAGE_DURING_WORK', not issues.errors
+            and 'listed in evidence_ids and in counter_evidence_ids: one record cannot both show the defect '
+            'and refute it' in text, {'errors': issues.errors, 'text': text})
+
+    # The failed check is listed whatever its flags, with what it supports and the findings that share its evidence.
+    entries = review('review-failed-check', 'nogo', None, 'FAILED_CHECK')
+    control(results, 'CLOSURE_REVIEW_FAILED_CHECK', [
+        (e['check'], e['purpose'], e['meaning'], e['required_for_audit'], e['required_for_release'], e['required_reason'],
+         e['requirements'], e['journeys'], e['gates'], e['findings']) for e in entries] == [
+        ('CHK-002', 'ACCEPTANCE_REGRESSION', FAILURE_MEANING['ACCEPTANCE_REGRESSION'], True, True,
+         'Core objective OBJ-001', ['REQ-001'], ['J-001'], ['G-001'], [
+             {'finding': 'F-001', 'assessment': 'CONFIRMED', 'state': 'OPEN', 'severity': 'HIGH', 'priority': 'P1',
+              'release_blocker': True}])], entries)
+    entries = review('review-failed-optional', 'go', optional_failed_check, 'FAILED_CHECK')
+    control(results, 'CLOSURE_REVIEW_FAILED_OPTIONAL_CHECK', [
+        (e['check'], e['required_for_audit'], e['required_for_release'], e['findings']) for e in entries] == [
+        ('CHK-012', False, False, [])], entries)
+    entries = review('review-failed-halves', 'nogo', chain(
+        shares_with_check('F-009', ['CLM-001'], ['EV-002']), shares_with_check('F-010', [], ['EV-001'])), 'FAILED_CHECK')
+    control(results, 'CLOSURE_REVIEW_FAILED_CHECK_FINDINGS_BY_CLAIM_OR_EVIDENCE', [
+        [f['finding'] for f in e['findings']] for e in entries] == [['F-001', 'F-009', 'F-010']], entries)
+    issues = validated('review-optional-exact', 'go', optional_failed_check)
+    kinds = sorted(item['kind'] for item in issues.review)
+    control(results, 'GO_OPTIONAL_FAILED_CHECK_REVIEW_ENTRIES', not issues.errors and kinds == sorted([
+        'BLOCKING_FINDING', 'FAILED_CHECK', 'GATE_CARRIER', 'T1_OWN_CHECK', 'OTHER_FAILED_RUNS']), kinds)
+    for control_id, check, finding, expected in (
+            ('LOWERED_CHECK_AND_FINDING', LOWERED_CHECK, dict(LOWERED_FINDING), {
+                'FAILED_CHECK': ['CHK-002'], 'CHANGED_SINCE_CHECKPOINT': ['CHK-002', 'F-001']}),
+            ('LOWERED_CHECK_AND_FINDING_RELIEF_BY_PROSE', LOWERED_CHECK, PROSE_DISPROOF, {
+                'FAILED_CHECK': ['CHK-002'], 'FINDING_NOT_OPEN': ['F-001'],
+                'CHANGED_SINCE_CHECKPOINT': ['CHK-002', 'F-001']}),
+            ('LOWERED_CHECK_AND_FINDING_RELIEF_BY_STATIC_READING', LOWERED_CHECK, dict(
+                PROSE_DISPROOF, counter_evidence_ids=['EV-005']), {
+                'FAILED_CHECK': ['CHK-002'], 'FINDING_NOT_OPEN': ['F-001'],
+                'CHANGED_SINCE_CHECKPOINT': ['CHK-002', 'F-001']}),
+            ('LOWERED_FINDING_SUPERSEDED_BY_REASON', LOWERED_CHECK, dict(
+                LOWERED_FINDING, state='SUPERSEDED', superseded_reason='Duplicate.'), {
+                'FAILED_CHECK': ['CHK-002'], 'FINDING_NOT_OPEN': ['F-001'],
+                'CHANGED_SINCE_CHECKPOINT': ['CHK-002', 'F-001']})):
+        issues = validated('review-' + control_id.lower(), 'nogo', weakened_nogo(check, **finding))
+        found: dict[str, list[str]] = {}
+        for item in issues.review:
+            if item['kind'] in expected:
+                found.setdefault(item['kind'], []).append(item.get('check') or item.get('finding'))
+        control(results, 'REVIEW_SHOWS_' + control_id, found == expected, {'found': found, 'errors': issues.errors})
+    entries = review('review-not-open-prose', 'nogo', weakened_nogo(LOWERED_CHECK, **PROSE_DISPROOF), 'FINDING_NOT_OPEN')
+    control(results, 'CLOSURE_REVIEW_FINDING_NOT_OPEN_FIELDS', [
+        (e['finding'], e['assessment'], e['state'], e['severity'], e['priority'], e['release_blocker'], e['disproof'],
+         e['counter_evidence'], e['successor']) for e in entries] == [
+        ('F-001', 'DISPROVEN', 'OPEN', 'HIGH', 'P3', False, 'Re-read the code: not reproducible.', 'none', None)], entries)
+    issues = validated('review-blocking-once', 'go', add_finding('SUPERSEDED', superseded_reason='Duplicate.',
+                                                                  counter_evidence_ids=['EV-002']))
+    listed = [item['kind'] for item in issues.review if item.get('finding') == 'F-009']
+    control(results, 'CLOSURE_REVIEW_BLOCKING_FINDING_LISTED_ONCE', listed == ['BLOCKING_FINDING'], listed)
+    entries = review('review-changed', 'nogo', weakened_nogo(LOWERED_CHECK, **dict(PROSE_DISPROOF, severity='LOW')),
+                     'CHANGED_SINCE_CHECKPOINT')
+    changes = {(e.get('check') or e.get('finding')): [(c['field'], c['at_checkpoint'], c['live']) for c in e['changes']]
+               for e in entries}
+    control(results, 'CLOSURE_REVIEW_CHANGED_SINCE_CHECKPOINT_FIELDS', changes == {
+        'CHK-002': [('required_for_audit', True, False), ('required_for_release', True, False)],
+        'F-001': [('severity', 'HIGH', 'LOW'), ('priority', 'P1', 'P3'), ('release_blocker', True, False),
+                  ('assessment', 'CONFIRMED', 'DISPROVEN')]}, changes)
+    entries = review('review-changed-state', 'nogo', weakened_nogo(
+        {'execution': 'PASS'}, state='SUPERSEDED', superseded_reason='Duplicate.', release_blocker=False),
+        'CHANGED_SINCE_CHECKPOINT')
+    changes = {(e.get('check') or e.get('finding')): [c['field'] for c in e['changes']] for e in entries}
+    control(results, 'CLOSURE_REVIEW_CHANGED_SINCE_CHECKPOINT_EXECUTION_AND_STATE', changes == {
+        'CHK-002': ['execution'], 'F-001': ['release_blocker', 'state']}, changes)
+    entries = review('review-changed-blocked', 'nogo', chain(
+        blocked_on_log('Connection refused\n', 1), renew_checkpoint, set_fields('checks', 'CHK-002', execution='PASS')),
+        'CHANGED_SINCE_CHECKPOINT')
+    control(results, 'CLOSURE_REVIEW_CHANGED_SINCE_CHECKPOINT_BLOCKED_TO_PASS', [
+        (e.get('check'), [(c['field'], c['at_checkpoint'], c['live']) for c in e['changes']]) for e in entries] == [
+        ('CHK-002', [('execution', 'BLOCKED', 'PASS')])], entries)
+    entries = review('review-changed-stronger', 'nogo', set_fields('findings', 'F-001', severity='CRITICAL', priority='P0'),
+                     'CHANGED_SINCE_CHECKPOINT')
+    control(results, 'CLOSURE_REVIEW_CHANGED_SINCE_CHECKPOINT_STRONGER_NOT_LISTED', not entries, entries)
+    for control_id, mutation in (('NO_CHECKPOINT', checkpoint_set_aside(False)), ('TAMPERED_CHECKPOINT', tampered_checkpoint)):
+        entries = review('review-changed-' + control_id.lower(), 'nogo', chain(
+            mutation, set_fields('findings', 'F-001', severity='LOW', priority='P3', release_blocker=False)),
+            'CHANGED_SINCE_CHECKPOINT')
+        control(results, 'CLOSURE_REVIEW_CHANGED_SINCE_CHECKPOINT_' + control_id, not entries, entries)
+
+    # Run logs of this run that failed and that no other review entry shows with their exit code.
+    entries = review('review-other', 'go', chain(
+        optional_failed_check, loose_run('start-failure', None, command=['nonexistent-tool'], error='command_not_found'),
+        loose_run('passed-run', 0), loose_run('timed-out', None, timed_out=True)), 'OTHER_FAILED_RUNS')
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LISTED', len(entries) == 1 and (
+        entries[0]['count'], entries[0]['unreadable_metadata'], entries[0]['not_listed']) == (3, 0, 0) and sorted(
+        (item['log'], item['command'], item['exit_code'], item['error']) for item in entries[0]['runs']) == [
+        ('evidence/logs/explore-run.log', 'pytest -k export', 1, None),
+        ('evidence/logs/start-failure.log', 'nonexistent-tool', None, 'command_not_found'),
+        ('evidence/logs/timed-out.log', 'probe timed-out', None, None)], entries)
+
+    def unreadable_metadata(data: dict[str, Any], run: Path, project: Path) -> None:
+        logs = run / 'evidence' / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        for name, content in (('broken', b'{not json'), ('listed', b'[]'), ('text-code', b'{"exit_code": "1"}'),
+                              ('nested', b'[' * 200_000), ('binary', bytes(range(128, 256)))):
+            (logs / f'{name}.meta.json').write_bytes(content)
+    entries = review('review-unreadable', 'go', unreadable_metadata, 'OTHER_FAILED_RUNS')
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_UNREADABLE_METADATA', len(entries) == 1 and (
+        entries[0]['count'], entries[0]['unreadable_metadata'], entries[0]['runs']) == (0, 5, []), entries)
+    entries = review('review-other-many', 'go', chain(*(loose_run(f'probe-{index:02d}', 1) for index in range(53))),
+                     'OTHER_FAILED_RUNS')
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LIMITED', len(entries) == 1 and (
+        entries[0]['count'], len(entries[0]['runs']), entries[0]['not_listed']) == (53, FAILED_RUN_LIMIT, 3), entries)
+    linked = root / 'review-other-links'
+    run_dir, project, data = write_example_run(linked, 'go')
+    elsewhere = linked / 'elsewhere'
+    loose_run('other-run', 1)(data, elsewhere, project)
+    link = run_dir / 'evidence' / 'logs' / 'linked'
+    if os.name == 'nt':  # a junction is the link a directory walk would enter by itself
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(elsewhere / 'evidence' / 'logs')],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.symlink(elsewhere / 'evidence' / 'logs', link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass
+    if is_link_or_junction(link):
+        listed = [item for item in validate_audit(data, run_dir, project, final=True)[0].review
+                  if item['kind'] == 'OTHER_FAILED_RUNS']
+        control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LINKS_NOT_FOLLOWED', not listed, listed)
+    else:
+        results.append({'id': 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LINKS_NOT_FOLLOWED', 'kind': 'TOOL_CONTROL',
+                        'result': 'SKIPPED', 'detail': 'Links cannot be created here.'})
+
+    # A failed run cited only by a set-aside check or by a finding stays visible in the review with its citers; the
+    # interim checkpoint is created after the edit, so the route reaches GO without a CHANGED_SINCE_CHECKPOINT entry.
+    for control_id, severity in (('SKIPPED', 'LOW'), ('NOT_RUN', 'MEDIUM'), ('BLOCKED', 'LOW')):
+        issues = validated('review-other-' + control_id.lower(), 'nogo', chain(
+            weakened_nogo(set_aside_citing_check(control_id), severity=severity, priority='P3',
+                          release_blocker=False), renew_checkpoint))
+        found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+        control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_' + control_id + '_CHECK', not issues.errors
+                and found is not None and found['runs'] == [{
+                    'log': 'evidence/logs/CHK-002.log', 'command': 'synthetic-test', 'exit_code': 1, 'error': None,
+                    'cited_by': [{'check': 'CHK-002', 'execution': control_id, 'required_for_audit': False,
+                                  'required_for_release': False,
+                                  'evidence': [{'evidence': 'EV-001', 'kind': 'LOG'}]}],
+                    'findings': [{'finding': 'F-001', 'assessment': 'CONFIRMED', 'state': 'OPEN',
+                                  'severity': severity, 'release_blocker': False}]}],
+                {'entry': found, 'errors': issues.errors})
+    issues = validated('review-other-deleted', 'nogo', chain(
+        weakened_nogo(set_aside_citing_check('SKIPPED')), finding_removed, renew_checkpoint))
+    found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_FINDING_DELETED', not issues.errors and found is not None
+            and found['runs'] == [{
+                'log': 'evidence/logs/CHK-002.log', 'command': 'synthetic-test', 'exit_code': 1, 'error': None,
+                'cited_by': [{'check': 'CHK-002', 'execution': 'SKIPPED', 'required_for_audit': False,
+                              'required_for_release': False, 'evidence': [{'evidence': 'EV-001', 'kind': 'LOG'}]}],
+                'findings': []}], {'entry': found, 'errors': issues.errors})
+    issues = validated('review-other-relabelled', 'nogo', chain(
+        weakened_nogo(LOWERED_CHECK), relabelled_log_evidence, finding_removed, check_removed, renew_checkpoint))
+    found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_REREGISTERED_EVIDENCE', not issues.errors
+            and found is not None and found['runs'] == [{
+                'log': 'evidence/logs/CHK-002.log', 'command': 'synthetic-test', 'exit_code': 1, 'error': None,
+                'cited_by': [{'check': 'CHK-010', 'execution': 'PASS', 'required_for_audit': True,
+                              'required_for_release': True,
+                              'evidence': [{'evidence': 'EV-001', 'kind': 'NOTE'}]}],
+                'findings': []}], {'entry': found, 'errors': issues.errors})
+
+    # Every run record below evidence counts, whatever its directory; a link below evidence is not followed.
+    for control_id, subdirectory in (('OUTSIDE_LOGS_DIRECTORY', 'other'), ('NESTED_DIRECTORY', 'other/attempts/first')):
+        issues = validated('review-other-' + control_id.lower(), 'nogo', chain(
+            weakened_nogo(set_aside_citing_check('SKIPPED'), severity='LOW', priority='P3', release_blocker=False),
+            run_record_moved(subdirectory), renew_checkpoint))
+        found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+        control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_' + control_id, not issues.errors
+                and found is not None and found['runs'] == [{
+                    'log': f'evidence/{subdirectory}/CHK-002.log', 'command': 'synthetic-test', 'exit_code': 1,
+                    'error': None, 'cited_by': [{'check': 'CHK-002', 'execution': 'SKIPPED', 'required_for_audit': False,
+                                                 'required_for_release': False,
+                                                 'evidence': [{'evidence': 'EV-001', 'kind': 'LOG'}]}],
+                    'findings': [{'finding': 'F-001', 'assessment': 'CONFIRMED', 'state': 'OPEN', 'severity': 'LOW',
+                                  'release_blocker': False}]}], {'entry': found, 'errors': issues.errors})
+    linked = root / 'review-other-links-evidence'
+    run_dir, project, data = write_example_run(linked, 'go')
+    elsewhere = linked / 'elsewhere'
+    loose_run('other-run', 1)(data, elsewhere, project)
+    link = run_dir / 'evidence' / 'linked-records'
+    if os.name == 'nt':
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(elsewhere / 'evidence' / 'logs')],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.symlink(elsewhere / 'evidence' / 'logs', link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass
+    if is_link_or_junction(link):
+        listed = [item for item in validate_audit(data, run_dir, project, final=True)[0].review
+                  if item['kind'] == 'OTHER_FAILED_RUNS']
+        control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LINKS_BELOW_EVIDENCE_NOT_FOLLOWED', not listed, listed)
+    else:
+        results.append({'id': 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_LINKS_BELOW_EVIDENCE_NOT_FOLLOWED', 'kind': 'TOOL_CONTROL',
+                        'result': 'SKIPPED', 'detail': 'Links cannot be created here.'})
+
+    # Placements that hide a run record from the scan count: a metadata name in another case (Windows opens it under
+    # the expected name), a directory that cannot be listed, and evidence/ itself a link.
+    placed = root / 'review-other-placements'
+    run_dir, project, data = write_example_run(placed, 'go')
+    loose_run('cased', 1)(data, run_dir, project)
+    cased = run_dir / 'evidence' / 'logs' / 'cased.meta.json'
+    cased.rename(cased.with_name('cased.Meta.Json'))
+    found = failed_run_logs(run_dir)
+    if os.name == 'nt':
+        control(results, 'FAILED_RUN_SCAN_MATCHES_METADATA_NAMES_IN_ANY_CASE', found == ([{
+            'log': 'evidence/logs/cased.log', 'command': ['probe', 'cased'], 'exit_code': 1, 'error': None}], 0), found)
+    else:
+        results.append({'id': 'FAILED_RUN_SCAN_MATCHES_METADATA_NAMES_IN_ANY_CASE', 'kind': 'TOOL_CONTROL',
+                        'result': 'SKIPPED', 'detail': 'Names differ by case on this platform.'})
+    (run_dir / 'evidence' / 'logs' / 'cased.Meta.Json').rename(cased)
+    locked = run_dir / 'evidence' / 'locked'
+    locked.mkdir()
+    real_scandir = os.scandir
+
+    def denied(path: Any = '.') -> Any:
+        if Path(path) == locked:
+            raise PermissionError(13, 'listing denied', str(path))
+        return real_scandir(path)
+
+    os.scandir = denied
+    try:
+        found = failed_run_logs(run_dir)
+    finally:
+        os.scandir = real_scandir
+    control(results, 'FAILED_RUN_SCAN_COUNTS_UNLISTABLE_DIRECTORIES', found[1] == 1 and [
+        item['log'] for item in found[0]] == ['evidence/logs/cased.log'], found)
+    moved = placed / 'evidence-real'
+    (run_dir / 'evidence').rename(moved)
+    if os.name == 'nt':
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(run_dir / 'evidence'), str(moved)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.symlink(moved, run_dir / 'evidence', target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass
+    if is_link_or_junction(run_dir / 'evidence'):
+        found = failed_run_logs(run_dir)
+        entries = [item for item in validate_audit(data, run_dir, project, final=True)[0].review
+                   if item['kind'] == 'OTHER_FAILED_RUNS']
+        control(results, 'FAILED_RUN_SCAN_COUNTS_LINKED_EVIDENCE_DIRECTORY', found == ([], 1) and len(entries) == 1
+                and entries[0]['unreadable_metadata'] == 1, {'scan': found, 'entries': entries})
+    else:
+        results.append({'id': 'FAILED_RUN_SCAN_COUNTS_LINKED_EVIDENCE_DIRECTORY', 'kind': 'TOOL_CONTROL',
+                        'result': 'SKIPPED', 'detail': 'Links cannot be created here.'})
+
+    # In an honest register every failed run is shown by its entry and is not listed again here.
+    issues = validated('review-shown-failed', 'nogo', None)
+    control(results, 'CLOSURE_REVIEW_FAILED_RUN_SHOWN_BY_FAILED_CHECK', any(
+        item['kind'] == 'FAILED_CHECK' and any(v.get('exit_code') == 1 for v in item['evidence'])
+        for item in issues.review) and not any(item['kind'] == 'OTHER_FAILED_RUNS' for item in issues.review),
+            [item['kind'] for item in issues.review])
+    issues = validated('review-shown-attempt', 'go', failed_attempt(['python', '-m', 'pytest'], 'Runner crashed.'))
+    control(results, 'CLOSURE_REVIEW_FAILED_RUN_SHOWN_BY_SUPERSEDED_ATTEMPT', not issues.errors
+            and any(item['kind'] == 'SUPERSEDED_ATTEMPT' for item in issues.review)
+            and not any(item['kind'] == 'OTHER_FAILED_RUNS' for item in issues.review),
+            {'kinds': [item['kind'] for item in issues.review], 'errors': issues.errors})
+    issues = validated('review-shown-blocked', 'nogo', blocked_on_log('Connection refused\n', 1))
+    runs = [run for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS' for run in item['runs']]
+    control(results, 'CLOSURE_REVIEW_BLOCKED_CHECK_RUN_SHOWN_ONCE', any(
+        item['kind'] == 'BLOCKED_CHECK' for item in issues.review)
+            and [run['log'] for run in runs] == ['evidence/logs/CHK-002.log']
+            and runs[0]['cited_by'] == [] and [f['finding'] for f in runs[0]['findings']] == ['F-001'],
+            issues.review)
+    issues = validated('review-other-cited-first', 'go', chain(
+        *(loose_run(f'probe-{index:02d}', 1) for index in range(53)), note_on_log('zz-cited')))
+    found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_CITED_FIRST', not issues.errors and found is not None
+            and found['count'] == 54 and len(found['runs']) == FAILED_RUN_LIMIT and found['not_listed'] == 4
+            and found['runs'][0]['log'] == 'evidence/logs/zz-cited.log'
+            and [c['check'] for c in found['runs'][0]['cited_by']] == ['CHK-014'],
+            {'entry': found, 'errors': issues.errors})
+    issues = validated('review-other-cited-by-finding-first', 'nogo', chain(
+        *(loose_run(f'probe-{index:02d}', 1) for index in range(53)), finding_on_log('zz-finding')))
+    found = next((item for item in issues.review if item['kind'] == 'OTHER_FAILED_RUNS'), None)
+    control(results, 'CLOSURE_REVIEW_OTHER_FAILED_RUNS_CITED_BY_FINDING_FIRST', not issues.errors and found is not None
+            and found['count'] == 54 and len(found['runs']) == FAILED_RUN_LIMIT and found['not_listed'] == 4
+            and found['runs'][0]['log'] == 'evidence/logs/zz-finding.log' and found['runs'][0]['cited_by'] == []
+            and [f['finding'] for f in found['runs'][0]['findings']] == ['F-009'],
+            {'entry': found, 'errors': issues.errors})
+
+    # The remedy for a started review without a checkpoint leads to a checkpoint.
+    run_dir, project, data = write_example_run(root / 'remedy-interim-state', 'go')
+    checkpoint_set_aside(False)(data, run_dir, project)
+    data['security_review'].update(status='PENDING', started_at_utc=None, executed_by=None, completed_at_utc=None)
+    data.update(audit_status='PARTIAL', release_status='NOT_DEMONSTRATED')
+    write_example_state(run_dir, data, INTERIM_LABEL)
+    try:
+        created = create_checkpoint(run_dir, project)['state']
+    except ToolError as exc:
+        created = str(exc)
+    control(results, 'CHECKPOINT_RECREATED_FROM_REMEDY_STATE', created == 'VALID', created)
+
+    # The program of a re-run is compared with the failed attempt on its program, through wrappers and on the platform
+    # that recorded the command, not on its options and arguments.
+    verdicts = [bool(programs_of(first) & programs_of(second)) for first, second, _ in PROGRAM_PAIRS]
+    control(results, 'RERUN_PROGRAM_COMPARED', verdicts == [same for _, _, same in PROGRAM_PAIRS]
+            and not programs_of(None) and not programs_of(42) and not programs_of([]),
+            [(first, second, verdict) for (first, second, same), verdict in zip(PROGRAM_PAIRS, verdicts) if verdict != same])
+    windows_path = 'C:\\Python312\\python.exe -m pytest tests'
+    control(results, 'RERUN_PROGRAM_SPLIT_BY_RECORDED_PLATFORM',
+            programs_of(windows_path, 'win32') == {('pytest',)} and programs_of(windows_path, 'linux') != {('pytest',)}
+            and ('pytest',) in programs_of(windows_path),
+            [sorted(programs_of(windows_path, platform)) for platform in ('win32', 'linux', None)])
+    if os.name == 'nt':  # the form `run` records for a batch file
+        workspace, evidence = root / 'shim' / 'copy', root / 'shim' / 'logs'
+        write_fixture_marker(workspace)
+        write_text_file(workspace / 'npm.cmd', '@echo shim\r\n')
+        common = ('--evidence-dir', str(evidence), '--cwd', str(workspace))
+        recorded = []
+        for index, arguments in enumerate((['test'], ['run', 'test'], ['run', 'build'])):
+            code, output = run_cli('run', '--id', f'SHIM-{index}', *common, '--', str(workspace / 'npm.cmd'), *arguments)
+            meta = read_json(evidence / f'SHIM-{index}.meta.json') if code == 0 else {}
+            recorded.append((meta.get('command'), meta.get('platform')))
+        wrapped = all(isinstance(command, str) and ' /d /s /c ' in command for command, _ in recorded)
+        control(results, 'RERUN_PROGRAM_OF_RECORDED_BATCH_RUN', wrapped and [programs_of(*item) for item in recorded] == [
+            {('npm', 'test')}, {('npm', 'test')}, {('npm', 'build')}], recorded)
+    else:
+        control(results, 'RERUN_PROGRAM_OF_RECORDED_BATCH_RUN', programs_of(NPM_BATCH % ('npm', 'test'), 'win32') == {
+            ('npm', 'test')}, 'The form of a recorded batch run is taken from the table (Windows only: cmd.exe).')
+    return results
+
+
+class ControlGroupAborted(Exception):
+    """A control precondition failed: its dependent controls are recorded as failed, the group stops."""
+
+    def __init__(self, results: list[dict[str, Any]], message: str) -> None:
+        super().__init__(message)
+        self.results = results
+
+
+def checkpoint_precondition(results: list[dict[str, Any]], control_ids: Iterable[str], run: Path,
+                            project: Path | None) -> dict[str, Any]:
+    """create_checkpoint as a precondition of controls; a failure fails those controls instead of the selftest."""
+    try:
+        return create_checkpoint(run, project)
+    except Exception as exc:
+        message = f'Precondition failed: checkpoint create: {exc.__class__.__name__}: {exc}'
+        for control_id in control_ids:
+            control(results, control_id, False, message)
+        raise ControlGroupAborted(results, message) from exc
+
+
+def control_group(results: list[dict[str, Any]], group: str, runner: Callable[..., Any], root: Path,
+                  appends: bool = False) -> None:
+    """Runs one control group; an abort fails the group with its error text instead of ending the selftest. A runner
+    that appends to the list it is given (appends) keeps the controls it recorded before an abort. Every entry of
+    the group carries its name in group."""
+    first = len(results)
+    try:
+        if appends:
+            runner(root, results)
+        else:
+            results += runner(root)
+    except ControlGroupAborted as exc:
+        if exc.results is not results:
+            results += exc.results
+        control(results, f'{group}_CONTROLS_COMPLETE', False, f'Control group aborted, later controls did not run. {exc}')
+    except Exception as exc:
+        control(results, f'{group}_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}: {exc}')
+    for entry in results[first:]:
+        entry['group'] = group
 
 
 def run_cli(*arguments: str, env: dict[str, str] | None = None, timeout: float = 180) -> tuple[int, str]:
@@ -4239,11 +10999,14 @@ def run_core2_controls(root: Path) -> list[dict[str, Any]]:
     run, project, data = write_example_run(root / 'checkpoint', 'interim')
     write_text_file(run / 'findings/F-001-notes-not-persistent.md', '# F-001\n[Details](../evidence/detail.txt)\n')
     write_text_file(run / 'evidence/detail.txt', 'Referenced detail.\n')
-    created = create_checkpoint(run, project)
+    created = checkpoint_precondition(results, ('CHECKPOINT_ROUNDTRIP_REFERENCES', 'CHECKPOINT_REFUSES_OVERWRITE',
+                                                'INTERRUPTED_LIVE_STATE_CHECKPOINT_GUIDANCE',
+                                                'INVALID_LIVE_STATE_CHECKPOINT_GUIDANCE', 'CHECKPOINT_TAMPER_REJECTED'),
+                                      run, project)
     snapshot = run / 'checkpoints/interim/files'
     control(results, 'CHECKPOINT_ROUNDTRIP_REFERENCES', created['state'] == 'VALID'
             and (snapshot / 'evidence/detail.txt').is_file()
-            and (snapshot / 'evidence/logs/CHK-002-2.meta.json').is_file())
+            and (snapshot / 'evidence/logs/CHK-002.meta.json').is_file())
     try:
         create_checkpoint(run, project)
         refused = False
@@ -4259,10 +11022,11 @@ def run_core2_controls(root: Path) -> list[dict[str, Any]]:
     info = describe_run(run)
     control(results, 'INVALID_LIVE_STATE_CHECKPOINT_GUIDANCE', info is not None
             and 'Offer the verified interim checkpoint' in info['resume_guidance'])
-    write_text_file(snapshot / 'REPORT.md', 'tampered\n')
+    with open(snapshot / 'REPORT.md', 'a', encoding='utf-8') as handle:
+        handle.write('Edited after the checkpoint.\n')
     control(results, 'CHECKPOINT_TAMPER_REJECTED', verify_checkpoint(run)['state'] == 'INVALID')
     run2, project2, data2 = write_example_run(root / 'checkpoint-inventory', 'interim')
-    create_checkpoint(run2, project2)
+    checkpoint_precondition(results, ('CHECKPOINT_INVENTORY_ENFORCED',), run2, project2)
     manifest_path = run2 / 'checkpoints/interim/manifest.json'
     manifest = read_json(manifest_path)
     manifest['sha256'].pop('tasks/T-001-persistence.md')
@@ -4296,6 +11060,7 @@ def run_core2_controls(root: Path) -> list[dict[str, Any]]:
     control(results, 'INCOMPATIBLE_OPEN_RUN_DISCOVERABLE', code == 0 and old.get('status') == 'OPEN'
             and old.get('resumable_with_package') is False and 'new linked' in old.get('resume_guidance', '')
             and listing.get('latest_resumable') is None)
+    run2, project2, data2 = write_example_run(root / 'prompt-drift', 'interim')  # without the tampered checkpoint
     data2['prompt_version'] = 'different-prompt'
     issues, _ = validate_audit(data2, run2, project2, final=True)
     control(results, 'COMPATIBLE_PROMPT_DRIFT_WARNING_ONLY', not issues.errors
@@ -4359,10 +11124,10 @@ def run_checkpoint_workflow_controls(root: Path) -> list[dict[str, Any]]:
          'https://example.invalid/reference', 'URL or external scheme', None),
         ('CHECKPOINT_CURRENT_QUALIFIED_REFERENCE', lambda d, r, p: d['sources'].append(
             {'id': 'SRC-CURRENT', 'ref': f'run:{d["run_id"]}/VISION.md', 'authority': 'Current run'}), None, None, 'VISION.md'),
-        ('CHECKPOINT_DOT_EVIDENCE_PATH', set_fields('evidence', 'EV-003', path='./evidence/logs/CHK-002-2.log'),
-         None, None, 'evidence/logs/CHK-002-2.log'),
-        ('CHECKPOINT_BACKSLASH_EVIDENCE_PATH', set_fields('evidence', 'EV-003', path='evidence\\logs\\CHK-002-2.log'),
-         None, None, 'evidence/logs/CHK-002-2.log'),
+        ('CHECKPOINT_DOT_EVIDENCE_PATH', set_fields('evidence', 'EV-001', path='./evidence/logs/CHK-002.log'),
+         None, None, 'evidence/logs/CHK-002.log'),
+        ('CHECKPOINT_BACKSLASH_EVIDENCE_PATH', set_fields('evidence', 'EV-001', path='evidence\\logs\\CHK-002.log'),
+         None, None, 'evidence/logs/CHK-002.log'),
     ]
     for control_id, mutation, reference, reason, stored in cases:
         run, project, data = write_example_run(root / control_id.lower(), 'interim')
@@ -4411,7 +11176,8 @@ def run_checkpoint_workflow_controls(root: Path) -> list[dict[str, Any]]:
                 and not list((run / 'checkpoints').glob('.interim-*')) and not (run / 'checkpoints/interim').exists())
 
     run, project, data = write_example_run(root / 'live-progress', 'interim')
-    create_checkpoint(run, project)
+    checkpoint_precondition(results, ('MID_P8_UNREVIEWED_FINDING_CONTINUES', 'PROJECT_DRIFT_NEVER_RESTORES_CHECKPOINT'),
+                            run, project)
     data['findings'][0].update(state='OPEN', review=None)
     data['release_status'] = 'NO_GO'
     data['release_gates'][0].update(status='VIOLATED', finding_ids=['F-001'])
@@ -4429,7 +11195,8 @@ def run_checkpoint_workflow_controls(root: Path) -> list[dict[str, Any]]:
             and 'Offer' not in info['resume_guidance'])
 
     run, project, data = write_example_run(root / 'pre-interim', 'interim')
-    create_checkpoint(run, project)
+    checkpoint_precondition(results, ('PRE_P7_CONTINUES_WITHOUT_RESTORE', 'SCHEMA_INVALID_LIVE_CHECKPOINT_RESTORE'),
+                            run, project)
     state = read_json(run / 'RUN-STATE.json')
     state['phase'] = 'P2'
     write_text_file(run / 'RUN-STATE.json', json.dumps(state))
@@ -4450,11 +11217,12 @@ def run_checkpoint_workflow_controls(root: Path) -> list[dict[str, Any]]:
     write_text_file(run / 'checkpoints/interim/files/copied.py', FAKE_LIVE_KEY)
     write_text_file(run / 'checkpoints/.interim-interrupted/files/staging.py', FAKE_LIVE_KEY)
     issues_after, counts_after = validate_audit(data, run, project, final=True)
+    # The copied file breaks the checkpoint's inventory; that is the only finding (no secret or discoverable file).
     control(results, 'VALIDATE_IGNORES_CHECKPOINT_COPIES_AND_STAGING', not issues_before.errors
-            and not issues_after.errors and counts_before == counts_after)
+            and issues_after.codes() == {'E_CHECKPOINT_INVALID'} and counts_before == counts_after)
 
     run, project, data = write_example_run(root / 'original-checkpoint', 'interim')
-    create_checkpoint(run, project)
+    checkpoint_precondition(results, ('CHECKPOINT_FROM_OTHER_RUN_REJECTED',), run, project)
     other, _, other_data = write_example_run(root / 'other-run', 'interim')
     other_data['run_id'] = 'different-run'
     state = read_json(other / 'RUN-STATE.json')
@@ -4511,7 +11279,14 @@ def run_recovery_integrity_controls(root: Path) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for kind in ('dangling-ref', 'record-field', 'record-type', 'malformed', 'non-object', 'top-field-type', 'both-unreadable'):
         run, project, data = write_example_run(root / kind, 'interim')
-        create_checkpoint(run, project)
+        if kind == 'both-unreadable':  # without a readable live run_id the checkpoint binds to the directory name
+            run = run.rename(run.with_name(data['run_id']))
+        checkpoint_precondition(results, ({'malformed': 'MALFORMED_RESTORE_DISCARD_WARNING',
+                                           'non-object': 'TOP_LEVEL_TYPE_RESTORE_DISCARD_WARNING',
+                                           'top-field-type': 'TOP_LEVEL_FIELD_TYPE_RESTORE_DISCARD_WARNING',
+                                           'both-unreadable': 'CORRUPT_RUN_RECOVERY_CONSISTENT'}.get(
+                                              kind, 'MID_P8_' + kind.replace('-', '_').upper() + '_REPAIR'),),
+                                run, project)
         state = read_json(run / 'RUN-STATE.json')
         state['phase'] = 'P8'
         write_text_file(run / 'RUN-STATE.json', json.dumps(state))
@@ -4546,18 +11321,18 @@ def run_recovery_integrity_controls(root: Path) -> list[dict[str, Any]]:
                          and info.get('live_state') == 'CORRUPT' and info.get('resumable_with_package') is True), info)
         if kind == 'both-unreadable':
             results_dir = root / 'listing'
-            shutil.copytree(run, results_dir / 'corrupt')
+            shutil.copytree(run, results_dir / run.name)
             code, output = run_cli('runs', '--results-dir', str(results_dir))
             listing = json_head(output)
             sole = next(iter(listing.get('runs', [])), {})
             control(results, 'RUNS_RECOVERS_SOLE_CORRUPT_RUN', code == 0 and sole.get('status') == 'CORRUPT'
-                    and sole.get('resumable_with_package') is True and listing.get('latest_resumable') == 'corrupt'
+                    and sole.get('resumable_with_package') is True and listing.get('latest_resumable') == run.name
                     and 'restoring discards all progress since the interim checkpoint' in sole.get('resume_guidance', '').lower(), sole)
             other, _, _ = write_example_run(root / 'other-open', 'interim')
             shutil.copytree(other, results_dir / 'open')
             code, output = run_cli('runs', '--results-dir', str(results_dir))
             listing = json_head(output)
-            corrupt = next((r for r in listing.get('runs', []) if r['dir'] == 'corrupt'), {})
+            corrupt = next((r for r in listing.get('runs', []) if r['dir'] == run.name), {})
             control(results, 'RUNS_LISTS_CORRUPT_WITH_OTHER_OPEN', code == 0 and len(listing.get('runs', [])) == 2
                     and corrupt.get('status') == 'CORRUPT' and corrupt.get('resumable_with_package') is not False
                     and 'Cannot resume' not in corrupt.get('resume_guidance', ''), corrupt)
@@ -4566,7 +11341,8 @@ def run_recovery_integrity_controls(root: Path) -> list[dict[str, Any]]:
         run, project, _ = write_example_run(root / reason.replace(' ', '-'), 'interim')
         write_text_file(run / 'evidence/only.txt', 'Current-run observation.\n')
         report_reference('[Observation](evidence/only.txt)')({}, run, project)
-        create_checkpoint(run, project)
+        checkpoint_precondition(results, ('CHECKPOINT_RELABELLED_' + ('DIRECTORY' if reason == 'directory' else 'PREVIOUS_RUN')
+                                          + '_INVALID',), run, project)
         directory = run / 'checkpoints/interim'
         manifest = read_json(directory / 'manifest.json')
         # Reference-collection mutants can omit this file before the relabelling control.
@@ -4581,7 +11357,7 @@ def run_recovery_integrity_controls(root: Path) -> list[dict[str, Any]]:
     for location, suffix in (('files/extra.txt', 'SNAPSHOT_FILE'), ('extra.txt', 'ENVELOPE_FILE'),
                              ('../extra.txt', 'ROOT_FILE'), ('empty-directory', 'DIRECTORY')):
         run, project, _ = write_example_run(root / location.replace('/', '-'), 'interim')
-        create_checkpoint(run, project)
+        checkpoint_precondition(results, ('CHECKPOINT_EXTRA_' + suffix + '_INVALID',), run, project)
         if suffix == 'DIRECTORY':
             (run / 'checkpoints/interim' / location).mkdir()
         else:
@@ -4663,7 +11439,8 @@ def run_checkpoint_input_controls(root: Path) -> list[dict[str, Any]]:
     for saved in (False, True):
         run, project, _ = write_example_run(root / ('staging-saved' if saved else 'staging-first'), 'interim')
         if saved:
-            create_checkpoint(run, project)
+            checkpoint_precondition(results, ('CHECKPOINT_IGNORES_LEFTOVER_STAGING',
+                                              'CHECKPOINT_CREATE_REFUSES_LEFTOVER_STAGING'), run, project)
         staging = run / 'checkpoints/.interim-interrupted'
         write_text_file(staging / 'files/extra.txt', 'Interrupted copy.\n')
         if saved:
@@ -4680,6 +11457,559 @@ def run_checkpoint_input_controls(root: Path) -> list[dict[str, Any]]:
         if saved:
             write_text_file(run / 'checkpoints/interim/files/REPORT.md', 'Tampered checkpoint.\n')
             control(results, 'CHECKPOINT_STAGING_DOES_NOT_MASK_TAMPER', verify_checkpoint(run)['state'] == 'INVALID')
+    return results
+
+
+def run_selection_checkpoint_controls(root: Path) -> list[dict[str, Any]]:
+    """Run selection, resume guidance and interim checkpoint identity and inventory."""
+    results: list[dict[str, Any]] = []
+
+    def listing(results_dir: Path) -> dict[str, Any]:
+        code, output = run_cli('runs', '--results-dir', str(results_dir))
+        return json_head(output) if code == 0 else {}
+
+    def p8_run(name: str, phase: str = 'P8', checkpoint: bool = True) -> tuple[Path, Path, dict[str, Any]]:
+        run, project, data = write_example_run(root / name, 'interim')
+        if checkpoint:
+            create_checkpoint(run, project)
+        state = read_json(run / 'RUN-STATE.json')
+        state['phase'] = phase
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        return run, project, data
+
+    # A run superseded before init wrote its audit.json is identified by RUN-STATE.json run_id or directory name.
+    superseded = root / 'superseded'
+    for original, successor, with_id in (('2026-03-01T1000Z_aaa1111', '2026-03-02T0900Z_bbb2222', True),
+                                         ('2026-03-03T1000Z_ccc3333', '2026-03-04T0900Z_ddd4444', False)):
+        write_json_new(superseded / original / 'RUN-STATE.json', {
+            **({'run_id': original} if with_id else {}), 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION,
+            'phase': 'P1', 'created_at_utc': original[:13] + ':00:00Z', 'closed_at_utc': '2026-03-05T00:00:00Z',
+            'superseded_by_run': successor})
+        write_json_new(superseded / successor / 'RUN-STATE.json', {
+            'run_id': successor, 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'phase': 'P2',
+            'created_at_utc': successor[:13] + ':00:00Z', 'closed_at_utc': None, 'previous_run_ids': [original]})
+    statuses = {item['dir']: item['status'] for item in listing(superseded).get('runs', [])}
+    control(results, 'SUPERSEDED_BEFORE_AUDIT_JSON_CLOSED', statuses == {
+        '2026-03-01T1000Z_aaa1111': 'CLOSED', '2026-03-02T0900Z_bbb2222': 'OPEN',
+        '2026-03-03T1000Z_ccc3333': 'CLOSED', '2026-03-04T0900Z_ddd4444': 'OPEN'}, statuses)
+
+    # Damaged RUN-STATE.json beside a usable audit.json, and top-level fields only: repair first, restore as fallback.
+    rebuild_ok, detail = True, {}
+    for kind in ('truncated', 'incomplete'):
+        run, _, _ = p8_run('state-' + kind)
+        if kind == 'truncated':
+            write_text_file(run / 'RUN-STATE.json', '{"run_id": "2026-01-01T0000Z_exa')
+        else:
+            state = read_json(run / 'RUN-STATE.json')
+            state.pop('next_steps')
+            write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        info = describe_run(run) or {}
+        guidance = info.get('resume_guidance', '')
+        detail[kind] = guidance
+        rebuild_ok = rebuild_ok and info.get('resumable_with_package') is True and (
+            'rebuild RUN-STATE.json from audit.json, RESUME.md and the evidence' in guidance
+            and 0 <= guidance.find('rebuild') < guidance.find('Offer the verified interim checkpoint')
+            and 'discards all progress' in guidance)
+    control(results, 'RUN_STATE_DAMAGED_REBUILD_FIRST', rebuild_ok, detail)
+    run, _, data = p8_run('top-level-field')
+    data.pop('residual_risks')
+    write_text_file(run / 'audit.json', json.dumps(data))
+    guidance = (describe_run(run) or {}).get('resume_guidance', '')
+    control(results, 'TOP_LEVEL_FIELDS_REPAIR_FIRST', guidance.startswith('Repair live state first')
+            and 'residual_risks' in guidance and 0 <= guidance.find('Repair') < guidance.find('Offer the verified'), guidance)
+
+    # P8/P9 without a verified interim checkpoint: the safe stop of master prompt §16, never continue.
+    safe_ok, detail = True, {}
+    for name, phase, checkpoint_state in (('p8-invalid', 'P8', 'INVALID'), ('p9-absent', 'P9', 'ABSENT'),
+                                          ('p8-absent', 'P8', 'ABSENT')):
+        run, _, _ = p8_run(name, phase, checkpoint_state == 'INVALID')
+        if checkpoint_state == 'INVALID':
+            write_text_file(run / 'checkpoints/interim/files/RESUME.md', 'Tampered.\n')
+        info = describe_run(run) or {}
+        guidance = info.get('resume_guidance', '')
+        detail[name] = guidance
+        safe_ok = safe_ok and (info.get('checkpoint', {}).get('state') == checkpoint_state
+                               and 'do not start or continue P8' in guidance and 'Continue' not in guidance
+                               and 'new linked re-audit run' in guidance and 'NOT_PERFORMED' in guidance
+                               and ('complete P7 instead' in guidance) == (name == 'p8-absent'))
+    control(results, 'P8_WITHOUT_VALID_CHECKPOINT_SAFE_STOP', safe_ok, detail)
+
+    # Closed runs are never resumed; later project changes are information only.
+    run, project, data = write_example_run(root / 'closed-changed', 'go')
+    close_review_run(data, run, project)
+    write_text_file(project / 'src/store.py', EXAMPLE_SOURCE + '# changed after closure\n')
+    legacy = root / 'legacy-closed' / 'r-legacy'
+    write_json_new(legacy / 'audit.json', {'prompt_version': '3.0', 'audit_status': 'PARTIAL'})
+    write_text_file(legacy / 'REPORT.md', '# Report\n')
+    infos = [describe_run(run), describe_run(run, inspect_live=False), describe_run(legacy), describe_run(legacy, inspect_live=False)]
+    control(results, 'CLOSED_RUN_NEVER_RESUMED', all(info is not None and info['resume_guidance'] == CLOSED_GUIDANCE
+                                                      and info['resumable_with_package'] is False for info in infos)
+            and infos[2]['status'] == 'LEGACY_CLOSED_INFERRED' and infos[0]['project_changed_since_run'] is True,
+            [info and (info['status'], info['resume_guidance']) for info in infos])
+    incompatible = root / 'live-states' / 'incompatible'
+    write_json_new(incompatible / 'audit.json', {'schema_version': 'audit-core/1', 'run_id': 'incompatible'})
+    write_json_new(incompatible / 'RUN-STATE.json', {'run_id': 'incompatible', 'closed_at_utc': None})
+    state_only = root / 'live-states' / 'state-only'
+    write_json_new(state_only / 'RUN-STATE.json', {'run_id': 'state-only', 'schema_version': SCHEMA_VERSION,
+                                                   'phase': 'P1', 'closed_at_utc': None})
+    invalid, _, invalid_data = write_example_run(root / 'live-states-invalid', 'interim')
+    invalid_data['findings'][0].pop('title')
+    write_text_file(invalid / 'audit.json', json.dumps(invalid_data))
+    states = {name: (describe_run(path) or {}).get('live_state') for name, path in
+              (('incompatible', incompatible), ('state_only', state_only), ('invalid', invalid))}
+    states['listed'] = (describe_run(invalid, inspect_live=False) or {}).get('live_state')
+    control(results, 'LIVE_STATE_SEPARATES_UNCHECKED_INCOMPATIBLE_INVALID', states == {
+        'incompatible': 'INCOMPATIBLE', 'state_only': 'NOT_CHECKED', 'invalid': 'INVALID_OR_INCOMPLETE',
+        'listed': 'NOT_CHECKED'}, states)
+
+    # resumable_with_package and latest_resumable follow the guidance.
+    corrupt, _, _ = p8_run('corrupt-no-checkpoint', 'P5', checkpoint=False)
+    write_text_file(corrupt / 'audit.json', '{"schema')
+    write_text_file(corrupt / 'RUN-STATE.json', '{"run_id')
+    corrupt_info = describe_run(corrupt) or {}
+    interrupted, _, interrupted_data = p8_run('interrupted-schema')
+    interrupted_data['schema_version'] = 'audit-core/1'
+    write_text_file(interrupted / 'audit.json', json.dumps(interrupted_data))
+    interrupted_results = root / 'interrupted-listing'
+    shutil.copytree(interrupted, interrupted_results / 'interrupted')
+    interrupted_listing = listing(interrupted_results)
+    interrupted_info = next(iter(interrupted_listing.get('runs', [])), {})
+    control(results, 'RESUMABLE_FOLLOWS_GUIDANCE', corrupt_info.get('resumable_with_package') is False
+            and 'not resumable as it is' in corrupt_info.get('resume_guidance', '')
+            and interrupted_info.get('resumable_with_package') is True
+            and 'Offer the verified interim checkpoint' in interrupted_info.get('resume_guidance', '')
+            and interrupted_listing.get('latest_resumable') == 'interrupted',
+            {'corrupt': corrupt_info.get('resume_guidance'), 'interrupted': interrupted_info.get('resume_guidance')})
+
+    # An older open run beside a newer closed one; ordering by parsed UTC time, not by text.
+    mixed = root / 'older-open'
+    write_json_new(mixed / '2026-01-10T0800Z_aaa1111' / 'RUN-STATE.json', {
+        'run_id': '2026-01-10T0800Z_aaa1111', 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION,
+        'phase': 'P3', 'created_at_utc': '2026-01-10T08:00:00Z', 'closed_at_utc': None})
+    write_json_new(mixed / '2026-02-10T0800Z_bbb2222' / 'RUN-STATE.json', {
+        'run_id': '2026-02-10T0800Z_bbb2222', 'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION,
+        'phase': 'P9', 'created_at_utc': '2026-02-10T08:00:00Z', 'closed_at_utc': '2026-02-12T08:00:00Z',
+        'superseded_by_run': None})
+    write_json_new(mixed / '2026-02-10T0800Z_bbb2222' / 'audit.json', {
+        'schema_version': SCHEMA_VERSION, 'run_id': '2026-02-10T0800Z_bbb2222', 'security_review': {'status': 'DONE'}})
+    notes = listing(mixed).get('notes', [])
+    control(results, 'OLDER_OPEN_RUN_BESIDE_NEWER_CLOSED_NOTED', any(
+        '2026-01-10T0800Z_aaa1111' in note and '2026-02-10T0800Z_bbb2222' in note and 'not the default' in note
+        and 'user decides' in note for note in notes), notes)
+    ordered = root / 'ordered'
+    for name, created in (('run-later', '2026-04-01T08:00:50Z'), ('run-offset', '2026-04-01T09:30:00+02:00'),
+                          ('run-earlier', '2026-04-01T08:00:10Z')):
+        write_json_new(ordered / name / 'RUN-STATE.json', {'run_id': name, 'schema_version': SCHEMA_VERSION,
+                                                           'prompt_version': PROMPT_VERSION, 'phase': 'P2',
+                                                           'created_at_utc': created, 'closed_at_utc': None})
+    order = [item['dir'] for item in listing(ordered).get('runs', [])]
+    control(results, 'RUNS_ORDERED_BY_UTC_TIME', order == ['run-offset', 'run-earlier', 'run-later'], order)
+
+    # The restore the guidance names leaves validate and checkpoint verify passing.
+    run, project, data = p8_run('restore-procedure')
+    write_text_file(run / 'audit.json', '{interrupted')
+    write_text_file(run / 'evidence/after-checkpoint.txt', 'Created after the checkpoint.\n')
+    guidance = (describe_run(run) or {}).get('resume_guidance', '')
+    restore_checkpoint(run, False)
+    issues, _ = validate_audit(read_json(run / 'audit.json'), run, project, final=True)
+    fresh, fresh_project, _ = write_example_run(root / 'recovery-before-create', 'interim')
+    write_text_file(fresh / 'recovery-20260101T000000Z/audit.json', '{interrupted')
+    created = create_checkpoint(fresh, fresh_project)
+    control(results, 'RESTORE_PROCEDURE_KEEPS_VALIDATION', all(
+        part in guidance for part in ('checkpoint restore <run>', 'recovery-<UTC>/', 'RUN-STATE.json last',
+                                      'run validate', 'created after the checkpoint in place'))
+            and not issues.errors and verify_checkpoint(run)['state'] == 'VALID' and created['state'] == 'VALID'
+            and not any('recovery-' in rel for rel in read_json(fresh / 'checkpoints/interim/manifest.json')['sha256']),
+            {'errors': sorted(issues.codes()), 'guidance': guidance})
+
+    # checkpoint create refuses a RUN-STATE.json that is no object or belongs to another run; nothing is written.
+    refused_all, detail = True, {}
+    for kind, text in (('other-id', None), ('non-object', '[]')):
+        run, project, data = write_example_run(root / ('create-' + kind), 'interim')
+        if text is None:
+            state = read_json(run / 'RUN-STATE.json')
+            state['run_id'] = data['run_id'] + '-2'
+            text = json.dumps(state)
+        write_text_file(run / 'RUN-STATE.json', text)
+        try:
+            create_checkpoint(run, project)
+            refused, detail[kind] = False, 'created'
+        except ToolError as exc:
+            refused, detail[kind] = 'run_id' in str(exc), str(exc)
+        refused_all = refused_all and refused and not (run / 'checkpoints').exists()
+    control(results, 'CHECKPOINT_CREATE_REFUSES_FOREIGN_RUN_STATE', refused_all, detail)
+
+    # Operating-system metadata in the checkpoint tree is ignored; other inventory errors name the entry.
+    run, project, _ = write_example_run(root / 'os-metadata', 'interim')
+    create_checkpoint(run, project)
+    for rel in ('.DS_Store', 'interim/Thumbs.db', 'interim/files/.DS_Store', 'interim/files/evidence/desktop.ini'):
+        (run / 'checkpoints' / rel).write_bytes(b'\0\0\0\1Bud1')
+    metadata_state = verify_checkpoint(run)['state']
+    write_text_file(run / 'checkpoints/interim/files/evidence/stray.txt', 'Added after creation.\n')
+    stray = verify_checkpoint(run).get('error', '')
+    (run / 'checkpoints/interim/files/evidence/stray.txt').unlink()
+    write_text_file(run / 'checkpoints/interim/stray-envelope.txt', 'Added after creation.\n')
+    envelope = verify_checkpoint(run).get('error', '')
+    control(results, 'CHECKPOINT_IGNORES_OS_METADATA', metadata_state == 'VALID', metadata_state)
+    control(results, 'CHECKPOINT_INVENTORY_ERROR_NAMES_ENTRY', 'unexpected evidence/stray.txt' in stray
+            and 'unexpected interim/stray-envelope.txt' in envelope, {'files': stray, 'envelope': envelope})
+
+    # A Markdown link destination with balanced parentheses is stored, not reported missing.
+    run, project, _ = write_example_run(root / 'parentheses', 'interim')
+    write_text_file(run / 'evidence/ui/login(1).png', 'Synthetic screenshot.\n')
+    report_reference('[Screenshot](evidence/ui/login(1).png)')({}, run, project)
+    try:
+        created = create_checkpoint(run, project)
+        stored = created['state'] == 'VALID' and 'evidence/ui/login(1).png' in read_json(
+            run / 'checkpoints/interim/manifest.json')['sha256']
+    except ToolError as exc:
+        stored = False
+        created = {'error': str(exc)}
+    control(results, 'CHECKPOINT_LINK_WITH_PARENTHESES', stored, created)
+
+    # The not_snapshotted inventory is required, also when nothing was left out.
+    run, project, _ = write_example_run(root / 'no-omissions', 'interim')
+    create_checkpoint(run, project)
+    snapshot, manifest_path = run / 'checkpoints/interim/files', run / 'checkpoints/interim/manifest.json'
+    saved = read_json(snapshot / 'audit.json')
+    for register, field in (('sources', 'ref'), ('components', 'ref'), ('evidence', 'ref'), ('security_scope', 'ref'),
+                            ('test_assessments', 'ref'), ('doc_claims', 'source')):
+        for record in saved.get(register) or []:
+            record.pop(field, None)
+    for register in ('evidence', 'findings'):
+        for record in saved.get(register) or []:
+            record['code_refs'] = []
+    write_text_file(snapshot / 'audit.json', json.dumps(saved))
+    manifest = read_json(manifest_path)
+    manifest['sha256']['audit.json'] = sha256_file(snapshot / 'audit.json')
+    manifest['not_snapshotted'] = []
+    manifest['tool_version'] = 'earlier'
+
+    def write_anchored(content: dict[str, Any]) -> None:
+        write_text_file(manifest_path, json.dumps(content))
+        anchored = read_json(run / 'RUN-STATE.json')
+        anchored['interim_checkpoint'] = dict(anchored.get('interim_checkpoint') or {},
+                                              manifest_sha256=sha256_file(manifest_path))
+        write_text_file(run / 'RUN-STATE.json', json.dumps(anchored))
+    write_anchored(manifest)
+    with_key = verify_checkpoint(run)['state']
+    manifest.pop('not_snapshotted')
+    write_anchored(manifest)
+    control(results, 'CHECKPOINT_REQUIRES_NOT_SNAPSHOTTED', checkpoint_files(snapshot, saved)[1] == []
+            and with_key == 'VALID' and verify_checkpoint(run)['state'] == 'INVALID', with_key)
+
+    # Without a readable live run_id, the checkpoint must belong to the run directory's name.
+    source, project, data = write_example_run(root / 'snapshot-source', 'interim')
+    create_checkpoint(source, project)
+    verdicts = {}
+    for name in ('2026-05-05T0505Z_other00', data['run_id']):
+        target = root / 'unreadable-live' / name
+        shutil.copytree(source / 'checkpoints', target / 'checkpoints')
+        write_text_file(target / 'RUN-STATE.json', '{"run_id": "2026-05-05T05')
+        verdicts[name] = verify_checkpoint(target)['state']
+    control(results, 'CHECKPOINT_WITHOUT_LIVE_ID_BINDS_DIRECTORY', verdicts == {
+        '2026-05-05T0505Z_other00': 'INVALID', data['run_id']: 'VALID'}, verdicts)
+
+    # init writes the same run type into RUN-STATE.json and audit.json.
+    project = root / 'init-project'
+    write_text_file(project / 'app.txt', 'x\n')
+    code, output = run_cli('init', '--project', str(project), '--results-dir', str(root / 'init-results'), '--mode', 'filesystem')
+    run_dir = Path(json_head(output).get('run_dir', str(root / 'missing-init')))
+    types = [read_json(run_dir / name).get('run_type') if (run_dir / name).is_file() else 'missing'
+             for name in ('RUN-STATE.json', 'audit.json')]
+    control(results, 'INIT_RUN_TYPE_CONSISTENT', code == 0 and types == ['INITIAL', 'INITIAL'], types)
+    return results
+
+
+def file_marks(run: Path) -> dict[str, Any]:
+    """Content and modification time of every file in a run directory; equal marks mean nothing was written."""
+    return {path.relative_to(run).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in sorted(run.rglob('*')) if path.is_file()}
+
+
+def run_closure_controls(root: Path) -> list[dict[str, Any]]:
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+
+    def close(*arguments: str) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(['close', *arguments])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    run, project, data = write_example_run(root / 'undecided-interim', 'nogo')
+    unexecuted_check()(data, run, project)
+    issues, _ = validate_audit(data, run, project, final=False)
+    control(results, 'UNDECIDED_SILENT_DURING_WORK', not issues.errors
+            and not any(item['code'].endswith('_CHECK_UNDECIDED') for item in issues.warnings), issues.warnings)
+    run, project, data = write_example_run(root / 't1-interim', 'nogo')
+    second_t1_journey()(data, run, project)
+    issues, _ = validate_audit(data, run, project, final=False)
+    control(results, 'T1_UNEXERCISED_WARNING_DURING_WORK', not issues.errors
+            and 'W_T1_UNEXERCISED' in {w['code'] for w in issues.warnings}, sorted(issues.codes()))
+    control(results, 'EXAMPLES_MARK_SCOPE_CHECKS_SECURITY', all(
+        all(entry(example, 'checks', cid).get('security') is True
+            for area in example['security_scope'] for cid in area['check_ids'])
+        for example in (example_audit(), example_go_audit(), example_interim_audit())))
+
+    project = root / 'init-project'
+    write_text_file(project / 'README.md', EXAMPLE_README)
+    write_text_file(project / 'src' / 'store.py', EXAMPLE_SOURCE)
+    code, output = run_cli('init', '--project', str(project), '--mode', 'filesystem')
+    created = json_head(output)
+    skeleton_path = Path(created.get('audit_json', root / 'missing'))
+    skeleton = skeleton_path.read_bytes() if skeleton_path.is_file() else b''
+    state = read_json(skeleton_path.parent / 'RUN-STATE.json') if skeleton else {}
+    interim_code, interim = run_cli('validate', str(skeleton_path.parent), '--json')
+    interim_result = json_head(interim)
+    control(results, 'INIT_WRITES_VALID_AUDIT_SKELETON', code == 0 and bool(skeleton) and interim_code == 0
+            and interim_result.get('errors') == [] and json.loads(skeleton).get('run_id') == created.get('run_id')
+            and any('audit.json' in step for step in state.get('next_steps', []))
+            and (skeleton_path.parent / 'evidence' / 'inventory').is_dir(),
+            interim_result.get('errors'))
+    code, output = run_cli('runs', '--project', str(project))
+    listed = next(iter(json_head(output).get('runs', [])), {})
+    control(results, 'INIT_SKELETON_RUNS_LIVE_VALID', code == 0 and listed.get('live_state') == 'VALID'
+            and listed.get('status') == 'OPEN', listed)
+    final_code, final = run_cli('validate', str(skeleton_path.parent), '--final', '--json')
+    final_errors = json_head(final).get('errors', [])
+    control(results, 'INIT_SKELETON_FAILS_FINAL', final_code == 1
+            and sorted(e['where'] for e in final_errors if e['code'] == 'E_FINAL_EMPTY')
+            == ['checks', 'components', 'journeys', 'objectives']
+            and 'E_FINAL_FILE' in {e['code'] for e in final_errors}, sorted({e['code'] for e in final_errors}))
+    code, output = run_cli('init', '--project', str(project), '--mode', 'filesystem')
+    second = Path(json_head(output).get('audit_json', root / 'missing'))
+    control(results, 'INIT_NEVER_OVERWRITES_AUDIT_JSON', code == 0 and skeleton_path.is_file()
+            and skeleton_path.read_bytes() == skeleton
+            and second.is_file() and second.parent != skeleton_path.parent)
+
+    run, project, data = write_example_run(root / 'close-ok', 'nogo')
+    before_state, before_audit, started = read_json(run / 'RUN-STATE.json'), (run / 'audit.json').read_bytes(), utc_now()
+    code, output, errors = close(str(run), '--project', str(project))
+    after = read_json(run / 'RUN-STATE.json')
+    printed = json_head(output)
+    stamp = after.get('closed_at_utc')
+    control(results, 'CLOSE_RECORDS_CURRENT_TIMESTAMP_ONLY', code == 0 and isinstance(stamp, str)
+            and started <= stamp <= utc_now() and after.get('updated_at_utc') == stamp
+            and {k: v for k, v in after.items() if k not in ('closed_at_utc', 'updated_at_utc', 'closure')}
+            == {k: v for k, v in before_state.items() if k != 'updated_at_utc'}
+            and (run / 'audit.json').read_bytes() == before_audit
+            and after.get('closure') == {'recorded_by': 'close', 'tool_version': TOOL_VERSION,
+                                         'audit_sha256': sha256_bytes(before_audit)}
+            and printed == {'run_id': data['run_id'], 'closed_at_utc': stamp, 'audit_status': 'PARTIAL',
+                            'release_status': 'NO_GO', 'security_review': {'status': 'DONE'},
+                            'warnings': printed.get('warnings'), 'closure': after.get('closure'),
+                            'closure_review_entries': printed.get('closure_review_entries'),
+                            'closure_review_note': printed.get('closure_review_note')}
+            and type(printed.get('warnings')) is int and type(printed.get('closure_review_entries')) is int
+            and not list(run.glob('.RUN-STATE.json.*')) and (describe_run(run) or {}).get('status') == 'CLOSED'
+            and not validate_audit(data, run, project, final=True)[0].errors, {'output': output, 'errors': errors})
+    marks = file_marks(run)
+    code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_REFUSES_CLOSED_RUN', code == 2 and 'already closed' in errors and file_marks(run) == marks, errors)
+
+    refusals: list[tuple[str, str, Mutation, int, str]] = [
+        ('CLOSE_REFUSES_FINAL_VALIDATION_ERROR', 'nogo', overwrite('REPORT.md', ''), 1, 'final validation failed'),
+        ('CLOSE_REFUSES_SECURITY_PENDING', 'interim', lambda d, r, p: None, 2, 'checkpoint create'),
+        ('CLOSE_REFUSES_SECURITY_IN_PROGRESS', 'interim', chain(checkpointed, started_security,
+            lambda d, r, p: d['security_review'].update(status='IN_PROGRESS')), 2, 'first record NOT_PERFORMED with the user decision'),
+        ('CLOSE_REFUSES_MISSING_RUN_STATE', 'nogo', unlink('RUN-STATE.json'), 2, 'RUN-STATE.json missing or unreadable'),
+        ('CLOSE_REFUSES_UNREADABLE_RUN_STATE', 'nogo', overwrite('RUN-STATE.json', '{interrupted'), 2,
+         'RUN-STATE.json missing or unreadable'),
+    ]
+    for control_id, variant, mutation, expected_code, message in refusals:
+        run, project, data = write_example_run(root / control_id.lower(), variant)
+        mutation(data, run, project)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        marks = file_marks(run)
+        code, output, errors = close(str(run), '--project', str(project))
+        control(results, control_id, code == expected_code and message in errors and 'rolled back' not in errors
+                and file_marks(run) == marks, {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'close-rollback', 'nogo')
+    original, real_validation = (run / 'RUN-STATE.json').read_bytes(), validate_audit
+
+    def late_error(*arguments: Any, **options: Any) -> tuple[Issues, dict[str, Any]]:
+        issues, counts = real_validation(*arguments, **options)
+        if 'checkpoints' in Path(arguments[1]).parts:  # the interim snapshot, revalidated as created
+            return issues, counts
+        if late_error.calls:
+            issues.error('E_SYNTHETIC', 'RUN-STATE.json', 'Synthetic error after closure.')
+        late_error.calls += 1
+        return issues, counts
+    late_error.calls = 0  # type: ignore[attr-defined]
+    with patch(__name__ + '.validate_audit', side_effect=late_error):
+        code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_ROLLS_BACK_ON_LATE_ERROR', code == 1 and 'rolled back' in errors
+            and (run / 'RUN-STATE.json').read_bytes() == original and not list(run.glob('.RUN-STATE.json.*')),
+            {'exit': code, 'stderr': errors})
+
+    def successor_of(run: Path, project: Path, previous: list[str]) -> str:
+        code, output = run_cli('init', '--project', str(project), '--results-dir', str(run.parent), '--mode', 'filesystem')
+        successor = Path(json_head(output)['run_dir'])
+        audit = read_json(successor / 'audit.json') if (successor / 'audit.json').is_file() else {
+            'run_id': successor.name, 'schema_version': SCHEMA_VERSION}
+        audit['previous_run_ids'] = previous
+        write_text_file(successor / 'audit.json', json.dumps(audit))
+        return successor.name
+
+    run, project, data = write_example_run(root / 'supersede-ok', 'interim')
+    write_text_file(run / 'REPORT.md', '')  # a superseded run need not pass final validation
+    successor = successor_of(run, project, [data['run_id']])
+    before_state, before_audit = read_json(run / 'RUN-STATE.json'), (run / 'audit.json').read_bytes()
+    code, output, errors = close(str(run), '--superseded-by', successor)
+    after = read_json(run / 'RUN-STATE.json')
+    control(results, 'CLOSE_SUPERSESSION_RECORDS_SUCCESSOR', code == 0 and after.get('superseded_by_run') == successor
+            and isinstance(after.get('closed_at_utc'), str) and after.get('updated_at_utc') == after['closed_at_utc']
+            and {k: v for k, v in after.items() if k not in ('closed_at_utc', 'updated_at_utc', 'superseded_by_run',
+                                                             'closure')}
+            == {k: v for k, v in before_state.items() if k != 'updated_at_utc'}
+            and (run / 'audit.json').read_bytes() == before_audit
+            and after.get('closure') == {'recorded_by': 'close', 'tool_version': TOOL_VERSION,
+                                         'audit_sha256': sha256_bytes(before_audit), 'superseded': True}
+            and (describe_run(run, inspect_live=False) or {}).get('status') == 'CLOSED', {'exit': code, 'stderr': errors})
+    # A run closed by supersession claims no validation: runs says so and never offers it as the closed base.
+    code_runs, output_runs = run_cli('runs', '--results-dir', str(run.parent))
+    superseded_listing = json_head(output_runs) if code_runs == 0 else {}
+    superseded_entry = next((item for item in superseded_listing.get('runs', []) if item.get('dir') == run.name), {})
+    control(results, 'RUNS_MARKS_SUPERSEDED_CLOSURE_AS_NO_CLOSED_BASE', superseded_entry.get('status') == 'CLOSED'
+            and superseded_entry.get('closure_superseded') is True and superseded_entry.get('superseded_by_run') == successor
+            and superseded_listing.get('latest_closed') != run.name
+            and any('closed by supersession' in note and run.name in note for note in superseded_listing.get('notes', [])),
+            {'entry': {key: superseded_entry.get(key) for key in ('status', 'closure_superseded', 'superseded_by_run')},
+             'latest_closed': superseded_listing.get('latest_closed'), 'notes': superseded_listing.get('notes')})
+    for control_id, kind in (('CLOSE_SUPERSESSION_REFUSES_MISSING_SUCCESSOR', 'missing'),
+                             ('CLOSE_SUPERSESSION_REFUSES_UNLINKED_SUCCESSOR', 'unlinked'),
+                             ('CLOSE_SUPERSESSION_REFUSES_SAME_RUN', 'same')):
+        run, project, data = write_example_run(root / control_id.lower(), 'interim')
+        if kind == 'missing':
+            successor = 'missing-successor'
+        elif kind == 'unlinked':
+            successor = successor_of(run, project, [])
+        else:  # the run itself, named and linked like a valid successor
+            run = run.rename(run.parent / data['run_id'])
+            data['previous_run_ids'] = [data['run_id']]
+            write_text_file(run / 'audit.json', json.dumps(data))
+            successor = data['run_id']
+        marks = file_marks(run)
+        code, output, errors = close(str(run), '--superseded-by', successor)
+        control(results, control_id, code == 2 and 'previous_run_ids' in errors and file_marks(run) == marks,
+                {'exit': code, 'stderr': errors})
+
+    for status, prepare in (('BLOCKED', chain(checkpointed, started_security,
+                                              lambda d, r, p: d['security_review'].update(status='BLOCKED'),
+                                              flagged_check_not_run(deferral=VALID_DEFERRAL),
+                                              lambda d, r, p: d['sources'].append(dict(USER_DECISION_SOURCE)),
+                                              report_lists('CHK-001', 'SRC-USER'))),
+                            ('NOT_APPLICABLE', valid_security_na), ('NOT_PERFORMED', valid_not_performed)):
+        run, project, data = write_example_run(root / ('close-' + status.lower()), 'go' if status == 'NOT_APPLICABLE' else 'interim')
+        prepare(data, run, project)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        code, output, errors = close(str(run), '--project', str(project))
+        control(results, 'CLOSE_ACCEPTS_SECURITY_' + status, code == 0
+                and json_head(output).get('security_review') == {'status': status}
+                and isinstance(read_json(run / 'RUN-STATE.json').get('closed_at_utc'), str)
+                and (describe_run(run) or {}).get('status') == 'CLOSED', {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'inventory-dir', 'interim')
+    (run / 'evidence' / 'inventory').mkdir()
+    issues, _ = validate_audit(data, run, project, final=True)
+    created = create_checkpoint(run, project)
+    control(results, 'EMPTY_INVENTORY_DIR_VALIDATES_AND_CHECKPOINTS', not issues.errors and created['state'] == 'VALID'
+            and verify_checkpoint(run)['state'] == 'VALID', {'errors': sorted(issues.codes()), 'checkpoint': created})
+    run, project, data = write_example_run(root / 'inventory-close', 'nogo')
+    (run / 'evidence' / 'inventory').mkdir()
+    code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_ACCEPTS_EMPTY_INVENTORY_DIR', code == 0, {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'close-unencodable', 'nogo')
+    write_text_file(run / 'RUN-STATE.json', json.dumps(dict(read_json(run / 'RUN-STATE.json'), note='\ud800')))
+    marks = file_marks(run)
+    code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_REFUSES_UNENCODABLE_RUN_STATE', code == 2 and 'cannot be written as UTF-8' in errors
+            and 'Traceback' not in errors and file_marks(run) == marks, {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'close-locked', 'nogo')
+    marks = file_marks(run)
+    with patch.object(os, 'replace', side_effect=PermissionError(13, 'Synthetic lock')):
+        code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_REFUSES_LOCKED_RUN_STATE', code == 2 and 'could not be written' in errors
+            and file_marks(run) == marks, {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'close-read-only', 'nogo')
+    state_path = run / 'RUN-STATE.json'
+    if os.name != 'nt' and os.geteuid() == 0:
+        results.append({'id': 'CLOSE_REFUSES_READ_ONLY_RUN_STATE', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': 'root ignores file permissions'})
+    else:
+        os.chmod(state_path, 0o444)
+        if os.name != 'nt':
+            os.chmod(run, 0o555)  # POSIX replaces a read-only file in a writable directory
+        try:
+            marks = file_marks(run)
+            code, output, errors = close(str(run), '--project', str(project))
+            unchanged = file_marks(run) == marks
+        finally:
+            os.chmod(run, 0o755)
+            os.chmod(state_path, 0o644)
+        control(results, 'CLOSE_REFUSES_READ_ONLY_RUN_STATE', code == 2 and 'could not be written' in errors and unchanged,
+                {'exit': code, 'stderr': errors})
+
+    run, project, data = write_example_run(root / 'close-rollback-fails', 'nogo')
+    real_replace, late_error.calls = replace_file_atomic, 0  # type: ignore[attr-defined]
+
+    def restore_fails(path: Path, content: bytes) -> None:
+        if restore_fails.calls:
+            raise PermissionError(13, 'Synthetic lock during restore')
+        restore_fails.calls += 1
+        real_replace(path, content)
+    restore_fails.calls = 0  # type: ignore[attr-defined]
+    with patch(__name__ + '.validate_audit', side_effect=late_error), patch(__name__ + '.replace_file_atomic',
+                                                                           side_effect=restore_fails):
+        code, output, errors = close(str(run), '--project', str(project))
+    control(results, 'CLOSE_FAILED_ROLLBACK_DEMANDS_MANUAL_REPAIR', code == 2 and 'closed_at_utc' in errors
+            and 'by hand' in errors and 'Traceback' not in errors
+            and isinstance(read_json(run / 'RUN-STATE.json').get('closed_at_utc'), str), {'exit': code, 'stderr': errors})
+
+    sample = root / 'mode' / 'sample.json'
+    write_text_file(sample, '{}\n')
+    if os.name == 'nt':
+        results.append({'id': 'ATOMIC_REPLACE_KEEPS_MODE', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': 'POSIX permission bits only'})
+    else:
+        os.chmod(sample, 0o640)
+        replace_file_atomic(sample, b'{"replaced": true}\n')
+        control(results, 'ATOMIC_REPLACE_KEEPS_MODE', os.stat(sample).st_mode & 0o7777 == 0o640
+                and sample.read_bytes() == b'{"replaced": true}\n' and not list(sample.parent.glob('.sample.json.*')),
+                oct(os.stat(sample).st_mode & 0o7777))
+
+    guard = ("import runpy, sys; sys.version_info = (3, 9, 18, 'final', 0); sys.version = '3.9.18 (simulated)'; "
+             f"sys.argv = [{str(Path(__file__).resolve())!r}, '--help']; runpy.run_path(sys.argv[0], run_name='__main__')")
+    proc = subprocess.run([sys.executable, '-c', guard], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    stderr = proc.stderr.decode('utf-8', 'replace')
+    control(results, 'INTERPRETER_GUARD_REFUSES_OLD_PYTHON', proc.returncode == 2 and not proc.stdout
+            and stderr.strip() == 'audit_tools.py requires Python 3.10 or newer, found 3.9.18; run it with python3 or py -3.10.',
+            {'exit': proc.returncode, 'stderr': stderr})
+
+    fake = [{'id': 'SYNTHETIC_PASS', 'kind': 'TOOL_CONTROL', 'result': 'PASS'},
+            {'id': 'SYNTHETIC_FAIL', 'kind': 'TOOL_CONTROL', 'result': 'FAIL', 'detail': 'synthetic'}]
+    printed_runs = []
+    for out in (None, root / 'selftest-report.json'):
+        stdout = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for name in SELFTEST_RUNNERS:
+                stack.enter_context(patch(f'{__name__}.{name}', return_value=fake if name == 'run_tool_controls' else []))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            code = cmd_selftest(argparse.Namespace(out=str(out) if out else None))
+        printed_runs.append((code, json_head(stdout.getvalue())))
+    (plain_code, plain), (file_code, with_file) = printed_runs
+    report = read_json(root / 'selftest-report.json') if (root / 'selftest-report.json').is_file() else {}
+    control(results, 'SELFTEST_PRINTS_SUMMARY_AND_FAILED_ENTRIES', plain_code == 1 and file_code == 1
+            and plain.get('failed') == ['SYNTHETIC_FAIL'] and plain.get('failed_results') == [fake[1]]
+            and 'results' not in plain and 'TOOL_CONTROL' in plain and 'failed_results' not in with_file
+            and with_file.get('failed') == ['SYNTHETIC_FAIL'] and report.get('results') == fake, plain)
     return results
 
 
@@ -4725,7 +12055,7 @@ def cleanup_link_control_ok(linked: bool, cleanup_ok: bool) -> bool:
 def run_tool_controls(root: Path) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     workspace, evidence = root / 'ws', root / 'run' / 'evidence' / 'logs'
-    write_text_file(workspace / WORKSPACE_MARKER, '{}')
+    write_fixture_marker(workspace)
     write_text_file(root / 'run' / 'RUN-STATE.json', '{}')
     python = sys.executable
 
@@ -5199,10 +12529,13 @@ def run_workspace_safeguard_controls(root: Path, results: list[dict[str, Any]] |
     content = 'a = 1\n\x0c\ns = "a\u2028b"\ntarget_line_value = 4242\n'
     with open(ff_project / 'src' / 'mod.py', 'w', encoding='utf-8', newline='\n') as handle:
         handle.write(content)
+    captured = read_json(run_dir / 'evidence' / 'baseline' / 'baseline-start.json')['captured_at_utc']
     (run_dir / 'evidence' / 'baseline' / 'baseline-start.json').unlink()
     snap, _ = take_snapshot(ff_project, mode='filesystem', with_side_effects=False)
+    snap['captured_at_utc'] = captured  # the example's run logs carry the first capture time
     write_json_new(run_dir / 'evidence' / 'baseline' / 'baseline-start.json', snap)
     data['baseline']['fingerprint'] = snap['content_fingerprint']
+    renew_checkpoint(data, run_dir, ff_project)
     data['findings'][0]['code_refs'].append({'path': 'src/mod.py', 'line_start': 4, 'line_end': 4,
                                              'excerpt': 'target_line_value = 4242'})
     issues, _ = validate_audit(data, run_dir, ff_project, final=True)
@@ -5239,10 +12572,1665 @@ def run_workspace_safeguard_controls(root: Path, results: list[dict[str, Any]] |
     return results
 
 
+def deny_read(path: Path) -> Callable[[], None] | None:
+    """Selftest: make a file or directory unreadable for the current user; returns the undo, or None if impossible
+    (POSIX root reads everything)."""
+    if os.name == 'nt':
+        user = (os.environ.get('USERDOMAIN', '') + '\\' if os.environ.get('USERDOMAIN') else '') + os.environ.get('USERNAME', '')
+        def icacls(*arguments: str) -> bool:
+            return subprocess.run(['icacls', str(path), *arguments], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=30).returncode == 0
+        if not os.environ.get('USERNAME') or not icacls('/deny', f'{user}:(RD)'):
+            return None
+
+        def undo() -> None:
+            icacls('/remove:d', user)
+        return undo
+    if os.geteuid() == 0:
+        return None
+    mode = path.stat().st_mode & 0o777
+    os.chmod(path, 0)
+    return lambda: os.chmod(path, mode)
+
+
+def run_workspace_fix_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Controls for baseline, workspace, envkeys and cleanup: input validation, credential withholding, links and
+    junctions, unreadable and special files, completeness."""
+    results = [] if results is None else results
+    python = sys.executable
+
+    def skip(control_id: str, reason: str) -> None:
+        results.append({'id': control_id, 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED', 'detail': reason})
+
+    def guarded(control_id: str, check: Callable[[], None]) -> None:
+        try:
+            check()
+        except Exception as exc:  # a broken fixture fails its own control, not the whole group
+            control(results, control_id, False, f'Control aborted: {exc.__class__.__name__}: {exc}')
+
+    def symlinks_possible(where: Path) -> bool:
+        where.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink('.', where / 'probe-link', target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+    def secret_value_files_uncapped() -> None:
+        # the file holding the secret sorts after more than 1000 other value files
+        project, dest, logs = root / 'w1-project', root / 'w1-copy', root / 'w1-logs'
+        value = 'Synth' + 'LateValue' + '5521qz'
+        for index in range(1001):
+            write_text_file(project / 'lib' / f'pkg{index // 100}' / f'fixture{index}.js',
+                            f'const api_key = "Synth{index}Fx7kLm9Qw";\n')
+        write_text_file(project / 'zz' / 'settings.py', f'SMTP_PASSWORD = "{value}"\n')
+        code_ws, output = run_cli('workspace', '--project', str(project), '--dest', str(dest), '--mode', 'filesystem',
+                                  '--no-git-snapshot')
+        total = json_head(output).get('secret_value_files_total')
+        marker = read_json(dest / WORKSPACE_MARKER) if (dest / WORKSPACE_MARKER).is_file() else {}
+        code_run, output = run_cli('run', '--id', 'W1', '--evidence-dir', str(logs), '--cwd', str(dest), '--', python,
+                                   '-c', 'print(open("zz/settings.py").read().split("=")[1])')
+        log = (logs / 'W1.log').read_text(encoding='utf-8', errors='replace') if (logs / 'W1.log').is_file() else ''
+        listed = marker.get('secret_value_files', [])
+        control(results, 'WORKSPACE_MARKER_KEEPS_EVERY_SECRET_VALUE_FILE', code_ws == 0 and code_run == 0
+                and len(listed) == 1002 and 'zz/settings.py' in listed and total == 1002 and bool(log)
+                and value not in log + output, {'workspace': code_ws, 'run': code_run, 'listed': len(listed),
+                                                'total': total, 'leaked': value in log + output})
+    guarded('WORKSPACE_MARKER_KEEPS_EVERY_SECRET_VALUE_FILE', secret_value_files_uncapped)
+
+    def workspace_input_validation() -> None:
+        project = root / 'w2-project'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        write_text_file(project / 'build' / 'gen.txt', 'generated\n')
+        outside, record, dest_file = root / 'w2-outside.txt', root / 'w2-record.json', root / 'w2-dest-file'
+        for path in (outside, record, dest_file):
+            write_text_file(path, '{}\n')
+        refused = {}
+        for label, dest, extra in (('record_exists', root / 'w2-copy1', ['--record', str(record)]),
+                                   ('dest_is_file', dest_file, []),
+                                   ('include_empty', root / 'w2-copy2', ['--include', '']),
+                                   ('include_outside', root / 'w2-copy3', ['--include', str(outside)]),
+                                   ('include_parent', root / 'w2-copy4', ['--include', '../w2-outside.txt'])):
+            code, output = run_cli('workspace', '--project', str(project), '--dest', str(dest), '--mode', 'filesystem',
+                                   '--no-git-snapshot', *extra)
+            refused[label] = (code == 2 and 'Traceback' not in output and 'Error: ' in output
+                              and (dest.is_file() if dest == dest_file else not dest.exists())
+                              and (label != 'include_empty' or 'names no path inside the project' in output))
+        dest = root / 'w2-copy5'
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(dest), '--mode', 'filesystem',
+                               '--no-git-snapshot', '--include', str(project / 'build' / 'gen.txt'), '--include',
+                               'nomatch*')
+        summary = json_head(output)
+        accepted = (code == 0 and summary.get('explicitly_included') == ['build/gen.txt']
+                    and (dest / 'build' / 'gen.txt').is_file() and summary.get('include_unmatched') == ['nomatch*'])
+        control(results, 'WORKSPACE_VALIDATES_INPUT_BEFORE_WRITING', all(refused.values()) and accepted,
+                {'refused': refused, 'absolute_include_and_unmatched': accepted})
+    guarded('WORKSPACE_VALIDATES_INPUT_BEFORE_WRITING', workspace_input_validation)
+
+    def no_default_excludes_inherited() -> None:
+        project, copy = root / 'w3-project', root / 'w3-copy'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        write_text_file(project / 'build' / 'gen.py', 'g = 1\n')
+        code_init, output = run_cli('init', '--project', str(project), '--mode', 'filesystem', '--no-default-excludes')
+        baseline = str(json_head(output).get('baseline', ''))
+        code_cmp, output = run_cli('baseline', '--project', str(project), '--compare', baseline)
+        compare = json_head(output).get('compare', {})
+        code_ws, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--expect-baseline',
+                                  baseline, '--no-git-snapshot')
+        expected = json_head(output).get('expected_baseline') or {}
+        control(results, 'BASELINE_AND_WORKSPACE_INHERIT_NO_DEFAULT_EXCLUDES', code_init == 0 and code_cmp == 0
+                and compare.get('identical') is True and code_ws == 0 and expected.get('matches') is True
+                and (copy / 'build' / 'gen.py').is_file(),
+                {'init': code_init, 'compare': code_cmp, 'removed': compare.get('removed'), 'workspace': code_ws})
+    guarded('BASELINE_AND_WORKSPACE_INHERIT_NO_DEFAULT_EXCLUDES', no_default_excludes_inherited)
+
+    def snapshot_commits_ignored_copies() -> None:
+        project, copy = root / 'w4-project', root / 'w4-copy'
+        write_text_file(project / '.gitignore', 'dist/\n')
+        write_text_file(project / 'index.js', 'main\n')
+        write_text_file(project / 'dist' / 'index.js', 'built\n')
+        identity = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                    'GIT_COMMITTER_EMAIL': 't@t'}
+        run_git(['init', '-q'], project)
+        run_git(['add', '.gitignore', 'index.js'], project)
+        run_git(['add', '-f', 'dist/index.js'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        commit = run_git(['commit-tree', tree, '--no-gpg-sign', '-m', 'init'], project, env=identity).decode().strip()
+        run_git(['update-ref', 'HEAD', commit], project)
+        code, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy))
+        listed = split_z(run_git(['ls-files', '-z'], copy)) if (copy / '.git').is_dir() else []
+        if (copy / 'dist' / 'index.js').is_file():
+            write_text_file(copy / 'dist' / 'index.js', 'changed in the copy\n')
+        status = run_git(['status', '--porcelain'], copy).decode() if (copy / '.git').is_dir() else ''
+        control(results, 'WORKSPACE_SNAPSHOT_COMMITS_IGNORED_COPIES', code == 0 and 'dist/index.js' in listed
+                and 'dist/index.js' in status, {'exit': code, 'listed': listed, 'status': status.strip()})
+    if git_available():
+        guarded('WORKSPACE_SNAPSHOT_COMMITS_IGNORED_COPIES', snapshot_commits_ignored_copies)
+    else:
+        skip('WORKSPACE_SNAPSHOT_COMMITS_IGNORED_COPIES', 'git unavailable')
+
+    def credential_names_withheld() -> None:
+        project, copy = root / 'w5-project', root / 'w5-copy'
+        secret_names = ['docker/db.env', 'prod.env', '.envrc', '_netrc', 'pgpass.conf', '.aws/credentials',
+                        '.docker/config.json', 'local.settings.json']
+        public_names = ['id_rsa.pub', '.env.production.example', 'settings.env.sample', 'server.key.template',
+                        'app.env.dist', 'docker/config.json']
+        for rel in secret_names + public_names:
+            write_text_file(project / rel, 'SYNTH_FIXTURE=1\n')
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        withheld = json_head(output).get('withheld_credential_files')
+        control(results, 'WORKSPACE_WITHHOLDS_CREDENTIAL_NAMES_KEEPS_PUBLIC_FILES', code == 0
+                and withheld == sorted(secret_names) and not any((copy / rel).exists() for rel in secret_names)
+                and all((copy / rel).is_file() for rel in public_names), {'exit': code, 'withheld': withheld})
+    guarded('WORKSPACE_WITHHOLDS_CREDENTIAL_NAMES_KEEPS_PUBLIC_FILES', credential_names_withheld)
+
+    def envkeys_whole_value_placeholders() -> None:
+        values = {'REAL_ANGLE': 'Kq9<vT2#mW8zLp', 'REAL_YOUR': 'Pq7your_Zm2Kd9Lw', 'REAL_DUMMY': 'aB3dummy9Xk2Lm4Qr8Zt6',
+                  'URL_EXAMPLE_HOST': 'postgres://app:' + 'Q7m2R9x4kL' + '@db.example.com/app',
+                  'TOKEN_WITH_TODO': 'ghp_' + 'TODO' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6',
+                  'P_ANGLE': '<your-api-key>', 'P_YOUR': 'your_api_key_here', 'P_CHANGE': 'changeme',
+                  'P_X': 'xxxxxxxx', 'P_HOST': 'https://api.example.com/v1', 'P_TODO': 'TODO'}
+        envfile = root / 'w6' / '.env'
+        write_text_file(envfile, ''.join(f'{key}={value}\n' for key, value in values.items()))
+        code, output = run_cli('envkeys', str(envfile))
+        shapes = {row['key']: row['shape'] for row in json_head(output).get('keys', [])}
+        real = ('REAL_ANGLE', 'REAL_YOUR', 'REAL_DUMMY', 'URL_EXAMPLE_HOST', 'TOKEN_WITH_TODO')
+        control(results, 'ENVKEYS_PLACEHOLDER_ONLY_AS_WHOLE_VALUE', code == 0 and len(shapes) == len(values)
+                and not any(shapes.get(key) == 'Placeholder' for key in real)
+                and shapes.get('URL_EXAMPLE_HOST') == 'URL with credentials'
+                and shapes.get('TOKEN_WITH_TODO', '').startswith('looks real')
+                and all(shapes.get(key) == 'Placeholder' for key in values if key.startswith('P_'))
+                and not any(value in output for key, value in values.items() if key not in ('P_TODO', 'P_CHANGE')),
+                shapes)
+    guarded('ENVKEYS_PLACEHOLDER_ONLY_AS_WHOLE_VALUE', envkeys_whole_value_placeholders)
+
+    def envkeys_backtick_and_encodings() -> None:
+        tail = 'Qk9vZ1pYbm1kR0V4' + 'WjNKcFlXdz='
+        envfile, utf16, binary = root / 'w7' / 'tick.env', root / 'w7' / 'utf16.env', root / 'w7' / 'binary.env'
+        write_text_file(envfile, f'DB=1\nSIGNING_SECRET=`\n{tail}\nNOT_A_KEY=inside\n`\nAFTER=2\n')
+        utf16.write_bytes('UTF_KEY=1\r\nOTHER_KEY=two\r\n'.encode('utf-16'))
+        binary.write_bytes(b'BIN\0\0KEY=1\n')
+        code, output = run_cli('envkeys', str(envfile))
+        keys = [row.get('key') for row in json_head(output).get('keys', [])]
+        control(results, 'ENVKEYS_BACKTICK_MULTILINE_VALUE_HIDDEN', code == 0
+                and keys == ['DB', 'SIGNING_SECRET', 'AFTER'] and tail[:-1] not in output, keys)
+        code, output = run_cli('envkeys', str(utf16), str(binary))
+        listing = json_head(output)
+        keys = [row.get('key') for row in listing.get('keys', [])]
+        noted = [item.get('file') for item in listing.get('notes', [])]
+        control(results, 'ENVKEYS_DECODES_UTF16_AND_NOTES_UNDECODABLE', code == 0 and keys == ['UTF_KEY', 'OTHER_KEY']
+                and noted == [str(binary)], {'keys': keys, 'notes': noted})
+    guarded('ENVKEYS_BACKTICK_MULTILINE_VALUE_HIDDEN', envkeys_backtick_and_encodings)
+
+    def excludes_normalised() -> None:
+        project = root / 'w9-project'
+        write_text_file(project / 'a.py', 'a = 1\n')
+        write_text_file(project / 'vendor' / 'lib.py', 'b = 1\n')
+        counts = {}
+        for label, value in (('dot_slash', './vendor'), ('backslash_trailing', '.\\vendor\\'),
+                             ('absolute_inside', str(project / 'vendor'))):
+            code, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem', '--exclude', value)
+            counts[label] = json_head(output).get('file_count') if code == 0 else f'exit {code}'
+        code_out, output_out = run_cli('baseline', '--project', str(project), '--mode', 'filesystem', '--exclude',
+                                       str(root / 'w9-elsewhere'))
+        code_none, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem', '--exclude',
+                                    'nothing-here')
+        notes = json_head(output).get('notes', [])
+        # A backslash separates paths on Windows only; on POSIX it is part of a file name, so .\vendor\ matches nothing.
+        expected = {label: 1 if os.name == 'nt' or label != 'backslash_trailing' else 2 for label in counts}
+        control(results, 'BASELINE_EXCLUDES_NORMALISED_AND_UNMATCHED_NOTED', counts == expected
+                and code_out == 2 and 'Traceback' not in output_out and code_none == 0
+                and 'Exclusion matches no path: nothing-here' in notes,
+                {'file_counts': counts, 'outside_exit': code_out, 'notes': notes})
+    guarded('BASELINE_EXCLUDES_NORMALISED_AND_UNMATCHED_NOTED', excludes_normalised)
+
+    def unreadable_file_refused() -> None:
+        project = root / 'w10-project'
+        write_text_file(project / 'a.py', 'a = 1\n')
+        write_text_file(project / 'locked.db', 'synthetic data\n')
+        if os.name == 'nt':  # a byte-range lock makes reads by other processes fail
+            import msvcrt
+            handle = open(project / 'locked.db', 'r+b')
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 8)
+            undo: Callable[[], None] | None = handle.close
+        else:
+            undo = deny_read(project / 'locked.db')
+        if undo is None:
+            skip('BASELINE_REFUSES_UNREADABLE_FILE', 'Cannot make a file unreadable (POSIX root)')
+            return
+        try:
+            code, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem')
+            code_excl, _ = run_cli('baseline', '--project', str(project), '--mode', 'filesystem', '--exclude',
+                                   'locked.db')
+        finally:
+            undo()
+        control(results, 'BASELINE_REFUSES_UNREADABLE_FILE', code == 2 and 'locked.db' in output
+                and '--exclude' in output and 'Traceback' not in output and code_excl == 0,
+                {'exit': code, 'with_exclude': code_excl, 'output': output.strip()[-200:]})
+    guarded('BASELINE_REFUSES_UNREADABLE_FILE', unreadable_file_refused)
+
+    def special_files_skipped() -> None:
+        project, copy = root / 'w10-fifo-project', root / 'w10-fifo-copy'
+        write_text_file(project / 'a.py', 'a = 1\n')
+        os.mkfifo(project / 'pipe')
+        try:
+            code, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem', timeout=60)
+            code_ws, output_ws = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode',
+                                         'filesystem', '--no-git-snapshot', '--include', 'pipe', timeout=60)
+        except subprocess.TimeoutExpired:
+            control(results, 'BASELINE_SKIPS_NON_REGULAR_FILES', False, 'timeout: the FIFO was opened')
+            return
+        summary = json_head(output)
+        control(results, 'BASELINE_SKIPS_NON_REGULAR_FILES', code == 0 and summary.get('file_count') == 1
+                and any('non-regular' in note and 'pipe' in note for note in summary.get('notes', []))
+                and code_ws == 0 and not (copy / 'pipe').exists(), {'baseline': code, 'workspace': code_ws})
+    if hasattr(os, 'mkfifo'):
+        guarded('BASELINE_SKIPS_NON_REGULAR_FILES', special_files_skipped)
+    else:
+        skip('BASELINE_SKIPS_NON_REGULAR_FILES', 'No FIFOs on this platform')
+
+    def git_long_paths() -> None:
+        project = root / 'w11-long'
+        deep = project.joinpath(*[f'verylongdirectoryname_{index}' for index in range(12)])
+        os.makedirs('\\\\?\\' + str(deep.resolve()), exist_ok=True)
+        with open('\\\\?\\' + str((deep / 'deep.py').resolve()), 'w', encoding='utf-8') as handle:
+            handle.write('x = 1\n')
+        write_text_file(project / 'a.py', 'a = 1\n')
+        if not (deep / 'deep.py').is_file():
+            skip('BASELINE_GIT_CAPTURES_LONG_PATHS', 'Long paths are disabled for programs on this system')
+            return
+        run_git(['init', '-q'], project)
+        empty = root / 'w11-empty.gitconfig'
+        write_text_file(empty, '')
+        env = {**os.environ, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': str(empty)}
+        out = root / 'w11-long-baseline.json'
+        code, _ = run_cli('baseline', '--project', str(project), '--out', str(out), env=env)
+        snap = read_json(out) if out.is_file() else {}
+        rel = (deep / 'deep.py').relative_to(project).as_posix()
+        control(results, 'BASELINE_GIT_CAPTURES_LONG_PATHS', code == 0 and snap.get('mode') == 'git'
+                and rel in snap.get('files', {}) and snap.get('incomplete') is False,
+                {'exit': code, 'files': len(snap.get('files', {}))})
+    if os.name != 'nt':
+        skip('BASELINE_GIT_CAPTURES_LONG_PATHS', 'The 260-character path limit exists on Windows only')
+    elif not git_available():
+        skip('BASELINE_GIT_CAPTURES_LONG_PATHS', 'git unavailable')
+    else:
+        guarded('BASELINE_GIT_CAPTURES_LONG_PATHS', git_long_paths)
+
+    def unreadable_directories_reported() -> None:
+        project = root / 'w11-unreadable'
+        write_text_file(project / 'a.py', 'a = 1\n')
+        write_text_file(project / 'hidden' / 'h.py', 'h = 1\n')
+        undo = deny_read(project / 'hidden')
+        if undo is None:
+            skip('BASELINE_REPORTS_UNREADABLE_DIRECTORIES', 'Cannot make a directory unreadable (POSIX root or no '
+                                                            'access control tool)')
+            return
+        observed: dict[str, Any] = {}
+        try:
+            code, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem')
+            summary = json_head(output)
+            observed['filesystem'] = (code == 0 and summary.get('incomplete') is True
+                                      and any('not readable' in note and 'hidden' in note for note in summary.get('notes', [])))
+            if git_available():
+                run_git(['init', '-q'], project)
+                code, output = run_cli('baseline', '--project', str(project), '--mode', 'git')
+                summary = json_head(output)
+                observed['git'] = (code == 0 and summary.get('incomplete') is True
+                                   and any(note.startswith('Git') and 'hidden' in note for note in summary.get('notes', [])))
+        finally:
+            undo()
+        control(results, 'BASELINE_REPORTS_UNREADABLE_DIRECTORIES', bool(observed) and all(observed.values()), observed)
+    guarded('BASELINE_REPORTS_UNREADABLE_DIRECTORIES', unreadable_directories_reported)
+
+    def include_keeps_directory_links() -> None:
+        project, copy = root / 'w12-project', root / 'w12-copy'
+        write_text_file(project / 'app.js', 'main\n')
+        write_text_file(project / 'store' / 'pkg-1.0' / 'index.js', 'module.exports = 1\n')
+        write_text_file(root / 'w12-outside' / 'x.txt', 'outside\n')
+        (project / 'node_modules').mkdir()
+        os.symlink(os.path.join('..', 'store', 'pkg-1.0'), project / 'node_modules' / 'pkg', target_is_directory=True)
+        os.symlink(str(root / 'w12-outside'), project / 'node_modules' / 'out', target_is_directory=True)
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot', '--include', 'node_modules')
+        summary = json_head(output)
+        link = copy / 'node_modules' / 'pkg'
+        unsafe = [item.get('path') for item in summary.get('unsafe_symlinks_not_created', [])]
+        control(results, 'WORKSPACE_INCLUDE_KEEPS_DIRECTORY_LINKS', link.is_symlink()
+                and (link / 'index.js').is_file() and 'node_modules/pkg' in summary.get('explicitly_included', [])
+                and unsafe == ['node_modules/out'] and not (copy / 'node_modules' / 'out').exists(),
+                {'exit': code, 'included': summary.get('explicitly_included'), 'unsafe': unsafe})
+    if symlinks_possible(root / 'w12-probe'):
+        guarded('WORKSPACE_INCLUDE_KEEPS_DIRECTORY_LINKS', include_keeps_directory_links)
+    else:
+        skip('WORKSPACE_INCLUDE_KEEPS_DIRECTORY_LINKS', 'Symlinks cannot be created on this system')
+
+    def symlink_safety_physical() -> None:
+        # self -> . plus self/../<project>/data.txt: lexically inside, physically a path out of the copy into the original
+        base = root / 'w13'
+        project, copy = base / 'proj', base / 'copy'
+        write_text_file(project / 'data.txt', 'original\n')
+        write_text_file(project / 'sub' / 'inner.txt', 'inner\n')
+        os.symlink('.', project / 'self', target_is_directory=True)
+        os.symlink('self/../proj/data.txt', project / 'link.txt')
+        os.symlink('sub/inner.txt', project / 'inner-link.txt')
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        unsafe = sorted(item.get('path') for item in json_head(output).get('unsafe_symlinks_not_created', []))
+        if (copy / 'link.txt').exists():
+            write_text_file(copy / 'link.txt', 'written through the copy\n')
+        control(results, 'WORKSPACE_SYMLINK_SAFETY_IS_PHYSICAL', unsafe == ['link.txt']
+                and not os.path.lexists(copy / 'link.txt') and (copy / 'inner-link.txt').is_symlink()
+                and (project / 'data.txt').read_text(encoding='utf-8') == 'original\n', {'exit': code, 'unsafe': unsafe})
+    if symlinks_possible(root / 'w13-probe'):
+        guarded('WORKSPACE_SYMLINK_SAFETY_IS_PHYSICAL', symlink_safety_physical)
+    else:
+        skip('WORKSPACE_SYMLINK_SAFETY_IS_PHYSICAL', 'Symlinks cannot be created on this system')
+
+    def junctions_not_followed() -> None:
+        project, outside, copy = root / 'w15-project', root / 'w15-outside', root / 'w15-copy'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        write_text_file(outside / 'o.txt', 'outside\n')
+        made = [subprocess.run(['cmd', '/c', 'mklink', '/J', str(project / name), str(target)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+                for name, target in (('loop', project), ('out', outside))]
+        if not all(made):
+            skip('BASELINE_AND_WORKSPACE_DO_NOT_FOLLOW_JUNCTIONS', 'Junctions cannot be created on this system')
+            return
+        expected = ['loop', 'out', 'src/a.py']
+        snap, _ = take_snapshot(project, mode='filesystem', with_side_effects=False)
+        observed: dict[str, Any] = {'filesystem': sorted(snap['files'])}
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot', '--include', 'loop', '--include', 'loop/src/a.py', '--include',
+                               '**/*.py', '--include', '**/*.txt')
+        # walk_files never enters a junction: the recreated loop junction would repeat the tree
+        copied = sorted(rel for rel in walk_files(copy, '', frozenset(), frozenset()) if rel != WORKSPACE_MARKER)
+        observed['copy'] = copied
+        observed['unsafe'] = sorted({item.get('path') for item in json_head(output).get('unsafe_symlinks_not_created', [])})
+        # loop leads to the project root: recreated as a junction to the copy's root, never to the original
+        loop_target = os.readlink(copy / 'loop') if is_junction(copy / 'loop') else ''
+        observed['loop'] = loop_target
+        ok = (observed['filesystem'] == expected and copied == ['loop', 'src/a.py'] and observed['unsafe'] == ['out']
+              and same_location(strip_extended_prefix(loop_target), copy))
+        for pattern, wanted in (('**/*', ['loop', 'out', 'src', 'src/a.py']), ('**/*.py', ['src/a.py'])):
+            try:  # Path.glob of some versions follows junctions until the path breaks
+                observed['glob ' + pattern] = [path.relative_to(project).as_posix() for path in glob_project(project, pattern)]
+            except OSError as exc:
+                observed['glob ' + pattern] = f'{exc.__class__.__name__}: {exc}'[:200]
+            ok = ok and observed['glob ' + pattern] == wanted
+        if git_available():
+            run_git(['init', '-q'], project)
+            snap, _ = take_snapshot(project, mode='git', with_side_effects=False)
+            observed['git'] = sorted(snap['files'])
+            ok = ok and observed['git'] == expected and any('Junction' in note for note in snap['notes'])
+        control(results, 'BASELINE_AND_WORKSPACE_DO_NOT_FOLLOW_JUNCTIONS', ok, observed)
+    if os.name == 'nt':
+        guarded('BASELINE_AND_WORKSPACE_DO_NOT_FOLLOW_JUNCTIONS', junctions_not_followed)
+    else:
+        skip('BASELINE_AND_WORKSPACE_DO_NOT_FOLLOW_JUNCTIONS', 'Junctions exist on Windows only')
+
+    def uncommitted_paths_project_only() -> None:
+        parent = root / 'w16-parent'
+        write_text_file(parent / 'proj' / 'a.txt', 'a\n')
+        write_text_file(parent / 'other' / 'b.txt', 'b\n')
+        identity = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                    'GIT_COMMITTER_EMAIL': 't@t'}
+        run_git(['init', '-q'], parent)
+        run_git(['add', '-A'], parent)
+        tree = run_git(['write-tree'], parent).decode().strip()
+        commit = run_git(['commit-tree', tree, '--no-gpg-sign', '-m', 'init'], parent, env=identity).decode().strip()
+        run_git(['update-ref', 'HEAD', commit], parent)
+        write_text_file(parent / 'proj' / 'a.txt', 'a changed\n')
+        write_text_file(parent / 'other' / 'b.txt', 'b changed\n')
+        snap, _ = take_snapshot(parent / 'proj', mode='git', with_side_effects=False)
+        git_info = snap.get('git') or {}
+        control(results, 'BASELINE_UNCOMMITTED_PATHS_ONLY_PROJECT', git_info.get('uncommitted_changes') == 1
+                and git_info.get('uncommitted_paths') == ['a.txt'], git_info.get('uncommitted_paths'))
+    if git_available():
+        guarded('BASELINE_UNCOMMITTED_PATHS_ONLY_PROJECT', uncommitted_paths_project_only)
+    else:
+        skip('BASELINE_UNCOMMITTED_PATHS_ONLY_PROJECT', 'git unavailable')
+
+    def cleanup_read_only_directories() -> None:
+        project, copy = root / 'w17-project', root / 'w17-copy'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                             '--no-git-snapshot')
+        cache = copy / '.audit-home' / 'go' / 'pkg' / 'mod' / 'example.com' / 'm@v1'
+        write_text_file(cache / 'sub' / 'f.go', 'package sub\n')
+        write_text_file(cache / 'g.go', 'package m\n')
+        for directory in (cache / 'sub', cache, cache.parent):
+            os.chmod(directory, 0o555)
+        code, _ = run_cli('cleanup', '--dest', str(copy), '--project', str(project))
+        removed = not copy.exists()
+        if not removed:  # leave nothing read-only behind for the final removal of the selftest directory
+            for directory in (cache.parent, cache, cache / 'sub'):
+                if directory.is_dir():
+                    os.chmod(directory, 0o755)
+        control(results, 'CLEANUP_REMOVES_READ_ONLY_DIRECTORIES_IN_ONE_PASS', code_ws == 0 and code == 0 and removed
+                and (project / 'src' / 'a.py').is_file(), {'workspace': code_ws, 'cleanup': code, 'removed': removed})
+    if os.name == 'nt':
+        skip('CLEANUP_REMOVES_READ_ONLY_DIRECTORIES_IN_ONE_PASS', 'Directory write protection is POSIX only')
+    elif os.geteuid() == 0:
+        skip('CLEANUP_REMOVES_READ_ONLY_DIRECTORIES_IN_ONE_PASS', 'POSIX root ignores directory write protection')
+    else:
+        guarded('CLEANUP_REMOVES_READ_ONLY_DIRECTORIES_IN_ONE_PASS', cleanup_read_only_directories)
+    return results
+
+
+def run_workspace_isolation_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Controls for the isolation of the working copy: index paths through links, .git entries, the caller's Git
+    environment, path aliases, planted markers, the record location, credential names, envkeys parsing and shapes,
+    hard links and read-only directories in cleanup, Windows alias names, nested depth, dependency summaries,
+    undecodable names, notes and sparse checkouts."""
+    from unittest.mock import patch
+    results = [] if results is None else results
+    python = sys.executable
+    identity = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                'GIT_COMMITTER_EMAIL': 't@t'}
+    posix_user = os.name != 'nt' and os.geteuid() != 0
+
+    def skip(control_id: str, reason: str) -> None:
+        results.append({'id': control_id, 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED', 'detail': reason})
+
+    def guarded(control_id: str, check: Callable[[], None]) -> None:
+        try:
+            check()
+        except Exception as exc:  # a broken fixture fails its own control, not the whole group
+            control(results, control_id, False, f'Control aborted: {exc.__class__.__name__}: {exc}')
+
+    def symlinks_possible(where: Path) -> bool:
+        where.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink('.', where / 'probe-link', target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return False
+        return True
+
+    def commit_all(project: Path) -> None:
+        run_git(['init', '-q'], project)
+        run_git(['add', '-A'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        commit = run_git(['commit-tree', tree, '--no-gpg-sign', '-m', 'init'], project, env=identity).decode().strip()
+        run_git(['update-ref', 'HEAD', commit], project)
+    links_ok = symlinks_possible(root / 'probe')
+
+    def index_paths_through_links() -> None:
+        # config/ is tracked, then replaced by a directory link to outside the project
+        project, outside, copy = root / 'x1-project', root / 'x1-outside', root / 'x1-copy'
+        secret = 'Synth' + 'OutsideValue' + '7731'
+        for base, text in ((project, 'DB_PASSWORD=changeme\n'), (outside, f'DB_PASSWORD={secret}\n')):
+            write_text_file(base / 'config' / '.env', text)
+            write_text_file(base / 'config' / 'app.yml', 'app: 1\n')
+        write_text_file(project / 'main.py', 'x = 1\n')
+        commit_all(project)
+        for name in ('.env', 'app.yml'):
+            (project / 'config' / name).unlink()
+        (project / 'config').rmdir()
+        os.symlink(os.path.join('..', 'x1-outside', 'config'), project / 'config', target_is_directory=True)
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--no-git-snapshot')
+        unsafe = [item.get('path') for item in json_head(output).get('unsafe_symlinks_not_created', [])]
+        snap, _ = take_snapshot(project, mode='git', with_side_effects=False)
+        # second layer: with the parent-link check disabled, the baseline and the copy still never read through it
+        with patch(f'{__name__}.link_prefix', return_value=None):
+            deep, _ = take_snapshot(project, mode='git', with_side_effects=False)
+        direct_unsafe: list[dict[str, str]] = []
+        direct = copy_file_or_link(project / 'config' / '.env', root / 'x1-direct' / '.env', 'config/.env', project, [],
+                                   direct_unsafe, physically_inside(project))
+        observed = {'exit': code, 'unsafe': unsafe, 'files': sorted(snap['files']), 'notes': snap['notes'],
+                    'second_layer_files': sorted(deep['files']), 'second_layer_incomplete': deep['incomplete'],
+                    'direct_copy': direct}
+        control(results, 'WORKSPACE_SKIPS_INDEX_PATHS_THROUGH_DIRECTORY_LINKS', code == 1 and unsafe == ['config']
+                and secret not in output and not os.path.lexists(copy / 'config')
+                and observed['files'] == ['config', 'main.py']
+                and any(note.endswith('2 paths through it left out: config') for note in snap['notes'])
+                and 'config/.env' not in deep['files'] and deep['incomplete'] is True and not direct
+                and bool(direct_unsafe) and not (root / 'x1-direct' / '.env').exists(), observed)
+    if not links_ok:
+        skip('WORKSPACE_SKIPS_INDEX_PATHS_THROUGH_DIRECTORY_LINKS', 'Symlinks cannot be created on this system')
+    elif not git_available():
+        skip('WORKSPACE_SKIPS_INDEX_PATHS_THROUGH_DIRECTORY_LINKS', 'git unavailable')
+    else:
+        guarded('WORKSPACE_SKIPS_INDEX_PATHS_THROUGH_DIRECTORY_LINKS', index_paths_through_links)
+
+    def git_entries_never_copied() -> None:
+        main, project, copy = root / 'x2-main', root / 'x2-project', root / 'x2-copy'
+        write_text_file(main / 'a.txt', 'a\n')
+        commit_all(main)
+        write_text_file(project / 'top.txt', 'top\n')
+        run_git(['worktree', 'add', '-q', '-b', 'x2-feature', str(project / 'wt')], main)
+        write_text_file(project / 'nested' / 'n.txt', 'n\n')
+        run_git(['init', '-q'], project / 'nested')
+        run_git(['config', 'remote.origin.url', 'https://synth:' + 'NestedTok' + '4410@git.invalid/r'], project / 'nested')
+
+        def state() -> tuple[bytes, bytes]:
+            return run_git(['for-each-ref'], main), (main / '.git' / 'config').read_bytes()
+        before = state()
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--include', 'wt', '--include', 'nested')
+        summary = json_head(output)
+        worktree, copy2 = root / 'x2-wt', root / 'x2-copy2'
+        run_git(['worktree', 'add', '-q', '-b', 'x2-other', str(worktree)], main)
+        before2 = state()
+        code2, output2 = run_cli('workspace', '--project', str(worktree), '--dest', str(copy2), '--mode', 'filesystem')
+        blocked = root / 'x2-blocked'
+        gitfile = 'gitdir: ' + str(main / '.git') + '\n'
+        write_text_file(blocked / '.git', gitfile)
+        refused = make_git_snapshot(blocked, [])
+        observed = {'exit': code, 'listed': summary.get('git_entries_not_copied'), 'worktree_exit': code2,
+                    'worktree_snapshot': json_head(output2).get('git_snapshot'), 'refused': refused}
+        control(results, 'WORKSPACE_NEVER_COPIES_GIT_ENTRIES', code == 0 and observed['listed'] == ['nested/.git', 'wt/.git']
+                and not os.path.lexists(copy / 'wt' / '.git') and not os.path.lexists(copy / 'nested' / '.git')
+                and (copy / 'wt' / 'a.txt').is_file() and (copy / '.git').is_dir() and 'NestedTok' not in output
+                and code2 == 0 and (observed['worktree_snapshot'] or {}).get('created') is True and state() == before2
+                and before2[1] == before[1] and refused.get('refused') is True
+                and (blocked / '.git').read_text(encoding='utf-8') == gitfile, observed)
+    if git_available():
+        guarded('WORKSPACE_NEVER_COPIES_GIT_ENTRIES', git_entries_never_copied)
+    else:
+        skip('WORKSPACE_NEVER_COPIES_GIT_ENTRIES', 'git unavailable')
+
+    def caller_git_environment_ignored() -> None:
+        repo, project, copy = root / 'x3-repo', root / 'x3-project', root / 'x3-copy'
+        write_text_file(repo / 'a.txt', 'a\n')
+        commit_all(repo)
+        head = run_git(['rev-parse', 'HEAD'], repo)
+        write_text_file(project / 'z.txt', 'z\n')
+        env = {**os.environ, 'GIT_DIR': str(repo / '.git'), 'GIT_WORK_TREE': str(project),
+               'GIT_INDEX_FILE': str(root / 'x3-index'), 'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare',
+               'GIT_CONFIG_VALUE_0': 'true'}
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), env=env)
+        stripped = git_env({'GIT_DIR': 'x', 'git_work_tree': 'y', 'GIT_CONFIG_KEY_3': 'k', 'PATH': 'p'})
+        observed = {'exit': code, 'snapshot': json_head(output).get('git_snapshot'), 'stripped': stripped}
+        control(results, 'GIT_CALLS_IGNORE_CALLER_REPOSITORY_VARIABLES', code == 0
+                and run_git(['rev-parse', 'HEAD'], repo) == head and (observed['snapshot'] or {}).get('created') is True
+                and (copy / '.git').is_dir() and not (root / 'x3-index').exists() and stripped == {'PATH': 'p'}, observed)
+    if git_available():
+        guarded('GIT_CALLS_IGNORE_CALLER_REPOSITORY_VARIABLES', caller_git_environment_ignored)
+    else:
+        skip('GIT_CALLS_IGNORE_CALLER_REPOSITORY_VARIABLES', 'git unavailable')
+
+    def path_aliases_contained() -> None:
+        project, victim = root / 'x4-project', root / 'x4-victim'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        write_text_file(victim / 'keep.txt', 'keep\n')
+        write_text_file(victim / WORKSPACE_MARKER, json.dumps({'project_root': str(victim.resolve()),
+                                                               'baseline_fingerprint': 'x'}))
+        long_form = '\\\\?\\' + str(project.resolve())
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', long_form + '\\sub', '--mode', 'filesystem')
+        code_long, _ = run_cli('cleanup', '--dest', '\\\\?\\' + str(victim.resolve()), '--project', str(victim),
+                               '--dry-run')
+        code_device, output_device = run_cli('cleanup', '--dest', '\\\\.\\' + str(victim.resolve()), '--project',
+                                             str(victim), '--dry-run')
+        drive = re.match(r'^([A-Za-z]):\\(.*)$', str(project.resolve()))
+        unc = f'\\\\localhost\\{drive.group(1)}$\\{drive.group(2)}' if drive else None
+        unc_ok = unc is not None and os.path.isdir(unc)
+        observed = {'workspace_long': code_ws, 'cleanup_long': code_long, 'cleanup_device': code_device,
+                    'unc_reachable': unc_ok}
+        missing = (root / 'x4-missing').absolute()  # no identity: only the normalised text decides
+        identity_ok = is_within(Path(long_form) / 'src' / 'new.txt', project) and is_within(
+            Path('\\\\?\\' + str(missing)) / 'f.txt', missing)
+        if unc_ok:  # an administrative share of the local drive names the same directory
+            identity_ok = identity_ok and is_within(Path(unc) / 'src' / 'a.py', project) and is_within(
+                Path('\\\\?\\UNC' + unc[1:]) / 'src', project) and same_location(unc, project)
+        observed['identity'] = identity_ok
+        control(results, 'CONTAINMENT_SEES_THROUGH_PATH_ALIASES', code_ws == 2 and not (project / 'sub').exists()
+                and code_long == 2 and code_device == 2 and 'device' in output_device and identity_ok
+                and not is_within(root / 'x4-elsewhere' / 'f.txt', project), observed)
+    if os.name == 'nt':
+        guarded('CONTAINMENT_SEES_THROUGH_PATH_ALIASES', path_aliases_contained)
+    else:
+        skip('CONTAINMENT_SEES_THROUGH_PATH_ALIASES', 'Extended-length, device and UNC paths exist on Windows only')
+
+    def planted_markers_ignored() -> None:
+        project, copy, logs = root / 'x5-project', root / 'x5-copy', root / 'x5-logs'
+        value = 'Synth' + 'PlantedValue' + '9944'
+        write_text_file(project / 'sub' / 'settings.ini', f'API_TOKEN={value}\n')
+        write_text_file(project / 'sub' / WORKSPACE_MARKER, json.dumps({
+            'project_root': str(root / 'x5-nowhere'), 'baseline_fingerprint': 'x', 'secret_value_files': []}))
+        write_text_file(project / WORKSPACE_MARKER, '{"note": "stray"}')
+        write_text_file(project / 'deep' / WORKSPACE_MARKER, json.dumps({'project_root': str(project.resolve()),
+                                                                         'baseline_fingerprint': 'x'}))
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        summary = json_head(output)
+        marker = read_json(copy / WORKSPACE_MARKER) if (copy / WORKSPACE_MARKER).is_file() else {}
+        code_run, _ = run_cli('run', '--id', 'X5', '--evidence-dir', str(logs), '--cwd', str(copy / 'sub'), '--', python,
+                              '-c', 'print(open("settings.ini").read())')
+        log = (logs / 'X5.log').read_text(encoding='utf-8', errors='replace') if (logs / 'X5.log').is_file() else ''
+        code_original, _ = run_cli('run', '--id', 'X5-ORIGINAL', '--evidence-dir', str(logs), '--cwd',
+                                   str(project / 'sub'), '--', python, '-c', 'open("written.txt", "w").write("x")')
+        moved, legacy = root / 'x5-moved', root / 'x5-legacy'
+        write_text_file(moved / WORKSPACE_MARKER, json.dumps(marker))  # written for x5-copy, not for x5-moved
+        write_text_file(legacy / WORKSPACE_MARKER, json.dumps({'project_root': str(project), 'baseline_fingerprint': 'x'}))
+        invalid: list[str] = []
+        found_moved = find_workspace_root(moved, invalid=invalid)
+        code_cleanup, output_cleanup = run_cli('cleanup', '--dest', str(copy), '--project', str(root / 'x5-gone'),
+                                               '--dry-run')
+        observed = {'exit': code, 'not_copied': summary.get('marker_files_not_copied'), 'run_copy': code_run,
+                    'run_original': code_original, 'invalid': invalid, 'cleanup_missing_project': code_cleanup}
+        control(results, 'MARKER_COUNTS_ONLY_FOR_ITS_OWN_COPY', code == 0
+                and observed['not_copied'] == [WORKSPACE_MARKER, 'deep/' + WORKSPACE_MARKER, 'sub/' + WORKSPACE_MARKER]
+                and not (copy / 'sub' / WORKSPACE_MARKER).exists() and same_location(marker.get('workspace_root', ''), copy)
+                and len(str(marker.get('workspace_id', ''))) == 32 and code_run == 0 and bool(log) and value not in log
+                and code_original == 2 and not (project / 'sub' / 'written.txt').exists()
+                and find_workspace_root(project / 'sub') is None and find_workspace_root(project / 'deep') is None
+                and found_moved is None and len(invalid) == 1
+                and find_workspace_root(legacy) == legacy and code_cleanup == 2
+                and 'Project directory not found' in output_cleanup, observed)
+    guarded('MARKER_COUNTS_ONLY_FOR_ITS_OWN_COPY', planted_markers_ignored)
+
+    def record_location() -> None:
+        project = root / 'x6-project'
+        write_text_file(project / 'a.txt', 'a\n')
+        refused = {}
+        for label, dest, record in (('in_project', root / 'x6-copy1', project / 'record.json'),
+                                    ('in_copy', root / 'x6-copy2', root / 'x6-copy2' / 'record.json')):
+            code, output = run_cli('workspace', '--project', str(project), '--dest', str(dest), '--mode', 'filesystem',
+                                   '--no-git-snapshot', '--record', str(record))
+            refused[label] = code == 2 and not dest.exists() and not record.exists() and 'Traceback' not in output
+        allowed = project / DEFAULT_RESULTS_DIRNAME / 'run' / 'evidence' / 'baseline' / 'workspace.json'
+        code, _ = run_cli('workspace', '--project', str(project), '--dest', str(root / 'x6-copy3'), '--mode',
+                          'filesystem', '--no-git-snapshot', '--record', str(allowed))
+        control(results, 'WORKSPACE_RECORD_OUTSIDE_COPY_AND_PROJECT', all(refused.values()) and code == 0
+                and allowed.is_file(), {'refused': refused, 'results_dir_exit': code})
+    guarded('WORKSPACE_RECORD_OUTSIDE_COPY_AND_PROJECT', record_location)
+
+    def more_credential_names() -> None:
+        project, copy = root / 'x7-project', root / 'x7-copy'
+        contents = {'keys/server.pem': '-----BEGIN PRIVATE KEY-----\nMIIsyntheticfixture\n-----END PRIVATE KEY-----\n',
+                    'certs/cacert.pem': '-----BEGIN CERTIFICATE-----\nMIIsyntheticfixture\n-----END CERTIFICATE-----\n',
+                    'token/.yarnrc.yml': 'npmAuthToken: synthetic-fixture\n', 'plain/.yarnrc.yml': 'nodeLinker: pnp\n'}
+        secret_names = ['.dev.vars', 'token.json', 'firebase-adminsdk-x1.json', 'gcloud/application_default_credentials.json',
+                        '.env-production', '.env_local', '.envrc.local', '.env-cmdrc', '.kube/config', 'id_dsa',
+                        'AuthKey_X1.p8', 'deploy.ppk', '.vault-token', '.s3cfg', '.boto', '.terraformrc', 'terraform.rc',
+                        'htpasswd', 'keys/server.pem', 'token/.yarnrc.yml']
+        public_names = ['certs/cacert.pem', 'plain/.yarnrc.yml', 'apps/.env.schema', 'id_dsa.pub']
+        for rel in secret_names + public_names:
+            write_text_file(project / rel, contents.get(rel, 'SYNTH_FIXTURE=1\n'))
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        withheld = json_head(output).get('withheld_credential_files')
+        control(results, 'WORKSPACE_WITHHOLDS_MORE_CREDENTIAL_NAMES_COPIES_CERTIFICATES', code == 0
+                and withheld == sorted(secret_names) and not any((copy / rel).exists() for rel in secret_names)
+                and all((copy / rel).is_file() for rel in public_names), {'exit': code, 'withheld': withheld})
+    guarded('WORKSPACE_WITHHOLDS_MORE_CREDENTIAL_NAMES_COPIES_CERTIFICATES', more_credential_names)
+
+    def envkeys_dotenv_rules() -> None:
+        leak = 'Zq8' + 'xQmV3rT5pL2wN9bH4'
+        text = (f'export\tTAB_KEY=1\nVT=a\x0b{leak}_VT=1\nFF=a\x0c{leak}_FF=1\nNL=a\x85{leak}_NEL=1\n'
+                f'LS=a\u2028{leak}_LS=1\nQ1=\'it\'\'s\'\nNEXT=1\nS1=\'a\\\'b\'\nAFTER_S1=1\nQ3="a" # comment with " quote\nVISIBLE_AFTER_COMMENT=2\n'
+                f'CONT=abc\\\n{leak}_CONT=part\nEND=3\n')
+        envfile = root / 'x8' / '.env'
+        envfile.parent.mkdir(parents=True, exist_ok=True)
+        envfile.write_bytes(text.encode('utf-8'))
+        code, output = run_cli('envkeys', str(envfile))
+        keys = [row.get('key') for row in json_head(output).get('keys', [])]
+        code_missing, output_missing = run_cli('envkeys', str(root / 'x8' / 'missing.env'))
+        control(results, 'ENVKEYS_FOLLOWS_DOTENV_LINE_AND_QUOTE_RULES', code == 0 and keys == [
+            'TAB_KEY', 'VT', 'FF', 'NL', 'LS', 'Q1', 'NEXT', 'S1', 'AFTER_S1', 'Q3', 'VISIBLE_AFTER_COMMENT', 'CONT', 'END']
+                and leak not in output and code_missing == 2 and 'existing env file' in output_missing, keys)
+    guarded('ENVKEYS_FOLLOWS_DOTENV_LINE_AND_QUOTE_RULES', envkeys_dotenv_rules)
+
+    def shape_table() -> None:
+        placeholder = ['changeme', 'your_api_key_here', '<your-token>', 'TODO: set me', 'dummyvalue', 'replace_with_real_key',
+                       'sk-xxxxxxxxxxxxxxxxxxxxxxxx', 'xxx-xxxx-xxxx', 'https://api.example.com/v1']
+        real = ['your-org-prod-9f8e7d6c5b4a3f2e1d0c', '<Zq8xQmV3rT5pL2wN9bH4>', 'example/Kq9vT2mW8zLp0000',
+                'Example.Pa55w0rd', 'example.Kq9vT2mW8zLp', 'xxxx1234']
+        credential_urls = ['https://api.internal.invalid/v1?access_token=Zq8xQmV3rT5pL2wN9bH4',
+                           'https://hooks.invalid/services/T00/B00/Zq8xQmV3rT5pL2wN9bH4kR']
+        shapes = {value: classify_value(value) for value in placeholder + real + credential_urls}
+        control(results, 'ENVKEYS_SHAPE_TABLE', all(shapes[value] == 'Placeholder' for value in placeholder)
+                and not any(shapes[value] == 'Placeholder' for value in real)
+                and all(shapes[value] == 'URL with credentials' for value in credential_urls), shapes)
+    guarded('ENVKEYS_SHAPE_TABLE', shape_table)
+
+    def cleanup_keeps_shared_modes() -> None:
+        project, copy, outside = root / 'x10-project', root / 'x10-copy', root / 'x10-outside'
+        write_text_file(project / 'a.txt', 'a\n')
+        write_text_file(outside / 'keep.txt', 'keep\n')
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                             '--no-git-snapshot')
+        (copy / 'ro').mkdir()
+        os.link(outside / 'keep.txt', copy / 'ro' / 'shared.txt')
+        os.chmod(outside / 'keep.txt', 0o444)  # Windows: the read-only attribute, which all links share
+        if os.name != 'nt':
+            os.chmod(copy / 'ro', 0o555)
+        before = (outside / 'keep.txt').stat().st_mode
+        try:
+            code, output = run_cli('cleanup', '--dest', str(copy), '--project', str(project))
+            after = (outside / 'keep.txt').stat().st_mode
+            writable = os.access(outside / 'keep.txt', os.W_OK)
+            content = (outside / 'keep.txt').read_text(encoding='utf-8')
+        finally:
+            if (copy / 'ro').is_dir():
+                os.chmod(copy / 'ro', 0o755)
+            os.chmod(outside / 'keep.txt', 0o644)
+        control(results, 'CLEANUP_KEEPS_MODES_OF_HARD_LINKED_FILES', code_ws == 0 and code == 0 and not copy.exists()
+                and after == before and not writable and content == 'keep\n',
+                {'workspace': code_ws, 'cleanup': code, 'mode_before': oct(before), 'mode_after': oct(after),
+                 'output': output.strip()[-300:]})
+    if os.name == 'nt' or posix_user:
+        guarded('CLEANUP_KEEPS_MODES_OF_HARD_LINKED_FILES', cleanup_keeps_shared_modes)
+    else:
+        skip('CLEANUP_KEEPS_MODES_OF_HARD_LINKED_FILES', 'POSIX root ignores directory write protection')
+
+    def cleanup_links_in_read_only_directories() -> None:
+        project, copy, outside = root / 'x11-project', root / 'x11-copy', root / 'x11-outside'
+        write_text_file(project / 'a.txt', 'a\n')
+        write_text_file(outside / 'keep.txt', 'keep\n')
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                             '--no-git-snapshot')
+        (copy / 'rod').mkdir()
+        os.symlink(str(outside), copy / 'rod' / 'link', target_is_directory=True)
+        os.chmod(copy / 'rod', 0o555)
+        try:
+            code, output = run_cli('cleanup', '--dest', str(copy), '--project', str(project))
+        finally:
+            if (copy / 'rod').is_dir():
+                os.chmod(copy / 'rod', 0o755)
+        control(results, 'CLEANUP_REMOVES_LINKS_IN_READ_ONLY_DIRECTORIES', code_ws == 0 and code == 0 and not copy.exists()
+                and (outside / 'keep.txt').is_file(), {'workspace': code_ws, 'cleanup': code, 'output': output[-300:]})
+    if posix_user:
+        guarded('CLEANUP_REMOVES_LINKS_IN_READ_ONLY_DIRECTORIES', cleanup_links_in_read_only_directories)
+    else:
+        skip('CLEANUP_REMOVES_LINKS_IN_READ_ONLY_DIRECTORIES', 'Directory write protection needs POSIX and a non-root user')
+
+    def windows_alias_names() -> None:
+        project, copy = root / 'x12-project', root / 'x12-copy'
+        value = 'Synth' + 'AliasValue' + '4471'
+        write_text_file(project / '.env', f'API_TOKEN={value}\n')
+        write_text_file(project / 'readme.txt', 'hello\n')
+        aliases = ['\\\\?\\' + str(project.resolve()) + '\\' + name for name in ('.env ', 'readme.txt.')]
+        alias_dir = '\\\\?\\' + str(project.resolve()) + '\\data.'
+        for alias in aliases:
+            with open(alias, 'w', encoding='utf-8') as handle:
+                handle.write('other content\n')
+        os.mkdir(alias_dir)
+        with open(alias_dir + '\\f.txt', 'w', encoding='utf-8') as handle:
+            handle.write('in alias directory\n')
+        try:
+            code, output = run_cli('baseline', '--project', str(project), '--mode', 'filesystem')
+            summary = json_head(output)
+            code_ws, output_ws = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode',
+                                         'filesystem', '--no-git-snapshot', '--include', '*')
+            listing = sorted(os.listdir('\\\\?\\' + str(copy.resolve()))) if copy.is_dir() else []
+        finally:  # through the \\?\ form: Win32 would remove the name without the trailing character instead
+            for alias in aliases:
+                os.unlink(alias)
+            os.unlink(alias_dir + '\\f.txt')
+            os.rmdir(alias_dir)
+        notes = summary.get('notes', [])
+        copy_notes = sorted(item.get('path') for item in json_head(output_ws).get('notes', [])
+                            if 'Windows opens as another file' in item.get('note', ''))
+        control(results, 'BASELINE_AND_WORKSPACE_SKIP_WINDOWS_ALIAS_NAMES', code == 0 and summary.get('incomplete') is True
+                and summary.get('file_count') == 2 and all(any(name in note for note in notes) for name in ('.env ', 'readme.txt.'))
+                and any(note.endswith(': data.') for note in notes)
+                and code_ws == 0 and listing == [WORKSPACE_MARKER, 'readme.txt'] and value not in output_ws
+                and copy_notes == ['.env ', 'data.', 'readme.txt.'],
+                {'baseline': code, 'notes': notes, 'workspace': code_ws, 'copy': listing, 'copy_notes': copy_notes})
+    if os.name == 'nt':
+        guarded('BASELINE_AND_WORKSPACE_SKIP_WINDOWS_ALIAS_NAMES', windows_alias_names)
+    else:
+        skip('BASELINE_AND_WORKSPACE_SKIP_WINDOWS_ALIAS_NAMES', 'Win32 name normalisation exists on Windows only')
+
+    def nested_depth_gap() -> None:
+        project = root / 'x13-project'
+        write_text_file(project / 'top.txt', 't\n')
+        run_git(['init', '-q'], project)
+        deep = project
+        for index in range(8):
+            deep = deep / f'n{index}'
+            write_text_file(deep / f'f{index}.txt', 'x\n')
+            run_git(['init', '-q'], deep)
+        snap, _ = take_snapshot(project, mode='git', with_side_effects=False)
+        control(results, 'BASELINE_REPORTS_NESTED_REPOSITORIES_BELOW_DEPTH_LIMIT', snap['incomplete'] is True
+                and any('depth limit' in note and 'n0/n1/n2/n3/n4/n5/n6/' in note for note in snap['notes']), snap['notes'])
+    if git_available():
+        guarded('BASELINE_REPORTS_NESTED_REPOSITORIES_BELOW_DEPTH_LIMIT', nested_depth_gap)
+    else:
+        skip('BASELINE_REPORTS_NESTED_REPOSITORIES_BELOW_DEPTH_LIMIT', 'git unavailable')
+
+    def dependency_edits_and_ignored_gaps() -> None:
+        project = root / 'x14-project'
+        write_text_file(project / '.gitignore', 'node_modules/\nbuild/\n')
+        write_text_file(project / 'a.py', 'a = 1\n')
+        write_text_file(project / 'node_modules' / 'pkg' / 'index.js', 'v1\n')
+        write_text_file(project / 'build' / 'deep' / 'b.txt', 'b\n')
+        commit_all(project)
+
+        def pin() -> None:  # an edit that keeps entry count and directory times
+            for directory in (project / 'node_modules', project / 'node_modules' / 'pkg'):
+                os.utime(directory, (1_600_000_000, 1_600_000_000))
+        pin()
+        first, _ = take_snapshot(project, mode='git')
+        write_text_file(project / 'node_modules' / 'pkg' / 'index.js', 'v2 changed\n')
+        pin()
+        second, _ = take_snapshot(project, mode='git')
+        changed = compare_snapshots(first, second)['side_effects'].get('ignored_files', [])
+        older = json.loads(json.dumps(first))
+        older['ignored_state']['node_modules'] = ':'.join(first['ignored_state']['node_modules'].split(':')[:3])
+        compatible = compare_snapshots(older, first)['side_effects']
+        undo = deny_read(project / 'build' / 'deep')
+        unreadable: bool | None = None
+        if undo is not None:
+            try:
+                third, _ = take_snapshot(project, mode='git')
+                unreadable = third['incomplete'] is True and any('build' in note and 'not readable' in note
+                                                                 for note in third['notes'])
+            finally:
+                undo()
+        observed = {'changed': changed, 'compatible': compatible, 'unreadable_gap': unreadable}
+        control(results, 'BASELINE_SIDE_EFFECTS_SEE_DEPENDENCY_EDITS_AND_GAPS', changed == ['node_modules']
+                and 'ignored_files' not in compatible and any('summarised' in note for note in first['notes'])
+                and unreadable is not False, observed)
+    if git_available():
+        guarded('BASELINE_SIDE_EFFECTS_SEE_DEPENDENCY_EDITS_AND_GAPS', dependency_edits_and_ignored_gaps)
+    else:
+        skip('BASELINE_SIDE_EFFECTS_SEE_DEPENDENCY_EDITS_AND_GAPS', 'git unavailable')
+
+    def undecodable_names_and_init_rollback() -> None:
+        sample = {'name': 'caf\udce9.txt'}  # what os.fsdecode makes of the byte name caf\xe9.txt on POSIX
+        text = json_text(sample)
+        observed: dict[str, Any] = {'roundtrip': json.loads(text) == sample and text.isascii()}
+        if os.name != 'nt' and sys.getfilesystemencoding() == 'utf-8':
+            project, copy = root / 'x15-project', root / 'x15-copy'
+            write_text_file(project / 'ok.txt', 'y\n')
+            with open(os.path.join(os.fsencode(project), b'caf\xe9.txt'), 'wb') as handle:
+                handle.write(b'x\n')
+            code_init, output = run_cli('init', '--project', str(project), '--mode', 'filesystem')
+            baseline = Path(str(json_head(output).get('baseline', '')))
+            snap = read_json(baseline) if baseline.is_file() else {}
+            code_compare, _ = run_cli('baseline', '--project', str(project), '--compare', str(baseline))
+            code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                                 '--no-git-snapshot')
+            observed['posix'] = (code_init == 0 and sample['name'] in snap.get('files', {}) and code_compare == 0
+                                 and code_ws == 0 and os.path.isfile(os.path.join(os.fsencode(copy), b'caf\xe9.txt')))
+        project = root / 'x15-init'
+        write_text_file(project / 'a.txt', 'a\n')
+        args = build_parser().parse_args(['init', '--project', str(project), '--mode', 'filesystem'])
+        try:
+            with patch(f'{__name__}.init_run_dir', side_effect=OSError(28, 'synthetic: no space left')):
+                cmd_init(args)
+            observed['rollback'] = 'init did not fail'
+        except ToolError as exc:
+            observed['rollback'] = 'removed' in str(exc) and not (project / DEFAULT_RESULTS_DIRNAME).exists()
+        control(results, 'JSON_KEEPS_UNDECODABLE_NAMES_AND_INIT_LEAVES_NO_HALF_RUN',
+                all(value is True for value in observed.values()), observed)
+    guarded('JSON_KEEPS_UNDECODABLE_NAMES_AND_INIT_LEAVES_NO_HALF_RUN', undecodable_names_and_init_rollback)
+
+    def notes_paths_and_sparse() -> None:
+        observed: dict[str, Any] = {
+            'backslash': project_relative('a\\b', root, '--exclude') == ('a/b' if os.name == 'nt' else 'a\\b')}
+        outside = root / 'x16-outside'
+        write_text_file(outside / 'f.txt', 'o\n')
+        if links_ok:
+            project = root / 'x16-project'
+            for index in range(52):
+                write_text_file(project / f'd{index:02}' / 'f.txt', 'x\n')
+            commit_all(project)
+            for index in range(52):
+                (project / f'd{index:02}' / 'f.txt').unlink()
+                (project / f'd{index:02}').rmdir()
+                os.symlink(str(outside), project / f'd{index:02}', target_is_directory=True)
+            snap, _ = take_snapshot(project, mode='git', with_side_effects=False)
+            link_notes = [note for note in snap['notes'] if 'not followed' in note]
+            observed['capped'] = (len(link_notes) == 50 and all('1 path through it' in note for note in link_notes)
+                                  and any(note.startswith('2 more links') for note in snap['notes']))
+            listed = root / 'x16-include'
+            write_text_file(listed / 'inc' / 'b.txt', 'b\n')
+            os.symlink(str(outside), listed / 'inc' / 'out', target_is_directory=True)
+            code, output = run_cli('workspace', '--project', str(listed), '--dest', str(root / 'x16-include-copy'),
+                                   '--mode', 'filesystem', '--no-git-snapshot', '--include', 'inc')
+            observed['unsafe_once'] = [item.get('path') for item in
+                                       json_head(output).get('unsafe_symlinks_not_created', [])] == ['inc/out']
+        sparse = root / 'x16-sparse'
+        for rel in ('a.txt', 'b.txt', 'd/c.txt'):
+            write_text_file(sparse / rel, rel + '\n')
+        commit_all(sparse)
+        run_git(['sparse-checkout', 'set', '--no-cone', 'a.txt', 'b.txt'], sparse)
+        snap, _ = take_snapshot(sparse, mode='git', with_side_effects=False)
+        observed['sparse'] = ((snap['git'] or {}).get('deleted_tracked_files') == [] and not (sparse / 'd').exists()
+                              and any('1 tracked path outside the sparse checkout' in note for note in snap['notes']))
+        control(results, 'NOTES_CAPPED_PATHS_KEPT_SPARSE_NOT_DELETED', all(value is True for value in observed.values()),
+                observed)
+    if git_available():
+        guarded('NOTES_CAPPED_PATHS_KEPT_SPARSE_NOT_DELETED', notes_paths_and_sparse)
+    else:
+        skip('NOTES_CAPPED_PATHS_KEPT_SPARSE_NOT_DELETED', 'git unavailable')
+    return results
+
+
+CLEANUP_ALIAS_LAYOUTS = (('held', 'j '), ('space', 'j '), ('dot', 'j.'))  # junction name; held: beside a busy 'j'
+ENVKEYS_ESCAPE_INPUTS = {  # (file content, keys that must be listed); value text must never appear
+    'sq-escape.env': ("A='abc\\'\nMIIEowIBAAKCAQEAsyntheticBODYLINE1==\nSECRETPART_sk_live=1\n'\nB=2\n", ['A', 'B']),
+    'sq-escape-mid.env': ("A='it\\'s\nMIIEowIBAAKCAQEAsyntheticBODYLINE2==\n'\nB=2\n", ['A', 'B']),
+    'sq-double-backslash.env': ("S='x\\\\'\nSECRETPART_VALUE_LINE=1'\nAFTER=1\n", ['S', 'AFTER']),
+    'colon.env': ('KEY: "multi\nSECRETPART_COLON=1\nend"\nAFTER: plain\nB=2\n', ['KEY', 'AFTER', 'B']),
+    'ordinary.env': ("A=1\nB='x'\nC=\"y\" # c\nexport D=4\nE: 5\nF='it''s'\nG='a\\'b'\nURL=http://x:1/a\nH=7\n",
+                     ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'URL', 'H']),
+}
+
+
+def run_workspace_cleanup_git_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Controls for cleanup on names Windows opens as another entry, links leading outside, mount points and entries
+    that cannot be classified; Git calls that never write the original; the link fallback, credential content rules,
+    envkeys quoting, the results directory, internal junctions and nested .git entries."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results = [] if results is None else results
+    identity = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
+                'GIT_COMMITTER_EMAIL': 't@t'}
+
+    def skip(control_id: str, reason: str) -> None:
+        results.append({'id': control_id, 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED', 'detail': reason})
+
+    def guarded(control_id: str, check: Callable[[], None]) -> None:
+        try:
+            check()
+        except Exception as exc:  # a broken fixture fails its own control, not the whole group
+            control(results, control_id, False, f'Control aborted: {exc.__class__.__name__}: {exc}')
+
+    def in_process(*arguments: str) -> tuple[int, dict[str, Any], str]:
+        """Exit code, printed JSON and error text of a command run in this process (for injected faults)."""
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = main(list(arguments))
+            return code, json_head(out.getvalue()), ''
+        except ToolError as exc:
+            return 2, {}, str(exc)
+
+    def make_link(target: Path, link: Path | str) -> bool:
+        """A directory junction on Windows (no privilege needed), a symbolic link elsewhere; the target is checked."""
+        try:
+            if os.name == 'nt':
+                import _winapi
+                _winapi.CreateJunction(str(target), extended_path(link))
+            else:
+                os.symlink(str(target), os.fspath(link), target_is_directory=True)
+        except OSError:
+            return False
+        return same_location(strip_extended_prefix(os.readlink(extended_path(link))), target)
+
+    def tree_state(base: Path) -> list[tuple[Any, ...]]:
+        """Every entry below base from the listing on extended paths: name, link target, content hash, read-only."""
+        rows: list[tuple[Any, ...]] = []
+        start = extended_path(base)
+        pending = [start]
+        while pending:
+            with os.scandir(pending.pop()) as listing:
+                for item in listing:
+                    kind = entry_kind(item)
+                    info = os.lstat(item.path)
+                    rel = item.path[len(start) + 1:]  # relpath would drop a trailing space
+                    content = sha256_file(Path(item.path)) if kind == 'file' else None
+                    rows.append((rel, kind, os.readlink(item.path) if kind == 'link' else None, content,
+                                 bool(getattr(info, 'st_file_attributes', 0) & 1) or not info.st_mode & 0o200))
+                    if kind == 'dir':
+                        pending.append(item.path)
+        return sorted(rows)
+
+    def alias_named_junctions() -> None:
+        observed: dict[str, Any] = {}
+        ok = True
+        for layout, name in CLEANUP_ALIAS_LAYOUTS:
+            base = root / f'c1-{layout}'
+            project, copy = base / 'project', base / 'copy'
+            write_text_file(project / 'src' / 'main.py', 'print(1)\n')
+            write_text_file(project / 'common' / 'util.txt', 'u\n')
+            write_text_file(project / 'ro.txt', 'ro\n')
+            os.chmod(project / 'ro.txt', 0o444)
+            if layout != 'held':  # the original's own links must survive as well
+                make_link(project / 'common', project / 'jcommon')
+            code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                                 '--no-git-snapshot')
+            held = None
+            if layout == 'held':
+                (copy / 'j').mkdir()
+                held = open(copy / 'j' / 'busy.log', 'w', encoding='utf-8')
+            linked = make_link(project, extended_path(copy) + '\\' + name)
+            before = tree_state(project)
+            try:
+                code_dry, dry, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project), '--dry-run')
+                code, _ = run_cli('cleanup', '--dest', str(copy), '--project', str(project))
+            finally:
+                if held is not None:
+                    held.close()
+            code_again = run_cli('cleanup', '--dest', str(copy), '--project', str(project))[0] if held else code
+            after = tree_state(project)
+            listed = [os.path.basename(item.get('path', '')) for item in dry.get('links_leading_outside', [])]
+            observed[layout] = {'workspace': code_ws, 'linked': linked, 'dry_run': code_dry, 'listed': listed,
+                                'cleanup': code, 'again': code_again, 'original_unchanged': before == after,
+                                'copy_left': os.path.lexists(extended_path(copy))}
+            ok = (ok and code_ws == 0 and linked and code_dry == 0 and listed == [name] and before == after
+                  and (code == 1 if held else code == 0) and code_again == 0 and not os.path.lexists(extended_path(copy))
+                  and any(row[0] == 'ro.txt' and row[4] for row in after))
+        # remove_tree (init and the selftest use it) on the same layout
+        tree, outside = root / 'c1-tree', root / 'c1-tree-outside'
+        write_text_file(outside / 'keep.txt', 'keep\n')
+        write_text_file(tree / 'j' / 'f.txt', 'f\n')
+        tree_linked = make_link(outside, extended_path(tree) + '\\j ')
+        remove_tree(tree)
+        observed['remove_tree'] = {'linked': tree_linked, 'removed': not os.path.lexists(extended_path(tree)),
+                                   'outside': (outside / 'keep.txt').is_file()}
+        ok = ok and tree_linked and not os.path.lexists(extended_path(tree)) and (outside / 'keep.txt').is_file()
+        control(results, 'CLEANUP_NEVER_ENTERS_ALIAS_NAMED_JUNCTIONS', ok, observed)
+    if os.name == 'nt':
+        guarded('CLEANUP_NEVER_ENTERS_ALIAS_NAMED_JUNCTIONS', alias_named_junctions)
+    else:
+        skip('CLEANUP_NEVER_ENTERS_ALIAS_NAMED_JUNCTIONS', 'Win32 name normalisation and junctions exist on Windows only')
+
+    def extended_path_keeps_names() -> None:
+        base = strip_extended_prefix(str(root.resolve())).replace('/', '\\')
+        share, share_extended = '\\\\srv\\share\\x', '\\\\?\\UNC\\srv\\share\\x'
+        plain_form, unc_form = '\\\\?\\' + base, share_extended
+        cwds = {'plain': base, 'extended': '\\\\?\\' + base, 'unc': share, 'unc_extended': share_extended}
+        rows: list[tuple[str, str, str, str]] = []  # label, current directory, given path, expected result
+        for name in ('j ', 'j.'):
+            rows += [('plain_slashes', cwds['plain'], base.replace('\\', '/') + '/' + name, plain_form + '\\' + name),
+                     ('plain_dotdot', cwds['unc'], base + '\\sub\\..\\.\\' + name, plain_form + '\\' + name),
+                     ('unc', cwds['plain'], share + '\\' + name, unc_form + '\\' + name),
+                     ('extended', cwds['unc'], plain_form + '\\' + name, plain_form + '\\' + name),
+                     ('extended_unc', cwds['plain'], unc_form + '\\' + name, unc_form + '\\' + name)]
+            for label, expected_base in (('plain', plain_form), ('extended', plain_form), ('unc', unc_form),
+                                         ('unc_extended', unc_form)):
+                rows.append(('relative_' + label, cwds[label], 'sub/../' + name, expected_base + '\\' + name))
+                rows.append(('dot_relative_' + label, cwds[label], '.\\sub\\..\\.\\' + name, expected_base + '\\' + name))
+        wrong = []
+        for label, cwd, given, expected in rows:
+            with patch('os.getcwd', return_value=cwd):
+                result = extended_path(given)
+            if result != expected or result.count('\\\\?\\') != 1:
+                wrong.append({'case': label, 'cwd': cwd, 'given': given, 'result': result, 'expected': expected})
+        control(results, 'EXTENDED_PATH_KEEPS_EVERY_COMPONENT_AS_GIVEN', not wrong and len(rows) == 26,
+                {'cases': len(rows), 'wrong': wrong[:6]})
+    if os.name == 'nt':
+        guarded('EXTENDED_PATH_KEEPS_EVERY_COMPONENT_AS_GIVEN', extended_path_keeps_names)
+    else:
+        skip('EXTENDED_PATH_KEEPS_EVERY_COMPONENT_AS_GIVEN', 'Win32 name normalisation and extended-length paths exist '
+                                                             'on Windows only')
+
+    def alias_named_junctions_to_outside() -> None:
+        observed: dict[str, Any] = {}
+        ok = True
+        for layout, name in (('space', 'j '), ('dot', 'j.')):
+            base = root / f'g2-{layout}'
+            project, copy, outside = base / 'project', base / 'copy', base / 'outside'
+            write_text_file(project / 'a.txt', 'a\n')
+            write_text_file(outside / 'keep.txt', 'keep\n')
+            write_text_file(outside / 'deep' / 'more.txt', 'more\n')
+            code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                                 '--no-git-snapshot')
+            # the real directory 'j' is the entry that a stripped name would reach
+            write_text_file(copy / 'j' / 'mine.txt', 'mine\n')
+            linked = make_link(outside, extended_path(copy) + '\\' + name)
+            tree, tree_outside = base / 'tree', base / 'tree-outside'
+            write_text_file(tree / 'j' / 'mine.txt', 'mine\n')
+            write_text_file(tree_outside / 'keep.txt', 'keep\n')
+            tree_linked = make_link(tree_outside, extended_path(tree) + '\\' + name)
+            remove_tree(tree / name)  # a plain path naming the alias entry itself: a link is never entered
+            tree_state_after = {'link_left': os.path.lexists(extended_path(tree) + '\\' + name),
+                                'real_directory_kept': (tree / 'j' / 'mine.txt').is_file(),
+                                'outside_kept': (tree_outside / 'keep.txt').is_file()}
+            before = tree_state(outside)
+            code, _ = run_cli('cleanup', '--dest', str(copy), '--project', str(project))
+            observed[layout] = {'workspace': code_ws, 'linked': linked, 'tree_linked': tree_linked,
+                                'remove_tree': tree_state_after, 'cleanup': code,
+                                'outside_unchanged': tree_state(outside) == before,
+                                'copy_left': os.path.lexists(extended_path(copy))}
+            ok = (ok and code_ws == 0 and linked and tree_linked and code == 0 and tree_state(outside) == before
+                  and len(before) == 3 and not os.path.lexists(extended_path(copy)) and tree_state_after == {
+                      'link_left': True, 'real_directory_kept': True, 'outside_kept': True})
+        control(results, 'CLEANUP_REMOVES_ALIAS_NAMED_JUNCTION_AND_KEEPS_THE_OUTSIDE_DIRECTORY', ok, observed)
+    if os.name == 'nt':
+        guarded('CLEANUP_REMOVES_ALIAS_NAMED_JUNCTION_AND_KEEPS_THE_OUTSIDE_DIRECTORY', alias_named_junctions_to_outside)
+    else:
+        skip('CLEANUP_REMOVES_ALIAS_NAMED_JUNCTION_AND_KEEPS_THE_OUTSIDE_DIRECTORY',
+             'Win32 name normalisation and junctions exist on Windows only')
+
+    def links_outside_listed() -> None:
+        project, copy, outside = root / 'c1-list-project', root / 'c1-list-copy', root / 'c1-list-outside'
+        write_text_file(project / 'a.txt', 'a\n')
+        write_text_file(outside / 'keep.txt', 'keep\n')
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                             '--no-git-snapshot')
+        (copy / 'inner').mkdir()
+        linked = make_link(outside, copy / 'out') and make_link(copy / 'inner', copy / 'in')
+        code_dry, dry, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project), '--dry-run')
+        code, _, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project))
+        listed = dry.get('links_leading_outside', [])
+        observed = {'workspace': code_ws, 'linked': linked, 'dry_run': code_dry, 'listed': listed, 'cleanup': code}
+        control(results, 'CLEANUP_LISTS_LINKS_LEADING_OUTSIDE_WITH_TARGETS', code_ws == 0 and linked and code_dry == 0
+                and [os.path.basename(item.get('path', '')) for item in listed] == ['out']
+                and same_location(strip_extended_prefix(str(listed[0].get('target'))), outside)
+                and dry.get('links_removed_not_followed') == 2 and code == 0 and not copy.exists()
+                and (outside / 'keep.txt').is_file(), observed)
+    guarded('CLEANUP_LISTS_LINKS_LEADING_OUTSIDE_WITH_TARGETS', links_outside_listed)
+
+    def mounts_and_unclassified() -> None:
+        project, copy = root / 'c2-project', root / 'c2-copy'
+        write_text_file(project / 'a.txt', 'a\n')
+        code_ws, _ = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                             '--no-git-snapshot')
+        write_text_file(copy / 'node_modules' / 'pkg' / 'index.js', 'outside content\n')
+        write_text_file(copy / 'odd' / 'f.txt', 'f\n')
+        fake = str((copy / 'node_modules' / 'pkg').resolve())
+        with patch(f'{__name__}.mount_points', return_value=['/', fake]):
+            code_dry, dry, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project), '--dry-run')
+            code, mounted, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project))
+        kept_mount = (copy / 'node_modules' / 'pkg' / 'index.js').is_file() and (copy / 'a.txt').is_file()
+        real_kind = entry_kind
+
+        def odd_entry(item: os.DirEntry) -> str:
+            if item.name == 'odd':
+                raise OSError(13, 'synthetic: cannot classify')
+            return real_kind(item)
+        linked = make_link(copy / 'odd', copy / 'odd-link')  # stopping means before links are removed, too
+        with patch(f'{__name__}.entry_kind', side_effect=odd_entry):
+            code_odd, odd, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project))
+        kept_odd = (linked and os.path.lexists(copy / 'odd-link') and (copy / 'a.txt').is_file()
+                    and (copy / 'node_modules' / 'pkg' / 'index.js').is_file())
+        code_final, _, _ = in_process('cleanup', '--dest', str(copy), '--project', str(project))
+        table = mount_points()  # the real table: Linux names its /proc mount point, elsewhere there is none
+        table_ok = '/' in table and '/proc' in table if sys.platform.startswith('linux') else table is None
+        observed = {'workspace': code_ws, 'dry_run': [code_dry, dry.get('mount_points')], 'mounted': code,
+                    'table': table[:20] if table else table,
+                    'mount_points': mounted.get('mount_points'), 'hint': mounted.get('hint'), 'kept': kept_mount,
+                    'unclassified': [code_odd, odd.get('unclassified_entries'), odd.get('removed')],
+                    'kept_after_unclassified': kept_odd, 'final': code_final}
+        control(results, 'CLEANUP_STOPS_AT_MOUNT_POINTS_AND_UNCLASSIFIED_ENTRIES', code_ws == 0 and code_dry == 1
+                and dry.get('mount_points') == [fake] and code == 1 and mounted.get('removed') is False
+                and mounted.get('mount_points') == [fake] and 'Unmount' in str(mounted.get('hint')) and kept_mount
+                and code_odd == 1 and odd.get('removed') is False and kept_odd
+                and any('odd' in entry for entry in odd.get('unclassified_entries', []))
+                and code_final == 0 and not copy.exists() and table_ok, observed)
+    guarded('CLEANUP_STOPS_AT_MOUNT_POINTS_AND_UNCLASSIFIED_ENTRIES', mounts_and_unclassified)
+
+    def git_calls_read_only() -> None:
+        project, marks, template = root / 'c3-project', root / 'c3-marks', root / 'c3-template'
+        write_text_file(project / 'src' / 'a.txt', 'a\n')
+        write_text_file(project / 'b.txt', 'b\n')
+        run_git(['init', '-q'], project)
+        run_git(['add', '-A'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        run_git(['update-ref', 'HEAD', run_git(['commit-tree', tree, '-m', 'i'], project, env=identity).decode().strip()],
+                project)
+        marks.mkdir()
+
+        def script(path: Path, mark: str, end: str = '') -> None:
+            write_text_file(path, f'#!/bin/sh\necho "$0 $*" >> "{(marks / mark).as_posix()}"\n{end}')
+            os.chmod(path, 0o755)
+        script(project / '.git' / 'hooks' / 'post-index-change', 'hook.log')
+        script(root / 'c3-fsmonitor.sh', 'fsmonitor.log', 'exit 1\n')
+        run_git(['config', 'core.fsmonitor', (root / 'c3-fsmonitor.sh').as_posix()], project)
+        script(template / 'hooks' / 'post-index-change', 'template.log')
+        ignore = root / 'c3-global-ignore'
+        write_text_file(ignore, 'c.txt\n')
+        global_config = root / 'c3-global-config'
+        write_text_file(global_config, f'[core]\n\texcludesFile = {ignore.as_posix()}\n')
+        os.utime(project / 'src' / 'a.txt', (1_600_000_000, 1_600_000_000))  # stat-dirty, same content
+        write_text_file(project / 'c.txt', 'untracked, ignored only by the global configuration the caller names\n')
+
+        def state() -> tuple[str, list[str]]:
+            listed = sorted(str(path.relative_to(project / '.git')) for path in (project / '.git').rglob('*'))
+            return sha256_file(project / '.git' / 'index'), listed
+        before = state()
+        env = {**os.environ, 'GIT_TEMPLATE_DIR': str(template), 'GIT_CONFIG_GLOBAL': str(global_config)}
+        codes = {}
+        for label, arguments in (
+                ('baseline', ['baseline', '--project', str(project), '--out', str(root / 'c3-base.json')]),
+                ('compare', ['baseline', '--project', str(project), '--compare', str(root / 'c3-base.json')]),
+                ('workspace', ['workspace', '--project', str(project), '--dest', str(root / 'c3-copy')]),
+                ('init', ['init', '--project', str(project), '--results-dir', str(root / 'c3-results')])):
+            code, output = run_cli(*arguments, env=env)
+            codes[label] = code
+            if label == 'baseline':
+                codes['file_count'] = json_head(output).get('file_count')
+        stat_dirty = state()
+        # every Git call, also one that writes an index: no hooks, no fsmonitor program
+        run_git(['update-index', '--refresh'], project)
+        run_git(['status', '--porcelain'], project)
+        written = [name for name in ('hook.log', 'fsmonitor.log', 'template.log') if (marks / name).exists()]
+        # the recorded hooks are the repository's own (not the null device the calls name); a rename counts with its
+        # new path, a change below the project directory relative to it
+        hooks_before = git_state(project)['hooks']
+        script(project / '.git' / 'hooks' / 'pre-commit', 'unused.log')
+        hooks_seen = git_state(project)['hooks'] != hooks_before
+        run_git(['mv', 'b.txt', 'renamed.txt'], project)
+        write_text_file(project / 'src' / 'a.txt', 'changed\n')
+        paths = {'root': sorted(uncommitted_paths(project)), 'src': uncommitted_paths(project / 'src')}
+        observed = {'codes': codes, 'index_unchanged': stat_dirty[0] == before[0], 'git_files_unchanged':
+                    stat_dirty[1] == before[1], 'marks': written,
+                    'copy_hooks': os.path.isdir(root / 'c3-copy' / '.git' / 'hooks'), 'hooks_seen': hooks_seen,
+                    'uncommitted': paths}
+        control(results, 'GIT_CALLS_NEVER_WRITE_THE_ORIGINAL_OR_RUN_HOOKS', codes == {
+            'baseline': 0, 'file_count': 3, 'compare': 0, 'workspace': 0, 'init': 0} and stat_dirty == before
+                and not written and not observed['copy_hooks'] and hooks_seen
+                and paths == {'root': ['renamed.txt', 'src/a.txt'], 'src': ['a.txt']}, observed)
+    if git_available():
+        guarded('GIT_CALLS_NEVER_WRITE_THE_ORIGINAL_OR_RUN_HOOKS', git_calls_read_only)
+    else:
+        skip('GIT_CALLS_NEVER_WRITE_THE_ORIGINAL_OR_RUN_HOOKS', 'git unavailable')
+
+    def git_calls_ignore_trace_variables() -> None:
+        project, outside = root / 'g1-project', root / 'g1-outside'
+        write_text_file(project / 'src' / 'a.txt', 'a\n')
+        write_text_file(project / 'b.txt', 'b\n')
+        outside.mkdir()
+        run_git(['init', '-q'], project)
+        run_git(['add', '-A'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        run_git(['update-ref', 'HEAD', run_git(['commit-tree', tree, '-m', 'i'], project, env=identity).decode().strip()],
+                project)
+        names = ['GIT_TRACE', 'GIT_TRACE_PACKET', 'GIT_TRACE_SETUP', 'GIT_TRACE_PERFORMANCE', 'GIT_TRACE_CURL',
+                 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF', 'GIT_TRACE2_NORMAL', 'GIT_REDIRECT_STDERR',
+                 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDIN']
+        env = {**os.environ}
+        for number, name in enumerate(names):  # alternately inside the original and outside it
+            env[name] = str((project if number % 2 == 0 else outside) / f'{name.lower()}.log')
+        kept = {'PATH': 'p', 'GIT_TERMINAL_PROMPT': '0', 'GIT_TRACED': 'x', 'GIT_TRACE2X': 'y'}
+        mixed = {**{name.lower(): 'f' for name in names}, **{name: 'f' for name in names}, **kept}
+        command_environment = git_command(['status'], mixed)[1]
+        # Windows compares names case-insensitively; elsewhere only the exact upper-case spellings reach Git
+        left = sorted(name for name, value in command_environment.items()
+                      if (name.upper() if os.name == 'nt' else name) in names and value != '0')
+
+        def marks() -> list[tuple[str, int, int]]:
+            return sorted((path.relative_to(project).as_posix(), path.stat().st_size, path.stat().st_mtime_ns)
+                          for path in project.rglob('*') if path.is_file())
+        before = marks()
+        codes = {}
+        for label, arguments in (
+                ('baseline', ['baseline', '--project', str(project), '--out', str(root / 'g1-base.json')]),
+                ('compare', ['baseline', '--project', str(project), '--compare', str(root / 'g1-base.json')]),
+                ('workspace', ['workspace', '--project', str(project), '--dest', str(root / 'g1-copy')]),
+                ('cleanup', ['cleanup', '--dest', str(root / 'g1-copy'), '--project', str(project)])):
+            codes[label], output = run_cli(*arguments, env=env)
+            if label == 'baseline':  # the redirected output of a Git call must not empty the snapshot
+                codes['file_count'] = json_head(output).get('file_count')
+        written = sorted(str(path.relative_to(root)) for path in root.rglob('*.log')
+                         if path.name in {name.lower() + '.log' for name in names})
+        observed = {'codes': codes, 'trace_files': written, 'original_unchanged': marks() == before,
+                    'left': left, 'kept': sorted(name for name in kept if name in command_environment)}
+        control(results, 'GIT_CALLS_DROP_TRACE_AND_REDIRECT_VARIABLES', codes == {
+            'baseline': 0, 'file_count': 2, 'compare': 0, 'workspace': 0, 'cleanup': 0} and not written
+                and marks() == before
+                and not left and sorted(kept) == observed['kept'], observed)
+    if git_available():
+        guarded('GIT_CALLS_DROP_TRACE_AND_REDIRECT_VARIABLES', git_calls_ignore_trace_variables)
+    else:
+        skip('GIT_CALLS_DROP_TRACE_AND_REDIRECT_VARIABLES', 'git unavailable')
+
+    def git_calls_ignore_trace_targets_of_configuration() -> None:
+        project, outside = root / 'j2-project', root / 'j2-outside'
+        write_text_file(project / 'src' / 'a.txt', 'a\n')
+        write_text_file(project / 'b.txt', 'b\n')
+        outside.mkdir()
+        run_git(['init', '-q'], project)
+        run_git(['add', '-A'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        run_git(['update-ref', 'HEAD', run_git(['commit-tree', tree, '-m', 'i'], project, env=identity).decode().strip()],
+                project)
+
+        def variant(label: str, directory: Path, prefix: str, through: str) -> dict[str, str]:
+            """Environment whose global configuration (through XDG_CONFIG_HOME or HOME) names the three trace2 targets."""
+            home, xdg = root / f'j2-home-{label}', root / f'j2-xdg-{label}'
+            (xdg / 'git').mkdir(parents=True)
+            home.mkdir()
+            write_text_file(xdg / 'git' / 'config' if through == 'xdg' else home / '.gitconfig', '[trace2]\n' + ''.join(
+                f'\t{kind} = {(directory / (prefix + kind.lower() + ".log")).as_posix()}\n'
+                for kind in ('normalTarget', 'eventTarget', 'perfTarget')))
+            return {**os.environ, 'HOME': str(home), 'XDG_CONFIG_HOME': str(xdg)}
+        # Git itself writes to the targets of a configuration: these files prove that it takes effect
+        subprocess.run(['git', 'status'], cwd=str(project), env=variant('sanity', outside, 'sanity-', 'xdg'),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proven = sorted(path.name for path in outside.glob('sanity-*.log'))
+
+        def marks() -> list[tuple[str, int, int]]:
+            return sorted((path.relative_to(project).as_posix(), path.stat().st_size, path.stat().st_mtime_ns)
+                          for path in project.rglob('*') if path.is_file())
+        before = marks()
+        codes = {}
+        for through, directory in (('xdg', project), ('home', outside)):  # targets inside the original and outside it
+            env = variant(through, directory, 'trace-', through)
+            base = str(root / f'j2-base-{through}.json')
+            for label, arguments in (
+                    ('baseline', ['baseline', '--project', str(project), '--out', base]),
+                    ('compare', ['baseline', '--project', str(project), '--compare', base]),
+                    ('workspace', ['workspace', '--project', str(project), '--dest', str(root / f'j2-copy-{through}')])):
+                codes[through + '-' + label] = run_cli(*arguments, env=env)[0]
+        written = sorted(str(path.relative_to(root)) for path in root.rglob('trace-*.log'))
+        observed = {'codes': codes, 'trace_files': written, 'original_unchanged': marks() == before, 'proven': proven}
+        control(results, 'GIT_CALLS_IGNORE_TRACE_TARGETS_OF_THE_CONFIGURATION', proven == [
+            'sanity-eventtarget.log', 'sanity-normaltarget.log', 'sanity-perftarget.log'] and len(codes) == 6
+                and set(codes.values()) == {0} and not written and marks() == before, observed)
+    if git_available():
+        guarded('GIT_CALLS_IGNORE_TRACE_TARGETS_OF_THE_CONFIGURATION', git_calls_ignore_trace_targets_of_configuration)
+    else:
+        skip('GIT_CALLS_IGNORE_TRACE_TARGETS_OF_THE_CONFIGURATION', 'git unavailable')
+
+    def filter_command(name: str, mark: Path, end: str) -> str:
+        """Command line of a shell script that appends a line to mark and then runs `end`."""
+        write_text_file(root / name, f'#!/bin/sh\necho "$0 $*" >> "{mark.as_posix()}"\n{end}')
+        return f"sh '{(root / name).as_posix()}'"
+
+    def mark_texts(folder: Path) -> dict[str, str]:
+        return {path.name: path.read_text(encoding='utf-8') for path in sorted(folder.iterdir())}
+
+    def git_calls_run_no_configured_program() -> None:
+        project, marks_dir, xdg = root / 'j3-project', root / 'j3-marks', root / 'j3-xdg'
+        marks_dir.mkdir()
+        (xdg / 'git').mkdir(parents=True)
+        contents = {'a.txt': 'a\n', 'src/b.txt': 'b\n', 'c.md': 'c\n',
+                    '.gitattributes': '*.txt filter=probe\n*.md filter=proc\n'}
+        for rel, text in contents.items():
+            write_text_file(project / rel, text)
+        run_git(['init', '-q'], project)
+        run_git(['add', '-A'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        run_git(['update-ref', 'HEAD', run_git(['commit-tree', tree, '-m', 'i'], project, env=identity).decode().strip()],
+                project)
+        # clean and smudge filters of the original, a long-running (process) filter of the user's configuration
+        run_git(['config', 'filter.probe.clean', filter_command('j3-clean.sh', marks_dir / 'clean.log', 'cat\n')], project)
+        run_git(['config', 'filter.probe.smudge', filter_command('j3-smudge.sh', marks_dir / 'smudge.log', 'cat\n')],
+                project)
+        run_git(['config', 'filter.probe.required', 'true'], project)
+        write_text_file(xdg / 'git' / 'config', '[filter "proc"]\n\tprocess = ' + filter_command(
+            'j3-process.sh', marks_dir / 'process.log', 'exit 1\n') + '\n\trequired = true\n')
+        env = {**os.environ, 'XDG_CONFIG_HOME': str(xdg)}
+
+        def make_stat_dirty(seconds: int) -> None:  # same content, another modification time: Git hashes the file again
+            for rel in contents:
+                os.utime(project / rel, (seconds, seconds))
+        # Git itself runs the programs of a configuration: these marks prove that it takes effect
+        make_stat_dirty(1_500_000_000)
+        subprocess.run(['git', 'status'], cwd=str(project), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proven = mark_texts(marks_dir)
+        make_stat_dirty(1_500_000_001)
+        codes = {}
+        for label, arguments in (
+                ('baseline', ['baseline', '--project', str(project), '--out', str(root / 'j3-base.json')]),
+                ('compare', ['baseline', '--project', str(project), '--compare', str(root / 'j3-base.json')]),
+                ('workspace', ['workspace', '--project', str(project), '--dest', str(root / 'j3-copy')])):
+            code, output = run_cli(*arguments, env=env)
+            codes[label] = code
+            if label == 'workspace':
+                codes['snapshot'] = (json_head(output).get('git_snapshot') or {}).get('created')
+        run_git(['status', '--porcelain'], project, env=env)
+        listed = read_json(root / 'j3-base.json').get('files') if (root / 'j3-base.json').is_file() else None
+        observed = {'codes': codes, 'proven': sorted(proven), 'marks_unchanged': mark_texts(marks_dir) == proven,
+                    'hashes': listed == {rel: sha256_file(project / rel) for rel in contents}}
+        run_git(['config', 'filter.a=b.clean', 'cat'], project)  # a name that no -c option can address
+        try:
+            uncommitted_paths(project)
+            observed['unswitchable'] = ''
+        except ToolError as exc:
+            observed['unswitchable'] = str(exc)
+        control(results, 'GIT_CALLS_RUN_NO_PROGRAM_OF_THE_CONFIGURATION', {'clean.log', 'process.log'} <= set(proven)
+                and codes == {'baseline': 0, 'compare': 0, 'workspace': 0, 'snapshot': True}
+                and observed['marks_unchanged'] and observed['hashes']
+                and 'cannot be switched off' in observed['unswitchable'], observed)
+    if git_available():
+        guarded('GIT_CALLS_RUN_NO_PROGRAM_OF_THE_CONFIGURATION', git_calls_run_no_configured_program)
+    else:
+        skip('GIT_CALLS_RUN_NO_PROGRAM_OF_THE_CONFIGURATION', 'git unavailable')
+
+    def git_status_does_not_enter_submodules() -> None:
+        project, marks_dir = root / 'j3-super', root / 'j3-super-marks'
+        sub = project / 'sub'
+        marks_dir.mkdir()
+        write_text_file(project / 't.txt', 't\n')
+        write_text_file(sub / 's.txt', 's\n')
+        write_text_file(sub / '.gitattributes', '*.txt filter=probe\n')
+        for repository in (sub, project):
+            run_git(['init', '-q'], repository)
+        run_git(['add', '-A'], sub)
+        sub_head = run_git(['commit-tree', run_git(['write-tree'], sub).decode().strip(), '-m', 'i'], sub,
+                           env=identity).decode().strip()
+        run_git(['update-ref', 'HEAD', sub_head], sub)
+        # the configuration of the submodule: a clean filter and a file-system monitor program
+        run_git(['config', 'filter.probe.clean', filter_command('j3-sub-clean.sh', marks_dir / 'clean.log', 'cat\n')], sub)
+        run_git(['config', 'core.fsmonitor', filter_command('j3-sub-fsmonitor.sh', marks_dir / 'fsmonitor.log',
+                                                            'exit 1\n')], sub)
+        run_git(['add', 't.txt'], project)
+        run_git(['update-index', '--add', '--cacheinfo', f'160000,{sub_head},sub'], project)
+        tree = run_git(['write-tree'], project).decode().strip()
+        run_git(['update-ref', 'HEAD', run_git(['commit-tree', tree, '-m', 'i'], project, env=identity).decode().strip()],
+                project)
+        os.utime(sub / 's.txt', (1_500_000_000, 1_500_000_000))
+        subprocess.run(['git', 'status'], cwd=str(project), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proven = mark_texts(marks_dir)  # Git enters the submodule and runs the clean filter of its configuration
+        os.utime(sub / 's.txt', (1_500_000_001, 1_500_000_001))
+        code, output = run_cli('baseline', '--project', str(project), '--out', str(root / 'j3-super-base.json'))
+        changed = uncommitted_paths(project)
+        observed = {'proven': sorted(proven), 'exit': code, 'file_count': json_head(output).get('file_count'),
+                    'marks_unchanged': mark_texts(marks_dir) == proven, 'uncommitted': changed}
+        control(results, 'GIT_STATUS_DOES_NOT_ENTER_SUBMODULES', 'clean.log' in proven and code == 0
+                and observed['file_count'] == 3 and observed['marks_unchanged'] and not changed, observed)
+    if git_available():
+        guarded('GIT_STATUS_DOES_NOT_ENTER_SUBMODULES', git_status_does_not_enter_submodules)
+    else:
+        skip('GIT_STATUS_DOES_NOT_ENTER_SUBMODULES', 'git unavailable')
+
+    def link_fallback() -> None:
+        project = root / 'c4-project'
+        secret = 'sk_' + 'live_' + 'Zq8xQmV3rT5pL2wN9bH4'
+        write_text_file(project / '.env', f'STRIPE_KEY={secret}\n')
+        write_text_file(project / 'docs' / 'guide.md', 'guide\n')
+        write_text_file(project / 'node_modules' / 'pkg' / 'index.js', 'module.exports = 1\n')
+        try:
+            for target, name in (('.env', 'app.cfg'), (os.path.join('..', '.env'), 'src/settings.txt'),
+                                 ('.env', '.env.example'), (os.path.join('docs', 'guide.md'), 'GUIDE.md'),
+                                 (os.path.join('node_modules', 'pkg', 'index.js'), 'entry.js')):
+                (project / name).parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(target, project / name)
+        except (OSError, NotImplementedError):
+            skip('WORKSPACE_LINK_FALLBACK_COPIES_ONLY_FILES_THE_COPY_HOLDS', 'Symlinks cannot be created on this system')
+            return
+        observed: dict[str, Any] = {}
+        ok = True
+        privilege = OSError(1, 'A required privilege is not held by the client')
+        for mode in ('filesystem', 'git'):
+            if mode == 'git':
+                write_text_file(project / '.gitignore', '.env\nnode_modules/\n')
+                run_git(['init', '-q'], project)
+            copy = root / f'c4-copy-{mode}'
+            with patch(f'{__name__}.os.symlink', side_effect=privilege):
+                code, summary, error = in_process('workspace', '--project', str(project), '--dest', str(copy), '--mode',
+                                                  mode, '--no-git-snapshot')
+            leaked = sorted(path.name for path in copy.rglob('*') if path.is_file()
+                            and secret in path.read_text(encoding='utf-8', errors='replace'))
+            listed = {item.get('path'): item.get('reason', '') for item in summary.get('links_not_created', [])}
+            observed[mode] = {'exit': code, 'error': error, 'leaked': leaked, 'not_created': listed}
+            ok = (ok and code == 0 and not leaked and sorted(listed) == ['.env.example', 'app.cfg', 'entry.js',
+                                                                         'src/settings.txt']
+                  and (mode == 'git' or all('withheld' in listed[name] for name in ('.env.example', 'app.cfg',
+                                                                                     'src/settings.txt')))
+                  and 'not part of the copy' in listed['entry.js'] and summary.get('matches_baseline') is False
+                  and (copy / 'GUIDE.md').read_text(encoding='utf-8') == 'guide\n')
+        control(results, 'WORKSPACE_LINK_FALLBACK_COPIES_ONLY_FILES_THE_COPY_HOLDS', ok, observed)
+    guarded('WORKSPACE_LINK_FALLBACK_COPIES_ONLY_FILES_THE_COPY_HOLDS', link_fallback)
+
+    def credential_content_rules() -> None:
+        project, copy, copy2 = root / 'c5-project', root / 'c5-copy', root / 'c5-copy2'
+        token = 'sk_' + 'live_' + 'Zq8xQmV3rT5pL2wN9bH4'
+        contents = {'auth/.yarnrc': f'"//registry.npmjs.org/:_authToken" "{token}"\n',
+                    'plain/.yarnrc': 'registry "https://registry.npmjs.org/"\n',
+                    'keys/ssh2.pem': '---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nAAAAsynthetic\n'
+                                     '---- END SSH2 ENCRYPTED PRIVATE KEY ----\n',
+                    'apps/.env.schema': f'KEY={token}\n',
+                    '.env.example': 'DATABASE_URL=postgres://postgres:postgres@localhost/app\nKEY=changeme\n',
+                    'id_rsa.pub': 'ssh-rsa AAAAsynthetic user@host\n'}
+        for rel, text in contents.items():
+            write_text_file(project / rel, text)
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        summary = json_head(output)
+        code2, output2 = run_cli('workspace', '--project', str(project), '--dest', str(copy2), '--mode', 'filesystem',
+                                 '--no-git-snapshot', '--include', 'apps/.env.schema')
+        summary2 = json_head(output2)
+        withheld = ['apps/.env.schema', 'auth/.yarnrc', 'keys/ssh2.pem']
+        observed = {'exit': code, 'withheld': summary.get('withheld_credential_files'),
+                    'content': summary.get('withheld_secret_content'), 'included': summary2.get('explicitly_included')}
+        control(results, 'WORKSPACE_WITHHOLDS_YARNRC_SSH2_KEYS_AND_SECRET_TEMPLATES', code == 0
+                and summary.get('withheld_credential_files') == withheld
+                and [item.get('path') for item in summary.get('withheld_secret_content', [])] == ['apps/.env.schema']
+                and not any((copy / rel).exists() for rel in withheld)
+                and all((copy / rel).is_file() for rel in ('plain/.yarnrc', '.env.example', 'id_rsa.pub'))
+                and token not in output and any('--include <path>' in hint for hint in summary.get('hints', []))
+                and code2 == 0 and summary2.get('explicitly_included') == ['apps/.env.schema']
+                and (copy2 / 'apps' / '.env.schema').is_file(), observed)
+    guarded('WORKSPACE_WITHHOLDS_YARNRC_SSH2_KEYS_AND_SECRET_TEMPLATES', credential_content_rules)
+
+    def envkeys_escapes() -> None:
+        folder = root / 'c6'
+        folder.mkdir(parents=True, exist_ok=True)
+        observed: dict[str, Any] = {}
+        ok = True
+        for name, (text, expected) in ENVKEYS_ESCAPE_INPUTS.items():
+            (folder / name).write_bytes(text.encode('utf-8'))
+            code, output = run_cli('envkeys', str(folder / name))
+            keys = [row.get('key') for row in json_head(output).get('keys', [])]
+            observed[name] = keys
+            ok = ok and code == 0 and keys == expected and 'SECRETPART' not in output and 'BODYLINE' not in output
+        escaped_key = 'PK="-----BEGIN RSA PRIVATE KEY-----\\nMIIEsynthetic\\n-----END RSA PRIVATE KEY-----"\nB=2\n'
+        (folder / 'pem-escaped.env').write_bytes(escaped_key.encode('utf-8'))
+        code, output = run_cli('envkeys', str(folder / 'pem-escaped.env'))
+        shapes = {row.get('key'): row.get('shape') for row in json_head(output).get('keys', [])}
+        observed['pem-escaped.env'] = shapes
+        control(results, 'ENVKEYS_SINGLE_QUOTE_ESCAPES_COLON_FORM_AND_ONE_LINE_KEYS', ok and code == 0
+                and shapes == {'PK': 'looks real (private key)', 'B': 'Switch or number'}, observed)
+    guarded('ENVKEYS_SINGLE_QUOTE_ESCAPES_COLON_FORM_AND_ONE_LINE_KEYS', envkeys_escapes)
+
+    def results_directory() -> None:
+        project = root / 'c7-project'
+        write_text_file(project / 'src' / 'a.py', 'a = 1\n')
+        write_text_file(project / 'out' / 'keep.txt', 'k\n')
+        elsewhere = root / 'c7-elsewhere'
+        elsewhere.mkdir()
+        linked = make_link(project / 'src', project / DEFAULT_RESULTS_DIRNAME)
+        refused = {}
+        for label, arguments in (
+                ('init', ['init', '--project', str(project), '--mode', 'filesystem']),
+                ('baseline', ['baseline', '--project', str(project), '--mode', 'filesystem']),
+                ('workspace', ['workspace', '--project', str(project), '--dest', str(root / 'c7-copy'), '--mode',
+                               'filesystem', '--record', str(project / DEFAULT_RESULTS_DIRNAME / 'r' / 'ws.json')])):
+            code, output = run_cli(*arguments)
+            refused[label] = code == 2 and 'symbolic link, junction' in output and '--results-dir' in output
+        made_in_src = sorted(path.name for path in (project / 'src').iterdir())
+        linked = linked and make_link(elsewhere, project / 'out' / 'link')
+        code_component, output_component = run_cli('init', '--project', str(project), '--mode', 'filesystem',
+                                                   '--results-dir', str(project / 'out' / 'link' / 'results'))
+        code_root, output_root = run_cli('workspace', '--project', str(project), '--dest', str(root / 'c7-copy2'),
+                                         '--mode', 'filesystem', '--results-dir', str(project), '--record',
+                                         str(project / 'src' / 'rec.json'))
+        code_ok, _ = run_cli('init', '--project', str(project), '--mode', 'filesystem', '--results-dir',
+                             str(project / 'out' / 'results'))
+        observed = {'linked': linked, 'refused': refused, 'src': made_in_src, 'component': code_component,
+                    'root': code_root, 'real_directory': code_ok}
+        control(results, 'RESULTS_DIRECTORY_IS_NO_LINK_AND_NOT_THE_PROJECT', linked and all(refused.values())
+                and made_in_src == ['a.py'] and not os.listdir(elsewhere) and code_component == 2
+                and 'out' in output_component and code_root == 2 and 'project root' in output_root
+                and not (project / 'src' / 'rec.json').exists() and code_ok == 0, observed)
+    guarded('RESULTS_DIRECTORY_IS_NO_LINK_AND_NOT_THE_PROJECT', results_directory)
+
+    def internal_junctions() -> None:
+        project, copy = root / 'c8-project', root / 'c8-copy'
+        write_text_file(project / 'common' / 'u.txt', 'u\n')
+        write_text_file(project / 'node_modules' / 'pkg' / 'i.js', 'i\n')
+        linked = make_link(project / 'common', project / 'jcommon') and make_link(project / 'node_modules',
+                                                                                 project / 'jmodules')
+        code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', 'filesystem',
+                               '--no-git-snapshot')
+        summary = json_head(output)
+        target = os.readlink(copy / 'jcommon') if is_junction(copy / 'jcommon') else ''
+        listed = [(item.get('path'), item.get('reason')) for item in summary.get('links_not_created', [])]
+        observed = {'linked': linked, 'exit': code, 'target': target, 'not_created': listed,
+                    'unsafe': summary.get('unsafe_symlinks_not_created')}
+        control(results, 'WORKSPACE_RECREATES_INTERNAL_JUNCTIONS_IN_THE_COPY', linked and code == 0
+                and same_location(strip_extended_prefix(target), copy / 'common')
+                and (copy / 'jcommon' / 'u.txt').read_text(encoding='utf-8') == 'u\n'
+                and listed == [('jmodules', 'Junction target is not part of the copy')]
+                and not os.path.lexists(copy / 'jmodules') and not summary.get('unsafe_symlinks_not_created'), observed)
+    if os.name == 'nt':
+        guarded('WORKSPACE_RECREATES_INTERNAL_JUNCTIONS_IN_THE_COPY', internal_junctions)
+    else:
+        skip('WORKSPACE_RECREATES_INTERNAL_JUNCTIONS_IN_THE_COPY', 'Junctions exist on Windows only')
+
+    def nested_git_entries() -> None:
+        project = root / 'c8-nested'
+        for rel in ('top.txt', 'nested/n.txt', 'sub/deep/d.txt'):
+            write_text_file(project / rel, rel + '\n')
+        run_git(['init', '-q'], project)
+        run_git(['init', '-q'], project / 'nested')
+        write_text_file(project / 'sub' / 'deep' / '.git', 'gitdir: ../../../c8-elsewhere.git\n')
+        (project / 'empty').mkdir()
+        run_git(['init', '-q'], project / 'empty')  # no files: neither Git nor the snapshot lists anything of it
+        observed = {}
+        for mode in ('git', 'filesystem'):
+            code, output = run_cli('workspace', '--project', str(project), '--dest', str(root / f'c8-nested-{mode}'),
+                                   '--mode', mode, '--no-git-snapshot')
+            summary = json_head(output)
+            observed[mode] = (code, summary.get('git_entries_not_copied'),
+                              any('git_entries_not_copied' in hint for hint in summary.get('hints', [])))
+        # a link to another repository is no nested repository of the project: the walk never enters it
+        linked_project, elsewhere = root / 'c8-nested-link', root / 'c8-nested-elsewhere'
+        write_text_file(linked_project / 'top.txt', 'top\n')
+        elsewhere.mkdir()
+        run_git(['init', '-q'], elsewhere)
+        run_git(['init', '-q'], linked_project)
+        linked =make_link(elsewhere, linked_project / 'ln')
+        for mode in ('git', 'filesystem'):
+            summary = json_head(run_cli('workspace', '--project', str(linked_project), '--dest',
+                                        str(root / f'c8-nested-link-{mode}'), '--mode', mode, '--no-git-snapshot')[1])
+            observed['link_' + mode] = summary.get('git_entries_not_copied')
+        control(results, 'WORKSPACE_LISTS_NESTED_GIT_ENTRIES_IN_BOTH_MODES', observed == {
+            'git': (0, ['empty/.git', 'nested/.git', 'sub/deep/.git'], True),
+            'filesystem': (0, ['empty/.git', 'nested/.git', 'sub/deep/.git'], True),
+            'link_git': [], 'link_filesystem': []} and linked, {**observed, 'linked': linked})
+    if git_available():
+        guarded('WORKSPACE_LISTS_NESTED_GIT_ENTRIES_IN_BOTH_MODES', nested_git_entries)
+    else:
+        skip('WORKSPACE_LISTS_NESTED_GIT_ENTRIES_IN_BOTH_MODES', 'git unavailable')
+
+    def nested_git_entries_in_other_case() -> None:
+        project = root / 'c9-nested-case'
+        write_text_file(project / 'top.txt', 'top\n')
+        write_text_file(project / 'sub' / 'x.txt', 'x\n')
+        (project / 'empty').mkdir()
+        for folder in (project / 'sub', project / 'empty', project):
+            run_git(['init', '-q'], folder)
+        for folder in (project / 'sub', project / 'empty', project):  # the project's own repository as well
+            os.rename(folder / '.git', folder / '.git-spelling')
+            os.rename(folder / '.git-spelling', folder / '.GIT')
+        spelled = sorted(name for folder in (project / 'sub', project / 'empty', project) for name in os.listdir(folder)
+                         if name.lower() == '.git')
+        observed = {'spelled': spelled}
+        for mode in ('git', 'filesystem'):
+            copy = root / f'c9-nested-case-{mode}'
+            code, output = run_cli('workspace', '--project', str(project), '--dest', str(copy), '--mode', mode,
+                                   '--no-git-snapshot')
+            observed[mode] = (code, json_head(output).get('git_entries_not_copied'), sorted(os.listdir(copy / 'sub')),
+                              sorted(os.listdir(copy / 'empty')) if (copy / 'empty').is_dir() else [])
+        control(results, 'WORKSPACE_LISTS_NESTED_GIT_ENTRIES_SPELLED_IN_ANOTHER_CASE', spelled == ['.GIT', '.GIT', '.GIT']
+                and all(observed[mode] == (0, ['empty/.GIT', 'sub/.GIT'], ['x.txt'], []) for mode in ('git', 'filesystem')),
+                observed)
+    if os.name != 'nt':
+        skip('WORKSPACE_LISTS_NESTED_GIT_ENTRIES_SPELLED_IN_ANOTHER_CASE', 'Directory names differ in case on Windows only')
+    elif git_available():
+        guarded('WORKSPACE_LISTS_NESTED_GIT_ENTRIES_SPELLED_IN_ANOTHER_CASE', nested_git_entries_in_other_case)
+    else:
+        skip('WORKSPACE_LISTS_NESTED_GIT_ENTRIES_SPELLED_IN_ANOTHER_CASE', 'git unavailable')
+    return results
+
+
 def run_environment_process_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     results = [] if results is None else results
     workspace, evidence = root / 'copy', root / 'logs'
-    write_json_new(workspace / WORKSPACE_MARKER, {})
+    write_fixture_marker(workspace)
     python = sys.executable
     common = ('--evidence-dir', str(evidence), '--cwd', str(workspace))
     credential_url = 'https://synth:UrlSecret7791@registry.invalid/simple'
@@ -5372,7 +14360,7 @@ def run_environment_process_controls(root: Path, results: list[dict[str, Any]] |
 
     project = root / 'include-project'
     write_text_file(project / '.env', 'SYNTH_CONFIG=sample\n')
-    write_text_file(project / 'synthetic.pem', 'synthetic certificate fixture\n')
+    write_text_file(project / 'synthetic.pem', '-----BEGIN PRIVATE KEY-----\nsynthetic fixture\n-----END PRIVATE KEY-----\n')
     write_text_file(project / 'app.txt', 'normal\n')
     glob_copy, exact_copy = root / 'glob-copy', root / 'exact-copy'
     code_glob, _ = run_cli('workspace', '--project', str(project), '--dest', str(glob_copy), '--include', '*',
@@ -5385,7 +14373,7 @@ def run_environment_process_controls(root: Path, results: list[dict[str, Any]] |
 
     secret = 'SynthWideSecret-8829xyz'
     write_text_file(workspace / 'config.txt', 'DB_PASSWORD=' + secret + '\n')
-    (workspace / WORKSPACE_MARKER).write_text(json.dumps({'secret_value_files': ['config.txt']}), encoding='utf-8')
+    write_fixture_marker(workspace, secret_value_files=['config.txt'])
     code, _ = run_cli('run', '--id', 'UTF16-OUTPUT', *common, '--', python, '-c',
                       'import sys; from pathlib import Path; value=Path("config.txt").read_text().strip().split("=",1)[1]; '
                       'sys.stdout.buffer.write(value.encode("utf-16-le")+b"\\n"+value.encode("utf-16-be"))')
@@ -5514,26 +14502,2767 @@ def run_environment_process_controls(root: Path, results: list[dict[str, Any]] |
     return results
 
 
+def run_execution_masking_controls(root: Path, results: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Command execution (batch files, stems, start failures, original-project arguments, stopping) and log masking."""
+    results = [] if results is None else results
+    workspace, evidence = root / 'copy', root / 'logs'
+    write_fixture_marker(workspace)
+    python = sys.executable
+    common = ('--evidence-dir', str(evidence), '--cwd', str(workspace))
+
+    # Script shims: cmd.exe re-parses the arguments of a batch file; each must arrive as given, and the record must be
+    # what ran. A POSIX shell script receives the same arguments unchanged, and nothing is refused there.
+    write_text_file(workspace / 'echo_args.py', 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+    if os.name == 'nt':
+        shim = 'shim.cmd'
+        (workspace / shim).write_bytes(f'@"{python}" "%~dp0echo_args.py" %*\r\n'.encode())
+    else:
+        shim = './shim.sh'
+        write_text_file(workspace / shim, f'#!/bin/sh\nexec "{python}" "$(dirname "$0")/echo_args.py" "$@"\n')
+        os.chmod(workspace / shim, 0o755)
+    arguments = ['^auth', '--grep=a&echo', 'INJECTED', 'login|logout', 'a b', '(x)', 'trail\\', 'C:\\a b\\', '',
+                 'x<y>z', 'semi;colon,comma=eq', 'plain']
+    code, _ = run_cli('run', '--id', 'BATCH-ARGS', *common, '--', shim, *arguments)
+    log = (evidence / 'BATCH-ARGS.log').read_bytes() if (evidence / 'BATCH-ARGS.log').is_file() else b''
+    meta = read_json(evidence / 'BATCH-ARGS.meta.json') if (evidence / 'BATCH-ARGS.meta.json').is_file() else {}
+    recorded = meta.get('command')
+    again = subprocess.run(recorded, cwd=str(workspace), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=60).stdout if isinstance(recorded, str) == (os.name == 'nt') else None
+    try:
+        received = json.loads(log.decode('utf-8'))
+    except ValueError:
+        received = None
+    control(results, 'RUN_BATCH_ARGUMENTS_ARRIVE_LITERALLY', code == 0 and received == arguments and again == log,
+            {'exit': code, 'received': received, 'command': recorded})
+    refused = {}
+    for index, argument in enumerate(('100%OS%', 'a"b', 'x!y')):
+        code, output = run_cli('run', '--id', f'BATCH-REFUSED-{index}', *common, '--', shim, argument)
+        if os.name == 'nt':
+            refused[argument] = (code == 2 and 'nothing was started' in output and 'Traceback' not in output
+                                 and not list(evidence.glob(f'BATCH-REFUSED-{index}*')))
+        else:
+            refused[argument] = code == 0 and read_json(evidence / f'BATCH-REFUSED-{index}.log') == [argument]
+    control(results, 'RUN_BATCH_REFUSES_ARGUMENTS_CMD_EXPANDS', all(refused.values()), refused)
+    pathext = root / 'pathext'
+    write_text_file(pathext / 'tool.js', 'console.log(1)\n')
+    found_js = resolve_executable('tool', pathext, {'PATH': '', 'PATHEXT': '.JS;.CMD'})
+    write_text_file(pathext / 'tool.cmd', '@echo 1\r\n')
+    found_cmd = resolve_executable('tool', pathext, {'PATH': '', 'PATHEXT': '.JS;.CMD'})
+    control(results, 'RUN_RESOLVES_ONLY_DIRECTLY_STARTABLE_TYPES', os.name != 'nt' or (
+        found_js is None and found_cmd is not None and found_cmd.lower().endswith('tool.cmd')),
+        {'js': found_js, 'cmd': found_cmd})
+
+    # A start failure is recorded like a command that was not found; no traceback.
+    (workspace / 'not-a-program.exe').write_bytes(b'not a program\n')
+    os.chmod(workspace / 'not-a-program.exe', 0o755)
+    code, output = run_cli('run', '--id', 'START-FAIL', *common, '--', str(workspace / 'not-a-program.exe'))
+    meta = read_json(evidence / 'START-FAIL.meta.json') if (evidence / 'START-FAIL.meta.json').is_file() else {}
+    control(results, 'RUN_START_FAILURE_RECORDED', code == 126 and 'Traceback' not in output
+            and str(meta.get('error', '')).startswith('start_failed: ') and meta.get('exit_code') is None,
+            {'exit': code, 'error': meta.get('error')})
+    code, output = run_cli('run', '--id', 'ENV-EMPTY-NAME', *common, '--env', '=value', '--', python, '-c', 'pass')
+    control(results, 'RUN_ENV_EMPTY_NAME_REFUSED', code == 2 and 'non-empty NAME' in output and 'Traceback' not in output
+            and not list(evidence.glob('ENV-EMPTY-NAME*')), {'exit': code})
+
+    # Same ID: the stem is reserved atomically; parallel runs never share a log or markers.
+    evidence.mkdir(parents=True, exist_ok=True)
+    first, first_log = unique_stem(evidence, 'SAME-STEM')
+    second, second_log = unique_stem(evidence, 'SAME-STEM')
+    first_log.close()
+    second_log.close()
+    tagged = 'import sys,time\nfor i in range(15):\n    print(sys.argv[1], i, flush=True)\n    time.sleep(0.03)\n'
+    write_text_file(workspace / 'tagged.py', tagged)
+    parallel = [subprocess.Popen([python, str(Path(__file__).resolve()), 'run', '--id', 'SAME-ID', *common, '--',
+                                  python, 'tagged.py', tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                for tag in ('AAAA', 'BBBB')]
+    codes = [proc.wait(timeout=60) for proc in parallel]
+    logs = sorted((evidence / name).read_text(encoding='utf-8') for name in ('SAME-ID.log', 'SAME-ID-2.log')
+                  if (evidence / name).is_file())
+    control(results, 'RUN_SAME_ID_RESERVES_SEPARATE_STEMS', first != second and codes == [0, 0] and len(logs) == 2
+            and all(log.count('AAAA') + log.count('BBBB') == 15 == max(log.count('AAAA'), log.count('BBBB'))
+                    for log in logs), {'stems': [first, second], 'codes': codes})
+
+    # A stop request left from an earlier run never stops a later run with the same ID: its stem counts as taken, and
+    # a stop file of the reserved stem (one written between check and reservation) is removed before the start.
+    write_text_file(evidence / 'STALE.stop', 'stop\n')
+    code, _ = run_cli('run', '--id', 'STALE', *common, '--', python, '-c', 'import time; time.sleep(1.5); print("done")')
+    metas = [read_json(path) for path in evidence.glob('STALE*.meta.json')]
+    write_text_file(evidence / 'STOP-TAKEN.stop', 'stop\n')
+    taken, taken_log = unique_stem(evidence, 'STOP-TAKEN')
+    taken_log.close()
+    write_text_file(evidence / 'STALE-RACE.stop', 'stop\n')
+    import contextlib
+    import io
+    from unittest.mock import patch
+    with patch(f'{__name__}.unique_stem', lambda directory, stem: (stem, open(directory / f'{stem}.log', 'xb'))), \
+            contextlib.redirect_stdout(io.StringIO()):
+        race_code = cmd_run(build_parser().parse_args(['run', '--id', 'STALE-RACE', *common]),
+                            [python, '-c', 'import time; time.sleep(1.5)'])
+    race = read_json(evidence / 'STALE-RACE.meta.json') if (evidence / 'STALE-RACE.meta.json').is_file() else {}
+    control(results, 'RUN_IGNORES_STALE_STOP_REQUEST', code == 0 and len(metas) == 1
+            and metas[0].get('stopped') is False and metas[0].get('exit_code') == 0 and taken == 'STOP-TAKEN-2'
+            and race_code == 0 and race.get('stopped') is False,
+            {'exit': code, 'metas': metas, 'taken': taken, 'race': [race_code, race.get('stopped')]})
+
+    # The log of a running service shows its output at once.
+    service = subprocess.Popen([python, str(Path(__file__).resolve()), 'run', '--id', 'SVC-LIVE-LOG', *common, '--',
+                                python, '-c', 'import time; print("listening", flush=True); time.sleep(120)'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_running_info(evidence / 'SVC-LIVE-LOG.running.json')
+        deadline, seen = time.monotonic() + 15, ''
+        while time.monotonic() < deadline and 'listening' not in seen:
+            seen = (evidence / 'SVC-LIVE-LOG.log').read_text(encoding='utf-8') if (evidence / 'SVC-LIVE-LOG.log').is_file() else ''
+            time.sleep(0.2)
+        alive = service.poll() is None
+    finally:
+        code, _ = run_cli('stop', '--id', 'SVC-LIVE-LOG', '--evidence-dir', str(evidence), '--wait', '30')
+        try:
+            service.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            service.kill()
+            service.wait(timeout=30)
+    control(results, 'RUN_LOG_READABLE_WHILE_RUNNING', 'listening' in seen and alive and code == 0, {'log': seen})
+
+    # Arguments naming the original project are refused; its results directory and missing paths are not.
+    original, copy = root / 'original', root / 'p5-copy'
+    write_text_file(original / 'args.js', 'original\n')
+    write_text_file(original / DEFAULT_RESULTS_DIRNAME / 'notes.txt', 'results\n')
+    write_json_new(copy / WORKSPACE_MARKER, {'project_root': str(original)})
+    write_text_file(copy / 'args.js', 'copy\n')
+    p5 = ('--evidence-dir', str(evidence), '--cwd', str(copy))
+    outcome = {}
+    for name, argument in (('relative', '../original/args.js'), ('option', '--config=' + str(original / 'args.js')),
+                           ('results', str(original / DEFAULT_RESULTS_DIRNAME / 'notes.txt')),
+                           ('missing', str(original / 'missing.js')), ('copy', 'args.js')):
+        code, output = run_cli('run', '--id', 'P5-' + name.upper(), *p5, '--', python, '-c', 'pass', argument)
+        outcome[name] = code if code != 2 or 'points into the original project' in output else 'other error'
+    control(results, 'RUN_REFUSES_ORIGINAL_PROJECT_ARGUMENTS', outcome == {
+        'relative': 2, 'option': 2, 'results': 0, 'missing': 2, 'copy': 0}
+            and not list(evidence.glob('P5-RELATIVE*')), outcome)
+
+    # A timed-out command that exits on termination ends at once; on POSIX its group leader is reaped, so the grace
+    # period for the rest of the group is not spent waiting on a zombie. Waiting on the zombie costs the timeout (1 s)
+    # plus the whole grace period (5 s); the bound leaves room for interpreter start-up on a loaded machine. PATH holds
+    # only the interpreter's directory: judging a long inherited PATH (under WSL dozens of slow /mnt/c directories)
+    # takes seconds and is not what this control measures.
+    reap_env = dict(os.environ, PATH=str(Path(python).parent))
+    started = time.monotonic()
+    code, _ = run_cli('run', '--id', 'TIMEOUT-REAP', *common, '--timeout', '1', '--', python, '-c',
+                      'import time; time.sleep(60)', env=reap_env)
+    elapsed = time.monotonic() - started
+    control(results, 'RUN_TIMEOUT_REAPS_GROUP_LEADER', code == 124 and elapsed < 5.5, {'exit': code, 'seconds': elapsed})
+
+    # Private key blocks: a real block is masked to its end; a marker inside a message masks nothing after it.
+    body = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7SynthKeyLine01',
+            'q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5Wx+/Ab0',
+            'SynthTail==']
+    lines = (['before the key', '-----BEGIN PRIVATE KEY-----', *body, '-----END PRIVATE KEY-----', 'after the key',
+              'Error: expected -----BEGIN PRIVATE KEY----- in input', 'Received value abc123',
+              'visible after the message', 'throw new Error("missing -----BEGIN RSA PRIVATE KEY-----")',
+              'visible after the throw', '-----BEGIN RSA PRIVATE KEY-----', 'Proc-Type: 4,ENCRYPTED',
+              'DEK-Info: AES-128-CBC,0011AABB', '', *body[:2], 'visible after the unterminated block.',
+              '[test] -----BEGIN PGP PRIVATE KEY BLOCK-----', '[test] Version: Synth 1', '[test] ',
+              '[test] ' + body[1], '[test] PgpTail', '[test] =Ab0c', '[test] -----END PGP PRIVATE KEY BLOCK-----',
+              'visible after pgp', '2026-01-01T00:00:00Z [app] -----BEGIN EC PRIVATE KEY-----',
+              '2026-01-01T00:00:01Z [app] ' + body[0], '2026-01-01T00:00:01Z [app] ShortTail',
+              '2026-01-01T00:00:02Z [app] -----END EC PRIVATE KEY-----', 'visible after the prefixed key',
+              '[app] -----BEGIN PRIVATE KEY-----', '[app] ' + body[1], '[app] Visibleword', 'visible after the word',
+              '-----BEGIN PRIVATE KEY-----', body[0], '[app] EndsOutput'])
+    write_text_file(workspace / 'keys.txt', '\n'.join(lines) + '\n')
+    code, _ = run_cli('run', '--id', 'KEY-BLOCKS', *common, '--', python, '-c',
+                      'import sys; sys.stdout.write(open("keys.txt").read())')
+    log = (evidence / 'KEY-BLOCKS.log').read_text(encoding='utf-8') if (evidence / 'KEY-BLOCKS.log').is_file() else ''
+    visible = ['before the key', 'after the key', 'Received value abc123', 'visible after the message',
+               'visible after the throw', 'visible after the unterminated block.', 'visible after pgp', 'visible after the prefixed key',
+               'visible after the word']
+    control(results, 'RUN_MASKS_KEY_BLOCK_TO_ITS_END_ONLY', code == 0 and all(text in log for text in visible)
+            and not any(part in log for part in ('MIIEvQ', 'q8vLm2', 'SynthTail', 'AES-128-CBC', '=Ab0c', 'Synth 1',
+                                                 'PgpTail', 'ShortTail', 'EndsOutput', 'Visibleword'))
+            and len(log.splitlines()) == len(lines),
+            {'missing': [text for text in visible if text not in log], 'log': log})
+
+    # Assignment masking covers PHP print_r output; arrow functions stay readable.
+    redactor = Redactor({})
+    printed = redactor.redact_text('Array ( [user] => app [password] => Zq8vLm2Rt5Wx )')
+    arrow = '([token]) => token.length; [user] => app'
+    control(results, 'MASKING_PRINT_R_VALUES', 'Zq8vLm2Rt5Wx' not in printed and '[REDACTED:password]' in printed
+            and '[user] => app' in printed and redactor.redact_text(arrow) == arrow
+            and 'Zq8vLm2Rt5Wx' not in redactor.redact_text('password = Zq8vLm2Rt5Wx'), printed)
+
+    # Inherited sensitive values are masked from 4 characters on, like --env values.
+    code, output = run_cli('run', '--id', 'INHERIT-SHORT', *common, '--inherit', 'SYNTH_DB_PASSWORD', '--', python,
+                           '-c', 'import os; print("pw", os.environ["SYNTH_DB_PASSWORD"])',
+                           env={**os.environ, 'SYNTH_DB_PASSWORD': 'Qz7k5'})
+    log = (evidence / 'INHERIT-SHORT.log').read_text(encoding='utf-8') if (evidence / 'INHERIT-SHORT.log').is_file() else ''
+    control(results, 'INHERITED_SHORT_VALUE_MASKED', code == 0 and 'Qz7k5' not in log + output
+            and '[REDACTED:SYNTH_DB_PASSWORD]' in log, {'exit': code})
+
+    # A short sensitive --env value is still masked everywhere, with a note on stderr and in the metadata.
+    proc = subprocess.run([python, str(Path(__file__).resolve()), 'run', '--id', 'SHORT-ENV', *common,
+                           '--env', 'API_KEY=Ak7z', '--env', 'SYNTH_LABEL_TOKEN=SynthLongToken8831', '--', python, '-c',
+                           'import os; print("key", os.environ["API_KEY"])'],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    stderr = proc.stderr.decode('utf-8', 'replace')
+    meta = read_json(evidence / 'SHORT-ENV.meta.json') if (evidence / 'SHORT-ENV.meta.json').is_file() else {}
+    log = (evidence / 'SHORT-ENV.log').read_text(encoding='utf-8') if (evidence / 'SHORT-ENV.log').is_file() else ''
+    note = '--env value of API_KEY is shorter than 12 characters'
+    control(results, 'RUN_NOTES_SHORT_ENV_VALUE', proc.returncode == 0 and note in stderr
+            and any(note in item for item in meta.get('notes', [])) and 'SYNTH_LABEL_TOKEN' not in stderr
+            and '[REDACTED:API_KEY]' in log and 'Ak7z' not in log + stderr, {'exit': proc.returncode, 'stderr': stderr})
+
+    # GitLab and npm access tokens are masked; near misses stay readable.
+    tokens = redactor.redact_text('a glpat-' + 'Ab1_' * 5 + ' b npm_' + 'a1B2' * 9 + ' c')
+    near = ['glpat-short', 'npm_' + 'a' * 35, 'npm_' + 'a' * 37, 'xnpm_' + 'a' * 36]
+    control(results, 'MASKING_GITLAB_AND_NPM_TOKENS', tokens == 'a [REDACTED:GITLAB_TOKEN] b [REDACTED:NPM_TOKEN] c'
+            and all(redactor.redact_text(value) == value for value in near), tokens)
+    return results
+
+
+def run_key_block_masking_controls(root: Path) -> list[dict[str, Any]]:
+    """Private-key blocks in command output: every log format of the reviews is masked, ordinary text stays readable,
+    terminal control sequences are removed from the log."""
+    results: list[dict[str, Any]] = []
+    workspace, evidence = root / 'copy', root / 'logs'
+    write_fixture_marker(workspace)
+    python = sys.executable
+    begin, end = '-----BEGIN PRIVATE KEY-----', '-----END PRIVATE KEY-----'
+    b1 = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7SynthKeyBodyAAAA'
+    b2 = 'q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxSecretLine2'
+    b3 = 'SynthTail=='
+    block = [begin, b1, b2, b3, end]
+    secrets = ['SynthKeyBody', 'SecretLine2', 'q8vLm2', 'SynthTail', 'NarrowAb', 'Cd3fGh5j', 'Synth 1', 'AES-128',
+               'PgpShort', 'AuxTail9']
+
+    def prefixed(prefix: str) -> list[str]:
+        return [prefix + line for line in block] + ['after text here']
+    masked_cases = {
+        'plain': block + ['after text here'],
+        'crlf': [line + '\r' for line in block] + ['after text here'],
+        'ansi_lines': ['\x1b[32m' + line + '\x1b[0m' for line in block] + ['after text here'],
+        'ansi_after_begin': [begin + '\x1b[0m', b1, b2, b3, end, 'after text here'],
+        'comment_after_begin': [begin + ' # key', b1, b2, b3, end, 'after text here'],
+        'trailing_text': [begin + ' (generated for the test)', b1, b2, b3, end, 'after text here'],
+        'interleaved': [begin, b1, 'WARNING: other worker started', b2, b3, end, 'after text here'],
+        'stderr_between': [begin, b1, b2, 'DeprecationWarning: synthetic', 'AuxTail9', end],
+        'python_logging': prefixed('INFO:root:'),
+        'logfmt': prefixed('level=info msg='),
+        'bracket': prefixed('[app]'),
+        'actions': prefixed('##[debug]'),
+        'compose': prefixed('app-1  | '),
+        'journald': prefixed('myapp[123]: '),
+        'timestamps': [f'2026-01-01T00:00:0{i}Z INFO {line}' for i, line in enumerate(block)] + ['after text here'],
+        'logger_header': [x for line in block for x in ('info: App[0]', '      ' + line)] + ['after text here'],
+        'json_one_line': [json.dumps({'key': '\n'.join(block) + '\n', 'after': 'visible'}), 'after text here'],
+        'yaml': ['key: |', *('  ' + line for line in block), 'next: visible'],
+        'pytest': ['E       ' + line for line in block] + ['after text here'],
+        'rsa_encrypted': ['-----BEGIN RSA PRIVATE KEY-----', 'Proc-Type: 4,ENCRYPTED', 'DEK-Info: AES-128-CBC,0011AABB',
+                          '', b1, b2, b3, '-----END RSA PRIVATE KEY-----', 'after text here'],
+        'openssh': ['-----BEGIN OPENSSH PRIVATE KEY-----', b1, b2, b3, '-----END OPENSSH PRIVATE KEY-----'],
+        'pgp_narrow': ['[test] -----BEGIN PGP PRIVATE KEY BLOCK-----', '[test] Version: Synth 1', '[test] ',
+                       '[test] NarrowAb', '[test] Cd3fGh5j', '[test] PgpShort', '[test] =Ab0c',
+                       '[test] -----END PGP PRIVATE KEY BLOCK-----', 'visible after pgp'],
+        'narrow_no_prefix': [begin, 'NarrowAb', 'Cd3fGh5j', 'SynthTail==', end],
+        'no_end': [begin, b1, b2, b3],
+        'mixed_prefix': ['[main] ' + begin, '[main] ' + b1, '[main] ' + b2, '[worker] SynthTail==', end],
+        'interleaved_many': [begin, b1, 'warn one', 'warn two', 'warn three', b2, 'warn four', 'warn five', b1,
+                             'SynthTail==', end],
+        'ended_without_end': [begin, b1, 'line one', 'line two', 'line three', 'line four', 'line five', b2],
+    }
+    visible_cases = {
+        # a BEGIN marker in prose masks no ordinary line after it
+        'prose': (['Error: expected ' + begin, 'Received value abc123', 'Result: failed 3 of 10', 'OK',
+                   'AssertionError: 3 != 4', 'finished'],
+                  ['Received value abc123', 'Result: failed 3 of 10', 'OK', 'AssertionError: 3 != 4', 'finished']),
+        'prose_word': (['FAIL test_pem: missing ' + begin, 'OK', 'ran 4 tests'], ['OK', 'ran 4 tests']),
+        # text after a complete block and after a block that ended without END is readable again
+        'after_block': (block + ['OK', 'Version: 2.1 deployed', 'after text here'],
+                        ['OK', 'Version: 2.1 deployed', 'after text here']),
+        'after_narrow': ([begin, 'NarrowAb', 'Cd3fGh5j', 'passed', 'OK'], ['passed', 'OK']),
+        'end_in_aftermath': ([begin, b1, 'line one', 'line two', 'line three', 'line four', 'line five', end,
+                              'commit 3b18e512dba79e4c8300dd08aeb37f8e728b8dad'],
+                             ['commit 3b18e512dba79e4c8300dd08aeb37f8e728b8dad']),
+        'prose_after_body': ([begin, b1, b2, 'Build finished in 5 seconds', 'ok'], ['Build finished in 5 seconds', 'ok']),
+        'after_unterminated': ([begin, b1, 'line one', 'line two', 'line three', 'line four', 'line five',
+                                'Comment: visible text']
+                               + [f'filler {i}' for i in range(200)] + ['commit 3b18e512dba79e4c8300dd08aeb37f8e728b8dad'],
+                               ['Comment: visible text', 'commit 3b18e512dba79e4c8300dd08aeb37f8e728b8dad']),
+    }
+    lines, spans = [], {}
+    for name, case in [*masked_cases.items(), *((n, c[0]) for n, c in visible_cases.items())]:
+        spans[name] = (len(lines), len(lines) + len(case))
+        lines += case + [end, f'=== end of case {name} ===']  # the END line resets the key state between cases
+    write_text_file(workspace / 'blocks.txt', '\n'.join(lines) + '\n')
+    code, _ = run_cli('run', '--id', 'KEY-FORMATS', '--evidence-dir', str(evidence), '--cwd', str(workspace), '--tail', '0',
+                      '--', python, '-c', 'import sys; sys.stdout.buffer.write(open("blocks.txt", "rb").read())')
+    raw = (evidence / 'KEY-FORMATS.log').read_bytes() if (evidence / 'KEY-FORMATS.log').is_file() else b''
+    log = raw.decode('utf-8', 'replace').splitlines()
+    leaked = {name: [s for s in secrets if any(s in line for line in log[spans[name][0]:spans[name][1]])]
+              for name in masked_cases}
+    leaked = {name: found for name, found in leaked.items() if found}
+    after = [name for name, case in masked_cases.items() if 'after text here' in case
+             and 'after text here' not in log[spans[name][0]:spans[name][1]]]
+    control(results, 'RUN_KEY_BLOCKS_MASKED_IN_LOG_FORMATS', code == 0 and not leaked and not after
+            and b'\x1b' not in raw and len(log) == len(lines), {'leaked': leaked, 'hidden_after': after})
+    hidden = {name: [text for text in expected if text not in log[spans[name][0]:spans[name][1]]]
+              for name, (_, expected) in visible_cases.items()}
+    hidden = {name: missing for name, missing in hidden.items() if missing}
+    control(results, 'RUN_KEY_MARKER_IN_PROSE_AND_TEXT_AFTER_BLOCK_READABLE', code == 0 and not hidden, hidden)
+    return results
+
+
+def run_runner_hardening_controls(root: Path) -> list[dict[str, Any]]:
+    """Environment of the command, paths into the original project, batch files, start failures, stop, long output,
+    secret values in their encoded forms."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    workspace, evidence = root / 'copy', root / 'logs'
+    original = root / 'original'
+    write_text_file(original / 'src' / 'data.txt', 'original\n')
+    write_text_file(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'notes.txt', 'results\n')
+    write_json_new(workspace / WORKSPACE_MARKER, {'project_root': str(original)})
+    write_text_file(workspace / 'src' / 'data.txt', 'copy\n')
+    python = sys.executable
+    common = ('--evidence-dir', str(evidence), '--cwd', str(workspace))
+    names_py = 'import json, os; print(json.dumps(sorted(os.environ)))'
+
+    def log_of(stem: str) -> str:
+        path = evidence / f'{stem}.log'
+        return path.read_text(encoding='utf-8', errors='replace') if path.is_file() else ''
+
+    def meta_of(stem: str) -> dict[str, Any]:
+        path = evidence / f'{stem}.meta.json'
+        value = read_json(path) if path.is_file() else {}
+        return value if isinstance(value, dict) else {}
+
+    # Git variables that select a repository never reach the command, also when named with --inherit.
+    repo_env = {name: str(original / '.git') for name in GIT_REPOSITORY_ENV}
+    repo_env.update(GIT_CEILING_DIRECTORIES=str(root), GIT_CONFIG_KEY_3='core.hooksPath')
+    code, _ = run_cli('run', '--id', 'GIT-ENV', *common, '--inherit', 'GIT_DIR', '--inherit', 'GIT_WORK_TREE',
+                      '--inherit', 'GIT_CONFIG_KEY_3', '--', python, '-c', names_py, env={**os.environ, **repo_env})
+    names = {name.upper() for name in json.loads(log_of('GIT-ENV'))} if log_of('GIT-ENV').startswith('[') else set()
+    # the tool's own Git calls remove the same variables
+    own = set(git_env(repo_env))
+    control(results, 'RUN_STRIPS_GIT_REPOSITORY_VARIABLES', code == 0 and not names & GIT_REPOSITORY_ENV
+            and 'GIT_CONFIG_KEY_3' not in names and 'GIT_CEILING_DIRECTORIES' in names
+            and own == {'GIT_CEILING_DIRECTORIES'}, sorted(name for name in names if name.startswith('GIT')))
+
+    # Credential variables of password managers, Sonar, .NET and connection strings are stripped; others stay.
+    credentials = {'BW_SESSION': 'SynthBwSession77xq', 'OP_SESSION_synth': 'SynthOpSession77xq',
+                   'SONAR_LOGIN': 'SynthSonar77xq', 'DEPLOY_PW': 'SynthPw77xq', 'REGISTRY_CREDS': 'ci:SynthCreds77xq',
+                   'ConnectionStrings__Main': 'Server=db;Database=x', 'HASH_SALT': 'SynthSalt77xq',
+                   'SSH_AUTH_SOCK': str(root / 'agent.sock'), 'GPG_AGENT_INFO': str(root / 'S.gpg-agent'),
+                   'APP_CONN': 'Server=db;User Id=sa;Password=SynthConnPw77xq;'}
+    ordinary = {'SYNTH_BUILD_MODE': 'release', 'SYNTH_PW_POLICY_DOC': 'docs/policy.md', 'SYNTH_SALTWATER': 'sea'}
+    code, _ = run_cli('run', '--id', 'CRED-ENV', *common, '--', python, '-c', names_py,
+                      env={**os.environ, **credentials, **ordinary})
+    names = set(json.loads(log_of('CRED-ENV'))) if log_of('CRED-ENV').startswith('[') else set()
+    code_inherit, _ = run_cli('run', '--id', 'CRED-INHERIT', *common, '--inherit', 'SONAR_LOGIN', '--', python, '-c',
+                              'import os; print("sonar", os.environ.get("SONAR_LOGIN"))',
+                              env={**os.environ, **credentials})
+    control(results, 'RUN_STRIPS_CREDENTIAL_VARIABLES', code == 0 and code_inherit == 0
+            and not names & set(credentials) and set(ordinary) <= names
+            and '[REDACTED:SONAR_LOGIN]' in log_of('CRED-INHERIT') and 'SynthSonar77xq' not in log_of('CRED-INHERIT'),
+            {'reached': sorted(names & set(credentials)), 'missing': sorted(set(ordinary) - names)})
+
+    # Paths into the original project in every spelling are refused, also a file not created yet and a path through a
+    # link; the copy, the results directory and ordinary option values are not.
+    link = workspace / 'linked'
+    try:
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(original / 'src'), str(link))
+        else:
+            os.symlink(original / 'src', link)
+    except OSError:
+        pass
+    target = original / 'src'
+    refused_cases = {
+        'new_file': ['python', '-c', 'pass', str(target / 'new-output.txt')],
+        'option_value': ['python', '-c', 'pass', '--junitxml=' + str(target / 'report.xml')],
+        'at_file': ['python', '-c', 'pass', '@' + str(target / 'data.txt')],
+        'short_option': ['python', '-c', 'pass', '-I' + str(target)],
+        'slash_option': ['python', '-c', 'pass', '/out:' + str(target / 'x.txt')],
+        'file_url': ['python', '-c', 'pass', 'file://' + ('/' if os.name == 'nt' else '') + target.as_posix()],
+        'through_link': ['python', '-c', 'pass', os.path.join('linked', 'via-link.txt')],
+        'env_value': ['--env', 'OUT_DIR=' + str(target), '--', 'python', '-c', 'pass'],
+        'shell': ['--shell', '--', f'{python} -c pass > "{target / "out.txt"}"'],
+        'evidence_dir': None,
+    }
+    outcome = {}
+    for name, command in refused_cases.items():
+        if command is None:
+            code, output = run_cli('run', '--id', 'Z2-EVIDENCE', '--evidence-dir', str(original / 'evidence'), '--cwd',
+                                   str(workspace), '--', python, '-c', 'pass')
+        elif '--' in command:
+            code, output = run_cli('run', '--id', 'Z2-' + name.upper(), *common, *command)
+        else:
+            code, output = run_cli('run', '--id', 'Z2-' + name.upper(), *common, '--', python, *command[1:])
+        outcome[name] = (code == 2 and 'original project' in output and 'Traceback' not in output
+                         and (name != 'through_link' or os.path.realpath(original / 'src' / 'via-link.txt') in output))
+    allowed = {}
+    for name, extra in (('copy_relative', ['src/data.txt', 'build/new.txt']),
+                        ('results_dir', [str(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'notes.txt')]),
+                        ('ordinary', ['https://example.com/a=b', '-Werror', '--out=build/x.txt', '@build/args.txt'])):
+        code, output = run_cli('run', '--id', 'Z2-OK-' + name.upper(), *common, '--', python, '-c', 'pass', *extra)
+        allowed[name] = code == 0
+    created = (target / 'new-output.txt').exists() or (target / 'out.txt').exists() or (original / 'evidence').exists()
+    control(results, 'RUN_REFUSES_PATHS_INTO_ORIGINAL_IN_EVERY_SPELLING', all(outcome.values()) and all(allowed.values())
+            and not created and link.exists(), {'refused': outcome, 'allowed': allowed})
+
+    # A batch file that forwards single parameters (%1) refuses cmd.exe operators; %* shims and the program path are
+    # handled as before; an overlong batch command line is refused before the start.
+    if os.name == 'nt':
+        write_text_file(workspace / 'echo_args.py', 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        (workspace / 'single.cmd').write_bytes(f'@"{python}" "%~dp0echo_args.py" "%1"\r\n'.encode())
+        (workspace / 'modifier.cmd').write_bytes(f'@"{python}" "%~dp0echo_args.py" %~1\r\n'.encode())
+        (workspace / 'all.cmd').write_bytes(f'@"{python}" "%~dp0echo_args.py" %*\r\n'.encode())
+        (workspace / 'pct%dir').mkdir(exist_ok=True)
+        (workspace / 'pct%dir' / 'tool.cmd').write_bytes(b'@echo tool\r\n')
+        batch = {}
+        for name, shim in (('single', 'single.cmd'), ('modifier', 'modifier.cmd'), ('all', 'all.cmd')):
+            code, output = run_cli('run', '--id', 'BAT-' + name.upper(), *common, '--', shim, 'a&echo INJECTED&b')
+            batch[name] = (code, 'INJECTED' in log_of('BAT-' + name.upper()).replace('a&echo INJECTED&b', ''))
+        code, output = run_cli('run', '--id', 'BAT-PROGRAM', *common, '--', str(workspace / 'pct%dir' / 'tool.cmd'))
+        program = code == 2 and 'Program path' in output
+        code, output = run_cli('run', '--id', 'BAT-LONG', *common, '--', 'all.cmd', *(['x' * 100] * 90))
+        too_long = code == 2 and str(BATCH_LINE_LIMIT) in output and not list(evidence.glob('BAT-LONG*'))
+        control(results, 'RUN_BATCH_POSITIONAL_PARAMETERS_REFUSE_OPERATORS', batch == {
+            'single': (2, False), 'modifier': (2, False), 'all': (0, False)} and program and too_long
+            and batch_forwards_positional(str(workspace / 'missing.cmd')), {'batch': batch, 'program': program,
+                                                                             'too_long': too_long})
+    else:
+        control(results, 'RUN_BATCH_POSITIONAL_PARAMETERS_REFUSE_OPERATORS', True, 'Windows only: cmd.exe batch files')
+
+    # A failed start is evidence: a one-line log and metadata like an ordinary run, never a traceback.
+    write_text_file(workspace / 'tool.js', 'console.log(1)\n')
+    code_missing, out_missing = run_cli('run', '--id', 'START-MISSING', *common, '--', 'audit-synthetic-missing-4711')
+    code_js, out_js = run_cli('run', '--id', 'START-JS', *common, '--', 'tool.js')
+    args = build_parser().parse_args(['run', '--id', 'START-VALUE', *common])
+    with patch(f'{__name__}.subprocess.Popen', side_effect=ValueError('embedded null byte')), \
+            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            code_value: Any = cmd_run(args, [python, '-c', 'pass'])
+        except Exception as exc:  # the control reports an escaping error instead of aborting the selftest
+            code_value = type(exc).__name__
+    metas = {stem: meta_of(stem) for stem in ('START-MISSING', 'START-JS', 'START-VALUE')}
+    logged = all(meta.get('log') == f'{stem}.log' and meta.get('log_sha256') == sha256_file(evidence / f'{stem}.log')
+                 and meta.get('tool') == 'audit_tools.py' and len(log_of(stem).splitlines()) == 1
+                 for stem, meta in metas.items())
+    control(results, 'RUN_START_FAILURE_LOGGED_AS_EVIDENCE', (code_missing, code_js, code_value) == (127, 126, 126)
+            and logged and 'Traceback' not in out_missing + out_js and 'node tool.js' in log_of('START-JS')
+            and metas['START-JS'].get('error') == 'not_directly_startable'
+            and str(metas['START-VALUE'].get('error', '')).startswith('start_failed: '),
+            {'exits': [code_missing, code_js, code_value], 'errors': [m.get('error') for m in metas.values()]})
+    write_text_file(root / 'evidence-file', 'x\n')
+    code_file, out_file = run_cli('run', '--id', 'EVIDENCE-FILE', '--evidence-dir', str(root / 'evidence-file'), '--cwd',
+                                  str(workspace), '--', python, '-c', 'pass')
+    stops = root / 'stop-markers'
+    outside = root / 'outside-marker.stop'
+    stop_cases = {'no_stem': ({'id': 'NOSTEM', 'pid': 1}, None), 'traversal': ({'id': 'TRAV', 'stem': '../outside-marker'}, None),
+                  'meta_list': ({'id': 'MLIST', 'stem': 'MLIST'}, '[1, 2]'), 'meta_bad': ({'id': 'MBAD', 'stem': 'MBAD'}, '{"id": ')}
+    stopped = {}
+    for name, (marker, meta) in stop_cases.items():
+        write_json_new(stops / f'{marker["id"]}.running.json', marker)
+        if meta is not None:
+            write_text_file(stops / f'{marker["stem"]}.meta.json', meta)
+        code, output = run_cli('stop', '--id', marker['id'], '--evidence-dir', str(stops), '--wait', '1')
+        stopped[name] = code == 2 and 'Traceback' not in output
+    code, output = run_cli('stop', '--id', 'X', '--evidence-dir', str(root / 'evidence-file'))
+    stopped['evidence_file'] = code == 2 and 'Traceback' not in output and 'not a directory' in output
+    control(results, 'RUN_AND_STOP_REFUSE_MALFORMED_INPUT_WITHOUT_TRACEBACK', code_file == 2
+            and 'Traceback' not in out_file and all(stopped.values()) and not outside.exists(), stopped)
+
+    # Without a Windows job object the metadata says leftovers could not be checked.
+    args = build_parser().parse_args(['run', '--id', 'NO-JOB', *common])
+    with patch.object(ProcessReaper, '_create_job', staticmethod(lambda pid: None)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        cmd_run(args, [python, '-c', 'pass'])
+    run_cli('run', '--id', 'WITH-JOB', *common, '--', python, '-c', 'pass')
+    expected = ('unavailable', 'job_object') if os.name == 'nt' else ('process_group', 'process_group')
+    control(results, 'RUN_RECORDS_LEFTOVER_CHECK', (meta_of('NO-JOB').get('leftover_check'),
+                                                    meta_of('WITH-JOB').get('leftover_check')) == expected,
+            [meta_of('NO-JOB').get('leftover_check'), meta_of('WITH-JOB').get('leftover_check')])
+
+    # Output: \r ends a line; a line longer than the bound is cut and its rest not written; tail lines are cut for
+    # display.
+    token = 'Tq7vWx2Lp9Rm4Zk8Ns3Jd'
+    write_text_file(workspace / 'long.py', 'import os, sys\nv = os.environ["API_TOKEN"].encode()\nout = sys.stdout.buffer\n'
+                    'out.write(b"x" * (1048576 - 10) + v + b"y" * 2200000)\nout.write(b"\\r\\nnext\\rdone\\n")\n')
+    code, output = run_cli('run', '--id', 'LONG-LINE', *common, '--tail', '10', '--env', 'API_TOKEN=' + token, '--', python,
+                           'long.py')
+    raw = (evidence / 'LONG-LINE.log').read_bytes() if (evidence / 'LONG-LINE.log').is_file() else b''
+    omitted = 1048576 - 10 + len(token) + 2200000 - (LONG_LINE_BYTES - LONG_LINE_BACK)
+    expected_log = (b'x' * (LONG_LINE_BYTES - LONG_LINE_BACK) + b'[LINE CUT: %d bytes omitted]' % omitted
+                    + b'\r\nnext\rdone\n')
+    meta = meta_of('LONG-LINE')
+    shown_tail = re.split(r'--- last \d+ lines ---', output)[-1]
+    control(results, 'RUN_LONG_LINES_CUT_WITHOUT_SPLITTING_SECRETS', code == 0 and raw == expected_log
+            and meta.get('long_lines_cut') == 1 and meta.get('long_line_bytes_omitted') == omitted
+            and meta.get('log_lines') == 3
+            and meta.get('output_truncated') is False and len(shown_tail.splitlines()) > 3
+            and max(map(len, shown_tail.splitlines())) <= TAIL_LINE_CHARS + 40,
+            {'exit': code, 'log_bytes': len(raw), 'cuts': meta.get('long_lines_cut'), 'lines': meta.get('log_lines')})
+    service = subprocess.Popen([python, str(Path(__file__).resolve()), 'run', '--id', 'CR-SERVICE', *common, '--', python,
+                                '-c', 'import sys, time\nfor i in range(600):\n    sys.stdout.write("\\rready on port 8080 '
+                                'tick %d" % i); sys.stdout.flush(); time.sleep(0.1)'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_running_info(evidence / 'CR-SERVICE.running.json')
+        deadline, seen_log = time.monotonic() + 15, ''
+        while time.monotonic() < deadline and 'ready on port' not in seen_log:
+            seen_log = log_of('CR-SERVICE')
+            time.sleep(0.2)
+    finally:
+        run_cli('stop', '--id', 'CR-SERVICE', '--evidence-dir', str(evidence), '--wait', '30')
+        try:
+            service.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            service.kill()
+            service.wait(timeout=30)
+    control(results, 'RUN_CARRIAGE_RETURN_ENDS_LINE', 'ready on port 8080' in seen_log, seen_log[-200:])
+
+    # The reader is kept while output still arrives after the command ended; output it could not read is reported.
+    # The kept case polls every 1.5 s: a reader starved for one short poll on a loaded machine is no stalled reader,
+    # and reading the burst still spans several polls.
+    write_text_file(workspace / 'burst.py', 'import sys\nfor i in range(400):\n    print("burst line", i)\n')
+    slow = Redactor.redact_bytes
+
+    def slowly(self: Redactor, value: bytes) -> tuple[bytes, int]:
+        time.sleep(0.03)
+        return slow(self, value)
+    drained = {}
+    for name, drain, poll in (('kept', 600, 1.5), ('cut', 0.5, 0.3)):
+        args = build_parser().parse_args(['run', '--id', 'DRAIN-' + name.upper(), *common])
+        with patch.object(Redactor, 'redact_bytes', slowly), patch(f'{__name__}.OUTPUT_DRAIN_SECONDS', drain), \
+                patch(f'{__name__}.READ_CHUNK_BYTES', 64), patch(f'{__name__}.READER_POLL_SECONDS', poll), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cmd_run(args, [python, 'burst.py'])
+        meta = meta_of('DRAIN-' + name.upper())
+        drained[name] = (meta.get('output_truncated'), meta.get('log_lines'), meta.get('background_output_holder'),
+                         meta.get('output_bytes_read', 0) >= meta.get('log_bytes', 0))
+    control(results, 'RUN_READER_KEPT_WHILE_OUTPUT_ARRIVES', drained['kept'][:3] == (False, 400, False)
+            and drained['cut'][0] is True and drained['cut'][1] < 400 and drained['cut'][2] is False
+            and drained['cut'][3], drained)
+
+    # Secret values in escaped forms; values of sensitive options on the command line; short --env values.
+    secret = 'Pa"ss\\w0rd-Synth/9@x'
+    redactor = Redactor({'QUOTED_SECRET': secret, 'DB_PASSWORD': 'Pässwort-Synth9'})
+    forms = [json.dumps({'cfg': secret}), repr([secret]), 'q=' + quote(secret, safe=''), 'q=' + quote_plus(secret, safe='')]
+    masked = [redactor.redact_bytes(form.encode('utf-8'))[0] for form in forms]
+    oem = [redactor.redact_bytes('Pässwort-Synth9\r\n'.encode(page))[0] for page in sorted(console_encodings())]
+    plain = 'Pa ss word synth 9 - ordinary text'
+    control(results, 'MASKING_ESCAPED_AND_CODE_PAGE_FORMS', all(b'REDACTED:QUOTED_SECRET' in item for item in masked)
+            and all(item.startswith(b'[REDACTED:DB_PASSWORD]') for item in oem)
+            and (os.name != 'nt' or bool(oem)) and redactor.redact_text(plain) == plain,
+            [item.decode('utf-8', 'replace') for item in masked + oem])
+    code, output = run_cli('run', '--id', 'OPTION-SECRETS', *common, '--', python, '-c', 'import sys; print(sys.argv[1:])',
+                           '--api-key', 'Zr8nQ2wX5vK7mP3tY6', '--password=Hunter2Synth99', '--token', 'TkSynth55aa',
+                           '--token-file', 'build/token.txt', '--color', 'always')
+    recorded = json.dumps(meta_of('OPTION-SECRETS').get('command'))
+    text = log_of('OPTION-SECRETS') + recorded + output
+    control(results, 'RUN_MASKS_SENSITIVE_OPTION_VALUES', code == 0 and not any(
+        value in text for value in ('Zr8nQ2wX5vK7mP3tY6', 'Hunter2Synth99', 'TkSynth55aa'))
+            and 'build/token.txt' in log_of('OPTION-SECRETS') and "'always'" in log_of('OPTION-SECRETS')
+            and '[REDACTED:--api-key]' in recorded, recorded)
+    proc = subprocess.run([python, str(Path(__file__).resolve()), 'run', '--id', 'TINY-ENV', *common, '--env', 'API_KEY=abc',
+                           '--env', 'DB_PASSWORD=xy', '--env', 'SYNTH_TOKEN=Ak7z', '--env', 'SYNTH_SECRET=Bq8w', '--',
+                           python, '-c', 'pass'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    stderr = proc.stderr.decode('utf-8', 'replace')
+    code_parse, out_parse = run_cli('run', '--id', 'ENV-PARSE', *common, '--env', 'sk_live_SYNTHVALUE0123456789', '--',
+                                    python, '-c', 'pass')
+    control(results, 'RUN_NOTES_TINY_ENV_VALUES_AND_HIDES_PARSE_INPUT', proc.returncode == 0
+            and '--env values of API_KEY, DB_PASSWORD are shorter than 4 characters and not masked' in stderr
+            and '--env values of SYNTH_SECRET, SYNTH_TOKEN are shorter than 12 characters' in stderr
+            and code_parse == 2 and 'SYNTHVALUE' not in out_parse, {'stderr': stderr, 'parse': out_parse[-200:]})
+
+    # Env-file values under sensitive names count from 8 characters on; placeholders and header names do not.
+    env_text = ('SECRET_KEY=correcthorsebatterystaple\nAPI_TOKEN=abcdefghqrstuvwzyabcdef\nDB_PASS=postgres1\n'
+                'JWT_SECRET=changeme\nAPI_KEY_HEADER=X-API-Key\nSESSION_SECRET=short\nNODE_ENV=production\n')
+    recorded_values = {name: value for name, value in assignment_secrets(env_text)}
+    control(results, 'MASKING_RECORDS_SENSITIVE_ENV_FILE_VALUES_FROM_8', recorded_values == {
+        'SECRET_KEY': 'correcthorsebatterystaple', 'API_TOKEN': 'abcdefghqrstuvwzyabcdef', 'DB_PASS': 'postgres1'},
+            recorded_values)
+
+    # print_r object properties with visibility are masked like array keys; the visibility word stays readable.
+    printed = Redactor({}).redact_text('[password:protected] => Zq8vLm2Rt5Wx [token:App\\User:private] => Tk9mQ2xZ7Rw '
+                                       '[user:protected] => app')
+    control(results, 'MASKING_PRINT_R_OBJECT_PROPERTIES', 'Zq8vLm2Rt5Wx' not in printed and 'Tk9mQ2xZ7Rw' not in printed
+            and '[password:protected] => [REDACTED:password]' in printed and '[user:protected] => app' in printed, printed)
+
+    # Masking 2 MB with 5,000 secret values costs a small multiple of masking it with one value, not one pass per value.
+    text = b'x SynthValue004321Qx y ordinary build output line 12345 ' * 40000
+
+    def masking_seconds(values: dict[str, str]) -> tuple[float, int]:
+        redactor, best, count = Redactor(values), float('inf'), 0
+        for _ in range(2):
+            started = time.monotonic()
+            count = redactor.redact_bytes(text)[0].count(b'[REDACTED:V4321]')
+            best = min(best, time.monotonic() - started)
+        return best, count
+    one = masking_seconds({'V4321': 'SynthValue004321Qx'})
+    many = masking_seconds({f'V{index}': f'SynthValue{index:06d}Qx' for index in range(5000)})
+    control(results, 'REDACTION_LINEAR_IN_SECRET_VALUES', one[1] == many[1] == 40000 and many[0] < 5 * one[0] + 0.5,
+            {'one_value_s': round(one[0], 2), 'values_5000_s': round(many[0], 2)})
+    return results
+
+
+def run_checkpoint_anchor_controls(root: Path) -> list[dict[str, Any]]:
+    """Checkpoint anchor and revalidation, damaged closed runs, consistency of the run listing, Markdown links."""
+    import contextlib
+    import io
+    results: list[dict[str, Any]] = []
+
+    def runs_listing(results_dir: Path) -> dict[str, Any]:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cmd_runs(argparse.Namespace(project=str(root), results_dir=str(results_dir), inspect_all=False))
+        return json.loads(stdout.getvalue())
+
+    # create records the manifest hash in RUN-STATE.json; a rewritten manifest no longer verifies.
+    run, project, _ = write_example_run(root / 'anchor', 'interim')
+    created = create_checkpoint(run, project)
+    anchor = read_json(run / 'RUN-STATE.json').get('interim_checkpoint') or {}
+    snapshot, manifest_path = run / 'checkpoints/interim/files', run / 'checkpoints/interim/manifest.json'
+    saved = read_json(snapshot / 'audit.json')
+    saved['checks'] = []
+    write_text_file(snapshot / 'audit.json', json.dumps(saved))
+    manifest = read_json(manifest_path)
+    manifest['sha256']['audit.json'] = sha256_file(snapshot / 'audit.json')
+    write_text_file(manifest_path, json.dumps(manifest))
+    rewritten = verify_checkpoint(run)
+    control(results, 'CHECKPOINT_ANCHOR_DETECTS_REWRITTEN_MANIFEST', created['state'] == 'VALID' and created['notes'] == []
+            and set(anchor) == {'manifest_sha256', 'created_at_utc', 'tool_version'} and rewritten['state'] == 'INVALID'
+            and 'changed after creation' in rewritten.get('error', ''), rewritten)
+    # without the anchor (an earlier tool version) the manifest is checked as before, with a note; the snapshot's
+    # audit.json is revalidated with the final rules for the same tool version only
+    state = read_json(run / 'RUN-STATE.json')
+    state.pop('interim_checkpoint', None)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    unanchored = verify_checkpoint(run, require_anchor=False)
+    legacy_run(run)
+    manifest['tool_version'] = 'earlier'
+    write_text_file(manifest_path, json.dumps(manifest))
+    other_version = verify_checkpoint(run)
+    control(results, 'CHECKPOINT_SNAPSHOT_REVALIDATED_AND_UNANCHORED_NOTED', unanchored['state'] == 'INVALID'
+            and 'fails the final validation' in unanchored.get('error', '') and other_version['state'] == 'VALID'
+            and any('no interim_checkpoint anchor' in note for note in other_version['notes'])
+            and any('not revalidated' in note for note in other_version['notes']), [unanchored, other_version])
+    control(results, 'RESTORE_GUIDANCE_COPIES_MANIFEST_FILES', 'the live files the manifest lists' in RESTORE_GUIDANCE
+            and 'with the interim_checkpoint anchor' in RESTORE_GUIDANCE
+            and 'discards all progress since the interim checkpoint' in RESTORE_GUIDANCE)
+
+    # A closed run with a damaged audit.json stays closed; a lost RUN-STATE.json beside a finished audit.json is
+    # probably closed; neither is offered for resuming or for an interim restore.
+    damaged_runs = root / 'damaged-results'
+    for name in ('closed-audit-damaged', 'state-lost-finished', 'state-lost-interim'):
+        run, project, _ = write_example_run(root / name, 'interim' if name == 'state-lost-interim' else 'go')
+        if name != 'state-lost-interim':
+            state = read_json(run / 'RUN-STATE.json')
+            state['closed_at_utc'] = '2026-01-02T00:00:00Z'
+            write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        shutil.copytree(run, damaged_runs / name)
+    write_text_file(damaged_runs / 'closed-audit-damaged' / 'audit.json', '{"run_id": "x", "schema_vers')
+    write_text_file(damaged_runs / 'state-lost-finished' / 'RUN-STATE.json', '{"run_id": "x", "phase": "P10", "clo')
+    (damaged_runs / 'state-lost-interim' / 'RUN-STATE.json').unlink()
+    listing = runs_listing(damaged_runs)
+    by_dir = {info['dir']: info for info in listing['runs']}
+    closed_damaged, finished, interim = (by_dir.get(name, {}) for name in (
+        'closed-audit-damaged', 'state-lost-finished', 'state-lost-interim'))
+    control(results, 'RUNS_DAMAGED_CLOSED_RUN_NEVER_REOPENED', closed_damaged.get('status') == 'CLOSED'
+            and closed_damaged.get('resumable_with_package') is False
+            and 'never restore the interim checkpoint' in str(closed_damaged.get('resume_guidance'))
+            and finished.get('status') == 'PROBABLY_CLOSED' and finished.get('resumable_with_package') is False
+            and 'Offer' not in str(finished.get('resume_guidance')) and interim.get('status') == 'OPEN'
+            and listing['latest_resumable'] in (None, 'state-lost-interim'),
+            {name: [info.get('status'), info.get('resumable_with_package')] for name, info in by_dir.items()})
+
+    # latest_resumable never names a run whose guidance says resuming is not the default or not possible; a newer
+    # damaged open run is judged before an older healthy one; a directory with only its checkpoint left is a run.
+    selection = root / 'selection-results'
+    stamps = {'older-open': '2026-01-01T00:00:00Z', 'newer-closed': '2026-02-01T00:00:00Z'}
+    for name, stamp in stamps.items():
+        run, _, _ = write_example_run(root / ('selection-' + name), 'interim' if name == 'older-open' else 'go')
+        state = read_json(run / 'RUN-STATE.json')
+        state.update(created_at_utc=stamp, closed_at_utc='2026-02-02T00:00:00Z' if name == 'newer-closed' else None)
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        shutil.copytree(run, selection / name)
+    older_open = runs_listing(selection)
+    p8 = root / 'p8-results'
+    run, _, _ = write_example_run(root / 'p8-run', 'interim')
+    state = read_json(run / 'RUN-STATE.json')
+    state['phase'] = 'P8'
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    shutil.copytree(run, p8 / 'p8')
+    p8_listing = runs_listing(p8)
+    newer = root / 'newer-damaged-results'
+    for name, stamp in (('older', '2025-12-15T00:00:00Z'), ('newer', '2026-02-01T00:00:00Z')):
+        run, project, data = write_example_run(root / ('newer-damaged-' + name), 'interim')
+        state = read_json(run / 'RUN-STATE.json')
+        state['created_at_utc'] = stamp
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        if name == 'newer':
+            create_checkpoint(run, project)
+        shutil.copytree(run, newer / (data['run_id'] if name == 'newer' else name))
+        if name == 'newer':
+            newer_dir = newer / data['run_id']
+            write_text_file(newer_dir / 'RUN-STATE.json', '{')
+            write_text_file(newer_dir / 'audit.json', '{')
+            leftover = newer / 'checkpoint-only'
+            (leftover / 'checkpoints').mkdir(parents=True)
+            shutil.copytree(newer_dir / 'checkpoints' / 'interim', leftover / 'checkpoints' / 'interim')
+            # its creation time is the directory's: older than both runs, so the newer run is the newest open run
+            past = datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp()
+            os.utime(leftover, (past, past))
+    damaged_listing = runs_listing(newer)
+    newer_name = next((info['dir'] for info in damaged_listing['runs'] if info['dir'] not in ('older', 'checkpoint-only')), None)
+    only = next((info for info in damaged_listing['runs'] if info['dir'] == 'checkpoint-only'), {})
+    control(results, 'RUNS_LATEST_RESUMABLE_FOLLOWS_GUIDANCE', older_open['latest_resumable'] is None
+            and p8_listing['latest_resumable'] is None and p8_listing['runs'][0]['resumable_with_package'] is False
+            and damaged_listing['latest_resumable'] == newer_name and 'checkpoint-only' not in damaged_listing['other_dirs']
+            and 'checkpoint' in str(only.get('resume_guidance')),
+            {'older_open': older_open['latest_resumable'], 'p8': p8_listing['latest_resumable'],
+             'damaged': damaged_listing['latest_resumable'], 'other': damaged_listing['other_dirs']})
+
+    # Markdown links: balanced parentheses to any depth; an unbalanced link is still reported; linear time.
+    started = time.monotonic()
+    for text in ('[a](' * 2000, '[a](' + 'x' * 200000 + '(', '[a](' + 'x(y)' * 50000, '[a](' + '(x)' * 100000 + ' ',
+                 ('[a](' + 'x' * 50) * 5000, '[' * 100000 + '](x)', '[a](x ' * 20000):
+        markdown_links(text)
+    elapsed = time.monotonic() - started
+    found = [markdown_links(text) for text in ('[a](x(a(b)).png)', '[a](x(.png)', '![a](x(1)(2).png "t")',
+                                               '[a](<x (1).png>) and [b](y.png)')]
+    control(results, 'MARKDOWN_LINKS_NESTED_UNBALANCED_LINEAR', found == [
+        ['x(a(b)).png'], ['x(.png'], ['x(1)(2).png'], ['<x (1).png>', 'y.png']] and elapsed < 5,
+            {'found': found, 'seconds': round(elapsed, 2)})
+
+    # init: the next steps match run_type INITIAL.
+    project = root / 'init-project'
+    write_text_file(project / 'app.txt', 'x\n')
+    code, output = run_cli('init', '--project', str(project), '--results-dir', str(root / 'init-results'), '--mode', 'filesystem')
+    run_dir = Path(json_head(output).get('run_dir', str(root / 'missing-init')))
+    steps = read_json(run_dir / 'RUN-STATE.json').get('next_steps', []) if (run_dir / 'RUN-STATE.json').is_file() else []
+    control(results, 'INIT_NEXT_STEPS_MATCH_RUN_TYPE', code == 0 and any(
+        'run_type is INITIAL' in step and 'previous_run_ids' in step for step in steps), steps)
+    return results
+
+
+def legacy_run(run: Path) -> None:
+    """Selftest: an example run as the previous prompt (5.0) and tool (3.0.0) left it: RUN-STATE.json without
+    tool_version and without an anchor, audit.json of prompt 5.0, a checkpoint manifest (if any) of tool 3.0.0. Only
+    the manifest's tool_version is rewritten: the snapshot files stay those of a current run, so a restore of such a
+    fixture yields a current run state."""
+    state = read_json(run / 'RUN-STATE.json')
+    state.pop('tool_version', None)
+    state.pop('interim_checkpoint', None)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    write_text_file(run / 'audit.json', json.dumps({**read_json(run / 'audit.json'), 'prompt_version': '5.0'}))
+    manifest_path = run / 'checkpoints' / 'interim' / 'manifest.json'
+    if manifest_path.is_file():
+        write_text_file(manifest_path, json.dumps({**read_json(manifest_path), 'tool_version': '3.0.0'}))
+
+
+def run_integration_controls(root: Path) -> list[dict[str, Any]]:
+    """Paths across the commands: closure receipt from init to runs, failed start to a BLOCKED journey check,
+    checkpoint to close, original-project aliases in run, selftest registration."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+
+    def runs_of(run: Path) -> dict[str, Any]:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cmd_runs(argparse.Namespace(project=str(root), results_dir=str(run.parent), inspect_all=False))
+        return json.loads(stdout.getvalue())
+
+    def final_codes(run: Path, project: Path) -> set[str]:
+        code, output = run_cli('validate', str(run), '--project', str(project), '--final', '--json')
+        return {item['code'] for item in json_head(output).get('errors', [])}
+
+    def type_closure(run: Path) -> None:
+        write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), 'phase': 'P9',
+                                                            'closed_at_utc': utc_now()}))
+
+    # init records the tool version; a closed_at_utc typed into such a run is no closure.
+    project = root / 'init-project'
+    write_text_file(project / 'README.md', EXAMPLE_README)
+    code, output = run_cli('init', '--project', str(project), '--mode', 'filesystem')
+    run = Path(json_head(output).get('run_dir', str(root / 'missing-init')))
+    state = read_json(run / 'RUN-STATE.json') if (run / 'RUN-STATE.json').is_file() else {}
+    if state:
+        type_closure(run)
+    control(results, 'INIT_RUN_TYPED_CLOSURE_UNRECORDED', code == 0 and state.get('tool_version') == TOOL_VERSION
+            and 'E_CLOSURE_UNRECORDED' in final_codes(run, project), state.get('tool_version'))
+
+    # The same run with tool_version removed is no run of an earlier tool: audit.json says prompt 5.1, so validate
+    # names the missing field (also without --final), the typed closed_at_utc is no closure, runs says so.
+    if state:
+        typed = read_json(run / 'RUN-STATE.json')
+        typed.pop('tool_version')
+        write_text_file(run / 'RUN-STATE.json', json.dumps(typed))
+    _, validated = run_cli('validate', str(run), '--project', str(project), '--json')
+    plain = {item['code'] for item in json_head(validated).get('errors', [])}
+    remedy = next((item['message'] for item in json_head(validated).get('errors', [])
+                   if item['code'] == 'E_RUN_STATE_TOOL_VERSION'), '')
+    listing = runs_of(run)
+    info = next(iter(listing['runs']), {})
+    control(results, 'CURRENT_RUN_WITHOUT_TOOL_VERSION_NOT_LEGACY', bool(state) and 'tool_version' not in typed
+            and 'E_RUN_STATE_TOOL_VERSION' in plain and TOOL_VERSION_REMEDY in remedy
+            and 'Rebuild' not in remedy
+            and {'E_RUN_STATE_TOOL_VERSION', 'E_CLOSURE_UNRECORDED'} <= final_codes(run, project)
+            and info.get('closure_recorded') is False
+            and any('closure_recorded false' in note and run.name in note for note in listing['notes']),
+            {'plain': sorted(plain), 'runs': info.get('closure_recorded', 'absent')})
+
+    # A current run is never inferred to be a legacy run, whatever RUN-STATE.json says about the prompt version; a
+    # run of the earlier prompt keeps the inference.
+    observed = {}
+    for name, version in (('current-prompt-spelling', 'prompt-5.1'), ('current-old-prompt', '3.0'), ('legacy', '3.0')):
+        run, project, data = write_example_run(root / ('inferred-' + name), 'nogo')
+        if name == 'legacy':
+            legacy_run(run)
+        write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), 'prompt_version': version}))
+        listing = runs_of(run)
+        observed[name] = (next(iter(listing['runs']), {}).get('status'), listing['latest_closed'])
+    control(results, 'CURRENT_RUN_NEVER_INFERRED_LEGACY', observed == {
+        'current-prompt-spelling': ('OPEN', None), 'current-old-prompt': ('OPEN', None),
+        'legacy': ('LEGACY_CLOSED_INFERRED', 'run')}, observed)
+
+    # A current run that only lacks tool_version is told to add the field; a run state that is really damaged still
+    # gets the rebuild guidance.
+    observed = {}
+    for name, drop in (('field-only', ('tool_version',)), ('damaged', ('tool_version', 'run_id', 'phase'))):
+        run, project, data = write_example_run(root / ('missing-field-' + name), 'interim')
+        write_text_file(run / 'RUN-STATE.json', json.dumps({key: value for key, value in read_json(
+            run / 'RUN-STATE.json').items() if key not in drop}))
+        guidance = str(next(iter(runs_of(run)['runs']), {}).get('resume_guidance'))
+        observed[name] = ('lacks tool_version' in guidance and TOOL_VERSION_REMEDY in guidance
+                          and 'rebuild' not in guidance if name == 'field-only' else
+                          'rebuild RUN-STATE.json' in guidance and 'incomplete' in guidance, guidance[:200])
+    control(results, 'MISSING_TOOL_VERSION_GUIDANCE_NAMES_THE_FIELD', all(ok for ok, _ in observed.values()), observed)
+
+    # A run that fails final validation, closed by hand: validate and runs say so, close stays refused. A run of an
+    # earlier tool (prompt 5.0, no tool_version) keeps the earlier behaviour.
+    observed = {}
+    for name in ('typed', 'legacy', 'stamped'):
+        run, project, data = write_example_run(root / ('hand-closed-' + name), 'nogo')
+        if name != 'typed':
+            legacy_run(run)
+        if name == 'stamped':  # tool_version alone, beside audit.json of prompt 5.0, makes the run current
+            write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'),
+                                                                'tool_version': TOOL_VERSION}))
+        write_text_file(run / 'REPORT.md', '')
+        type_closure(run)
+        listing = runs_of(run)
+        info = next(iter(listing['runs']), {})
+        code, output = run_cli('close', str(run), '--project', str(project))
+        observed[name] = {'codes': sorted(final_codes(run, project)
+                                          & {'E_CLOSURE_UNRECORDED', 'E_CLOSURE_STALE', 'E_RUN_STATE_TOOL_VERSION'}),
+                          'status': info.get('status'), 'recorded': info.get('closure_recorded', 'absent'),
+                          'stale': info.get('closure_stale', 'absent'), 'latest_closed': listing['latest_closed'],
+                          'noted': any('closure_recorded false' in note and run.name in note for note in listing['notes']),
+                          'close': code == 2 and (CLOSURE_UNRECORDED_REMEDY if name != 'legacy' else 'already closed')
+                          in output}
+    control(results, 'CLOSURE_TYPED_TIMESTAMP_UNRECORDED', observed == {
+        'typed': {'codes': ['E_CLOSURE_UNRECORDED'], 'status': 'CLOSED', 'recorded': False, 'stale': False,
+                  'latest_closed': 'run', 'noted': True, 'close': True},
+        'stamped': {'codes': ['E_CLOSURE_UNRECORDED'], 'status': 'CLOSED', 'recorded': False, 'stale': False,
+                    'latest_closed': 'run', 'noted': True, 'close': True},
+        'legacy': {'codes': [], 'status': 'CLOSED', 'recorded': 'absent', 'stale': 'absent', 'latest_closed': 'run',
+                   'noted': False, 'close': True}}, observed)
+
+    # close records the receipt; validate --final and runs accept it until audit.json changes.
+    run, project, data = write_example_run(root / 'receipt', 'nogo')
+    code, output = run_cli('close', str(run), '--project', str(project))
+    printed, state = json_head(output), read_json(run / 'RUN-STATE.json')
+    receipt = {'recorded_by': 'close', 'tool_version': TOOL_VERSION, 'audit_sha256': sha256_file(run / 'audit.json')}
+    review = validate_audit(read_json(run / 'audit.json'), run, project, final=True)[0].review
+    listing = runs_of(run)
+    info = next(iter(listing['runs']), {})
+    control(results, 'CLOSURE_RECEIPT_RECORDED_BY_CLOSE', code == 0 and state.get('closure') == receipt
+            and printed.get('closure') == receipt and printed.get('closure_review_entries') == len(review)
+            and 'needs a reader' in str(printed.get('closure_review_note')) and not final_codes(run, project)
+            and info.get('closure_recorded') is True and info.get('closure_stale') is False
+            and listing['latest_closed'] == 'run' and not any('closure' in note for note in listing['notes']),
+            {'printed': printed, 'state': state.get('closure'), 'runs': info})
+    edited = read_json(run / 'audit.json')
+    edited['residual_risks'] = edited['residual_risks'] + ['Added after closure.']
+    write_text_file(run / 'audit.json', json.dumps(edited))
+    listing = runs_of(run)
+    info = next(iter(listing['runs']), {})
+    control(results, 'CLOSURE_STALE_AFTER_AUDIT_EDIT', 'E_CLOSURE_STALE' in final_codes(run, project)
+            and info.get('status') == 'CLOSED' and info.get('closure_stale') is True
+            and any('closure_stale true' in note for note in listing['notes']), info)
+
+    # Deeply nested RUN-STATE.json: a tool error with remedy, no traceback.
+    run, project, data = write_example_run(root / 'close-deep', 'nogo')
+    write_text_file(run / 'RUN-STATE.json', '[' * 100000)
+    code, output = run_cli('close', str(run), '--project', str(project))
+    control(results, 'CLOSE_DEEP_RUN_STATE_TOOL_ERROR', code == 2 and 'RUN-STATE.json missing or unreadable' in output
+            and 'Traceback' not in output, output[-300:])
+
+    # checkpoint create without recorded authorizations names the remedy.
+    run, project, data = write_example_run(root / 'checkpoint-authorization', 'interim')
+    write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), 'authorization': None}))
+    code, output = run_cli('checkpoint', 'create', str(run), '--project', str(project))
+    control(results, 'CHECKPOINT_NAMES_AUTHORIZATION_REMEDY', code == 2 and 'E_RUN_AUTHORIZATION' in output
+            and 'RUN-STATE.json authorization' in output and not (run / 'checkpoints' / 'interim').exists(), output[-400:])
+
+    # checkpoint create to close: the anchor is kept, the receipt added, the checkpoint still verifies.
+    run, project, interim = write_example_run(root / 'checkpoint-close', 'interim')
+    created = create_checkpoint(run, project)
+    anchor = read_json(run / 'RUN-STATE.json').get('interim_checkpoint')
+    write_text_file(run / 'audit.json', json.dumps(finish_interim(run, interim)))
+    code, output = run_cli('close', str(run), '--project', str(project))
+    state = read_json(run / 'RUN-STATE.json')
+    control(results, 'CHECKPOINT_CREATE_TO_CLOSE_KEEPS_ANCHOR', created['state'] == 'VALID' and code == 0
+            and isinstance(anchor, dict) and state.get('interim_checkpoint') == anchor
+            and (state.get('closure') or {}).get('audit_sha256') == sha256_file(run / 'audit.json')
+            and verify_checkpoint(run)['state'] == 'VALID' and not final_codes(run, project), output[-600:])
+
+    # A command that cannot start leaves a one-line log that carries a BLOCKED own check of a T1 journey; the same
+    # record with an empty log does not.
+    run, project, data = write_example_run(root / 'failed-start', 'nogo')
+    workspace = root / 'failed-start-copy'
+    write_fixture_marker(workspace)
+    code, output = run_cli('run', '--id', 'CHK-008', '--evidence-dir', str(run / 'evidence' / 'logs'), '--cwd',
+                           str(workspace), '--', 'audit-selftest-missing-runner')
+    try:  # the summary on stdout and the error line on stderr, in either order
+        evidence = json.JSONDecoder().raw_decode(output[output.find('{'):])[0].get('evidence_entry') or {}
+    except (ValueError, AttributeError):
+        evidence = {}
+    data['evidence'].append(dict(evidence, id='EV-START', limits='The end-to-end runner is not installed in the copy.'))
+    add_check('CHK-008', title='Edit a note, restart the process, read the edit', purpose='CHARACTERIZATION',
+              method='E2E', execution='BLOCKED', evidence_ids=['EV-START'],
+              catch_up_plan='Install the end-to-end runner in the working copy.')(data, run, project)
+    data['journeys'].append({'id': 'J-002', 'name': 'Edit a note and read it after a restart', 'tier': 'T1',
+                             'objective_ids': ['OBJ-001'], 'check_ids': ['CHK-008'], 'status': 'INCONCLUSIVE',
+                             'gap': 'The end-to-end runner is missing; CHK-008 is BLOCKED.'})
+    write_text_file(run / 'audit.json', json.dumps(data))
+    log_path = run / str(evidence.get('path', 'evidence/logs/missing.log'))
+    blocked = final_codes(run, project)
+    lines = log_path.read_text(encoding='utf-8').splitlines() if log_path.is_file() else []
+    log_path.write_bytes(b'')
+    meta_path = log_path.with_name(log_path.name[:-4] + '.meta.json')
+    if meta_path.is_file():
+        write_text_file(meta_path, json.dumps({**read_json(meta_path), 'log_sha256': sha256_file(log_path)}))
+    entry(data, 'evidence', 'EV-START')['sha256'] = sha256_file(log_path)
+    write_text_file(run / 'audit.json', json.dumps(data))
+    control(results, 'RUN_FAILED_START_LOG_CARRIES_BLOCKED_T1_CHECK', code == 127 and len(lines) == 1
+            and evidence.get('path') == 'evidence/logs/CHK-008.log' and not blocked
+            and 'E_BLOCKED_UNEVIDENCED' in final_codes(run, project), {'exit': code, 'errors': sorted(blocked)})
+
+    # runs lists a verdict stored as an object or a list with the other runs, without a traceback.
+    run, project, data = write_example_run(root / 'status-object', 'go')
+    data.update(audit_status={'value': data['audit_status'], 'reason': 'Stored as an object.'}, release_status=['GO'])
+    write_text_file(run / 'audit.json', json.dumps(data))
+    open_run, _, _ = write_example_run(root / 'status-object-open', 'interim')
+    shutil.copytree(open_run, run.parent / 'open')
+    code, output = run_cli('runs', '--project', str(root), '--results-dir', str(run.parent))
+    listed = {info.get('dir'): info.get('status') for info in json_head(output).get('runs', [])}
+    control(results, 'RUNS_LISTS_STATUS_STORED_AS_OBJECT', code == 0 and 'Traceback' not in output
+            and listed.get('open') == 'OPEN' and 'run' in listed, listed or output[-300:])
+
+    # Extended-length and UNC loopback spellings of the original project are refused like the drive spelling.
+    workspace = root / 'alias-copy'
+    write_fixture_marker(workspace)
+    original = (root / 'alias-copy-original').resolve()
+    write_text_file(original / 'src' / 'data.txt', 'original\n')
+    drive = re.match(r'([A-Za-z]):\\(.*)$', str(original)) if os.name == 'nt' else None
+    unc = f'\\\\localhost\\{drive.group(1)}$\\{drive.group(2)}' if drive else None
+    if os.name != 'nt':
+        results.append({'id': 'RUN_REFUSES_ORIGINAL_ALIAS_SPELLINGS', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': 'Extended-length and UNC paths exist on Windows only'})
+    elif unc is None or not os.path.isfile(unc + '\\src\\data.txt'):
+        results.append({'id': 'RUN_REFUSES_ORIGINAL_ALIAS_SPELLINGS', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': f'The administrative share {unc} is not reachable here'})
+    else:
+        refused = {}
+        for spelling, base in (('extended', '\\\\?\\' + str(original)), ('unc', unc),
+                               ('extended_unc', '\\\\?\\UNC\\' + unc[2:])):
+            for kind, extra in (('argument', ['--', sys.executable, '-c', 'pass', base + '\\src\\data.txt']),
+                                ('option', ['--', sys.executable, '-c', 'pass', '--config=' + base + '\\src\\new.txt']),
+                                ('env', ['--env', 'OUT_DIR=' + base + '\\src', '--', sys.executable, '-c', 'pass']),
+                                ('evidence', None)):
+                evidence_dir = base + '\\evidence' if extra is None else str(root / 'alias-logs')
+                code, output = run_cli('run', '--id', f'ALIAS-{spelling}-{kind}'.upper().replace('_', '-'),
+                                       '--evidence-dir', evidence_dir, '--cwd', str(workspace),
+                                       *(extra or ['--', sys.executable, '-c', 'pass']))
+                refused[f'{spelling}/{kind}'] = code == 2 and 'original project' in output and 'Traceback' not in output
+        control(results, 'RUN_REFUSES_ORIGINAL_ALIAS_SPELLINGS', all(refused.values())
+                and not (original / 'evidence').exists() and not (original / 'src' / 'new.txt').exists(), refused)
+
+    # Every runner is a registered group; an aborted group keeps its earlier controls and hides no later group;
+    # the totals are the sum of the groups.
+    def synthetic(name: str, appends: bool) -> Callable[..., Any]:
+        record = {'id': 'SYNTH_' + name.upper(), 'kind': 'TOOL_CONTROL', 'result': 'PASS'}
+        if name == 'run_workspace_fix_controls':
+            def crash(group_root: Path, group_results: list[dict[str, Any]]) -> None:
+                group_results.append(record)
+                raise RuntimeError('Synthetic workspace abort')
+            return crash
+        if appends:
+            return lambda group_root, group_results: group_results.append(record)
+        return lambda group_root: [record]
+    out = root / 'registration.json'
+    complete_stdout = io.StringIO()
+    with contextlib.ExitStack() as stack:
+        for _, name, _, appends in SELFTEST_GROUPS:
+            stack.enter_context(patch(f'{__name__}.{name}', side_effect=synthetic(name, appends)))
+        stack.enter_context(contextlib.redirect_stdout(complete_stdout))
+        code = cmd_selftest(argparse.Namespace(out=str(out)))
+    report = read_json(out) if out.is_file() else {'results': [], 'summary': {}}
+    defined = sorted(name for name, value in globals().items()
+                     if re.fullmatch(r'run_\w+_controls', name) and callable(value))
+    summary = report['summary']
+    control(results, 'SELFTEST_RUNS_EVERY_GROUP_SEPARATELY', code == 1 and defined == sorted(SELFTEST_RUNNERS)
+            and len({group for group, _, _, _ in SELFTEST_GROUPS}) == len(SELFTEST_GROUPS)
+            and [r['id'] for r in report['results'] if r['id'].startswith('SYNTH_')]
+            == ['SYNTH_' + name.upper() for name in SELFTEST_RUNNERS]
+            and summary.get('failed') == ['WORKSPACE_FIX_CONTROLS_COMPLETE']
+            and 'Synthetic workspace abort' in str(next((r.get('detail') for r in report['results']
+                                                         if r['id'] == 'WORKSPACE_FIX_CONTROLS_COMPLETE'), ''))
+            and sum(summary.get(kind, {}).get('total', 0) for kind in ('POSITIVE_CONTROL', 'NEGATIVE_CONTROL',
+                                                                       'TOOL_CONTROL')) == len(report['results']),
+            {'missing': sorted(set(defined) - set(SELFTEST_RUNNERS)), 'summary': summary})
+    group_of = {name: group for group, name, _, _ in SELFTEST_GROUPS}
+    tagged = {r['id']: r.get('group') for r in report['results']}
+    printed_complete = json_head(complete_stdout.getvalue())
+    control(results, 'SELFTEST_COMPLETE_RUN_REPORTS_EVERY_GROUP', summary.get('partial') is False
+            and summary.get('groups') == [group for group, _, _, _ in SELFTEST_GROUPS] and 'note' not in summary
+            and printed_complete.get('partial') is False and 'note' not in printed_complete
+            and printed_complete.get('groups') == [group for group, _, _, _ in SELFTEST_GROUPS]
+            and all(tagged.get('SYNTH_' + name.upper()) == group for name, group in group_of.items())
+            and tagged.get('WORKSPACE_FIX_CONTROLS_COMPLETE') == 'WORKSPACE_FIX', {'groups': summary.get('groups'),
+                                                                                  'tagged': tagged})
+    chosen = ['CORE2', 'TOOL']
+    out = root / 'registration-chosen.json'
+    with contextlib.ExitStack() as stack:
+        for _, name, _, appends in SELFTEST_GROUPS:
+            stack.enter_context(patch(f'{__name__}.{name}', side_effect=synthetic(name, appends)))
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        chosen_code = cmd_selftest(argparse.Namespace(out=str(out), group=chosen[::-1]))
+    chosen_report = read_json(out) if out.is_file() else {'results': [], 'summary': {}}
+    control(results, 'SELFTEST_GROUP_RUNS_NAMED_GROUPS_IN_ORDER', chosen_code == 0
+            and [r.get('group') for r in chosen_report['results']] == ['TOOL', 'CORE2']
+            and chosen_report['summary'].get('groups') == ['TOOL', 'CORE2']
+            and chosen_report['summary'].get('partial') is True
+            and chosen_report['summary'].get('failed') == [], chosen_report['summary'])
+    out = root / 'single-group.json'
+    try:
+        code, output = run_cli('selftest', '--group', 'CHECKPOINT_INPUT', '--out', str(out), timeout=60)
+    except subprocess.TimeoutExpired:
+        code, output = -1, 'Timeout: the group run did not end within 60 seconds'
+    single = read_json(out) if out.is_file() else {'results': [], 'summary': {}}
+    printed = json_head(output)
+    control(results, 'SELFTEST_GROUP_REPORTS_ONLY_THE_GROUP', code == 0 and single['results']
+            and {r.get('group') for r in single['results']} == {'CHECKPOINT_INPUT'}
+            and single['summary'].get('groups') == ['CHECKPOINT_INPUT'] and single['summary'].get('partial') is True
+            and printed.get('groups') == ['CHECKPOINT_INPUT'] and printed.get('partial') is True
+            and 'no selftest result for the tool' in str(printed.get('note')), output[-500:])
+    out = root / 'unknown-group.json'
+    code, output = run_cli('selftest', '--group', 'NO_SUCH_GROUP', '--out', str(out))
+    code_help, helptext = run_cli('selftest', '--help')
+    control(results, 'SELFTEST_GROUP_REFUSES_UNKNOWN_NAME', code == 2 and not out.exists() and 'NO_SUCH_GROUP' in output
+            and 'CHECKPOINT_INPUT' in output and 'INTEGRATION' in output and 'Traceback' not in output
+            and '"partial"' not in output and code_help == 0 and '--group' in helptext
+            and 'mutation probe' in ' '.join(helptext.split()), output[-500:])
+    # A partial run fails like a complete one when a control of its group fails; a repeated --group runs the group once.
+    out = root / 'failing-group.json'
+    failing = [{'id': 'SYNTH_GROUP_CONTROL', 'kind': 'TOOL_CONTROL', 'result': 'FAIL', 'detail': 'synthetic'}]
+    failing_stdout = io.StringIO()
+    with patch(f'{__name__}.run_tool_controls', return_value=failing), contextlib.redirect_stdout(failing_stdout):
+        failing_code = cmd_selftest(argparse.Namespace(out=str(out), group=['TOOL']))
+    failing_report = read_json(out) if out.is_file() else {'results': [], 'summary': {}}
+    failing_printed = json_head(failing_stdout.getvalue())
+    out = root / 'repeated-group.json'
+    try:
+        code, output = run_cli('selftest', '--group', 'CHECKPOINT_INPUT', '--group', 'CHECKPOINT_INPUT', '--out', str(out),
+                               timeout=60)
+    except subprocess.TimeoutExpired:
+        code, output = -1, 'Timeout: the group run did not end within 60 seconds'
+    repeated = read_json(out) if out.is_file() else {'results': [], 'summary': {}}
+    repeated_ids = [r['id'] for r in repeated['results']]
+    control(results, 'SELFTEST_GROUP_RUN_FAILS_WITH_ITS_CONTROLS', failing_code == 1
+            and failing_report['summary'].get('failed') == ['SYNTH_GROUP_CONTROL']
+            and failing_report['summary'].get('groups') == ['TOOL'] and failing_report['summary'].get('partial') is True
+            and failing_printed.get('failed') == ['SYNTH_GROUP_CONTROL'] and failing_printed.get('partial') is True
+            and code == 0 and repeated_ids and len(repeated_ids) == len(set(repeated_ids))
+            and repeated_ids == [r['id'] for r in single['results']]
+            and repeated['summary'].get('groups') == ['CHECKPOINT_INPUT'], {
+                'failing': failing_report['summary'], 'repeated': repeated['summary'].get('groups'), 'output': output[-300:]})
+    return results
+
+
+def run_checkpoint_recovery_controls(root: Path) -> list[dict[str, Any]]:
+    """Checkpoints of runs with tool_version, replacing a checkpoint that does not verify, checkpoint restore, closed
+    runs that are never resumed, and the defaults of the run listing."""
+    results: list[dict[str, Any]] = []
+
+    def cli_json(*arguments: str) -> tuple[int, dict[str, Any], str]:
+        code, output = run_cli(*arguments)
+        try:
+            value = json.JSONDecoder().raw_decode(output[output.find('{'):])[0]
+        except ValueError:
+            value = {}
+        return code, value if isinstance(value, dict) else {}, output
+
+    def listing(results_dir: Path) -> dict[str, Any]:
+        return cli_json('runs', '--project', str(root), '--results-dir', str(results_dir))[1]
+
+    def interim_run(name: str, anchored: bool = True) -> tuple[Path, Path, dict[str, Any]]:
+        run, project, data = write_example_run(root / name, 'interim')
+        if anchored:
+            create_checkpoint(run, project)
+        return run, project, data
+
+    def closed_run(name: str) -> tuple[Path, Path]:
+        run, project, interim = interim_run(name)
+        write_text_file(run / 'audit.json', json.dumps(finish_interim(run, interim)))
+        write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), 'phase': 'P9'}))
+        code, output = run_cli('close', str(run), '--project', str(project))
+        if code != 0:
+            raise ToolError('Synthetic closure failed: ' + output[-500:])
+        return run, project
+
+    def update_state(run: Path, **changes: Any) -> None:
+        write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), **changes}))
+
+    # A checkpoint that checkpoint create never made does not verify for a run with tool_version, also with a null
+    # anchor; a run of an earlier tool is verified against the manifest with a note.
+    run, project, data = interim_run('handmade', anchored=False)
+    data['checks'] = []
+    write_text_file(run / 'audit.json', json.dumps(data))
+    files, omitted, directories = checkpoint_files(run, data)
+    destination = run / 'checkpoints' / 'interim'
+    for rel in files:
+        (destination / 'files' / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(run / rel, destination / 'files' / rel)
+    for rel in directories:
+        (destination / 'files' / rel).mkdir(parents=True, exist_ok=True)
+    write_json_new(destination / 'manifest.json', {
+        'format': 'audit-interim-checkpoint/1', 'package': 'production-readiness-audit', 'schema_version': SCHEMA_VERSION,
+        'prompt_version': PROMPT_VERSION, 'tool_version': '3.0.0', 'run_id': data['run_id'], 'baseline': data['baseline'],
+        'validation': {'result': 'PASS', 'final': True, 'errors': 0},
+        'sha256': {rel: sha256_file(run / rel) for rel in files}, 'not_snapshotted': omitted})
+    handmade = verify_checkpoint(run)
+    update_state(run, phase='P8')
+    listed = next(iter(listing(run.parent).get('runs', [])), {})
+    run, project, data = interim_run('null-anchor')
+    update_state(run, interim_checkpoint=None)
+    null_anchor = verify_checkpoint(run)
+    run, project, data = write_example_run(root / 'earlier-tool', 'interim')
+    create_checkpoint(run, project)
+    legacy_run(run)
+    earlier = verify_checkpoint(run)
+    control(results, 'CHECKPOINT_WITHOUT_ANCHOR_INVALID_FOR_TOOL_VERSION_RUN', handmade['state'] == 'INVALID'
+            and 'not created by checkpoint create' in handmade.get('error', '') and all(
+                text in handmade.get('remedy', '') for text in ('checkpoint reanchor', 'checkpoint create replaces'))
+            and listed.get('checkpoint', {}).get('state') == 'INVALID'
+            and listed.get('resumable_with_package') is False and null_anchor['state'] == 'INVALID'
+            and earlier['state'] == 'VALID' and any('earlier tool version' in note for note in earlier['notes']),
+            {'handmade': handmade, 'listed': listed.get('checkpoint'), 'null': null_anchor['state'], 'earlier': earlier})
+
+    # Before P8 checkpoint create replaces a checkpoint that does not verify and keeps the old one; a checkpoint that
+    # verifies is never replaced; after the review started, the refusal names the way out.
+    run, project, data = interim_run('reindented')
+    manifest_path = run / 'checkpoints' / 'interim' / 'manifest.json'
+    write_text_file(manifest_path, json.dumps(read_json(manifest_path), indent=4))
+    reindented = verify_checkpoint(run)
+    code, created, output = cli_json('checkpoint', 'create', str(run), '--project', str(project))
+    moved = Path(str((created.get('replaced') or {}).get('moved_to', root / 'missing')))
+    code_again, _, output_again = cli_json('checkpoint', 'create', str(run), '--project', str(project))
+    started_security(data, run, project)
+    write_text_file(run / 'audit.json', json.dumps(data))
+    write_text_file(manifest_path, json.dumps(read_json(manifest_path), indent=4))
+    marks = file_marks(run)
+    code_started, _, output_started = cli_json('checkpoint', 'create', str(run), '--project', str(project))
+    control(results, 'CHECKPOINT_CREATE_REPLACES_INVALID_BEFORE_P8', reindented['state'] == 'INVALID'
+            and 'the checkpoint or the anchor was changed' in reindented.get('error', '') and code == 0
+            and created.get('state') == 'VALID' and (moved / 'manifest.json').is_file()
+            and moved.parent == run / 'checkpoints' and moved.name.startswith('invalid-')
+            and code_again == 2 and 'verifies; never overwrite' in output_again and code_started == 2
+            and 'set security_review back to PENDING' in output_started
+            and file_marks(run) == marks, {'created': created, 'again': output_again[-200:],
+                                           'started': output_started[-300:]})
+
+    # checkpoint restore moves the live files the manifest lists aside, copies the checkpoint back, RUN-STATE.json last
+    # with the anchor, keeps later files; --dry-run changes nothing; a later manifest change is still detected.
+    run, project, data = interim_run('restore')
+    write_text_file(run / 'evidence' / 'later.txt', 'Written after the checkpoint.\n')
+    write_text_file(run / 'audit.json', '{interrupted')
+    marks = file_marks(run)
+    code_dry, dry, _ = cli_json('checkpoint', 'restore', str(run), '--dry-run')
+    unchanged = file_marks(run) == marks
+    code, restored, output = cli_json('checkpoint', 'restore', str(run))
+    recovery = Path(str(restored.get('recovery_dir', root / 'missing')))
+    snapshot = run / 'checkpoints' / 'interim' / 'files'
+    manifest_path = run / 'checkpoints' / 'interim' / 'manifest.json'
+    state = read_json(run / 'RUN-STATE.json') if (run / 'RUN-STATE.json').is_file() else {}
+    restored_ok = (code_dry == 0 and dry.get('state') == 'DRY_RUN' and unchanged and 'audit.json' in dry.get(
+        'moved_to_recovery', []) and code == 0 and restored.get('state') == 'RESTORED'
+        and (recovery / 'audit.json').is_file() and (recovery / 'audit.json').read_text(encoding='utf-8') == '{interrupted'
+        and (run / 'audit.json').read_bytes() == (snapshot / 'audit.json').read_bytes()
+        and (state.get('interim_checkpoint') or {}).get('manifest_sha256') == sha256_file(manifest_path)
+        and (run / 'evidence' / 'later.txt').is_file() and (restored.get('checkpoint') or {}).get('state') == 'VALID')
+    manifest = read_json(manifest_path)
+    manifest['tool_version'] = '3.0.9'
+    write_text_file(manifest_path, json.dumps(manifest))
+    control(results, 'CHECKPOINT_RESTORE_MOVES_COPIES_AND_ANCHORS', restored_ok
+            and verify_checkpoint(run)['state'] == 'INVALID', {'restored': restored, 'output': output[-300:]})
+    code_invalid, _, output_invalid = cli_json('checkpoint', 'restore', str(run))
+    run, project = closed_run('restore-closed')
+    marks = file_marks(run)
+    code_closed, _, output_closed = cli_json('checkpoint', 'restore', str(run))
+    control(results, 'CHECKPOINT_RESTORE_REFUSES_CLOSED_OR_INVALID', code_invalid == 2 and 'does not verify'
+            in output_invalid and code_closed == 2 and 'never restored' in output_closed and file_marks(run) == marks,
+            [output_invalid[-200:], output_closed[-200:]])
+    run, project, data = interim_run('state-truncated')
+    write_text_file(run / 'RUN-STATE.json', '{"run_id": "trunc')
+    truncated = verify_checkpoint(run)
+    control(results, 'CHECKPOINT_UNREADABLE_STATE_ANCHOR_NOT_READ', truncated['state'] == 'VALID'
+            and any('anchor could not be read' in note for note in truncated['notes'])
+            and not any('earlier tool version' in note for note in truncated['notes']), truncated)
+
+    # A closed run is never resumed or restored, whatever else is damaged; with the closure receipt also when the
+    # security review was set back.
+    run, project = closed_run('closed-source')
+    closed_state, closed_audit = read_json(run / 'RUN-STATE.json'), read_json(run / 'audit.json')
+    without = lambda value, *keys: json.dumps({key: item for key, item in value.items() if key not in keys})
+    observed = {}
+    for name, state_text, audit_text in (
+            ('audit_empty', None, '{}'),
+            ('audit_without_review', None, without(closed_audit, 'security_review', 'security_scope', 'next_actions',
+                                                   'residual_risks')),
+            ('state_empty', '{}', None),
+            ('receipt_only', without(closed_state, 'closed_at_utc'), None),
+            ('no_receipt_audit_empty', without(closed_state, 'closure'), '{}'),
+            ('review_reset', None, json.dumps({**closed_audit, 'security_review': {
+                **closed_audit['security_review'], 'status': 'PENDING'}}))):
+        results_dir = root / ('closed-' + name.replace('_', '-'))
+        shutil.copytree(run, results_dir / 'r1')
+        for rel, text in (('RUN-STATE.json', state_text), ('audit.json', audit_text)):
+            if text is not None:
+                write_text_file(results_dir / 'r1' / rel, text)
+        value = listing(results_dir)
+        info = next(iter(value.get('runs', [])), {})
+        marks = file_marks(results_dir / 'r1')
+        code, _, output = cli_json('checkpoint', 'restore', str(results_dir / 'r1'))
+        observed[name] = (info.get('status'), info.get('resumable_with_package'), value.get('latest_resumable'),
+                          'Offer' in str(info.get('resume_guidance')) or 'checkpoint restore' in str(
+                              info.get('resume_guidance')),
+                          code == 2 and 'nothing restored' in output and file_marks(results_dir / 'r1') == marks)
+    control(results, 'RUNS_CLOSED_RUN_NEVER_RESUMED_OR_RESTORED', all(
+        status in ('CLOSED', 'PROBABLY_CLOSED') and resumable is False and latest is None and not offered and refused
+        for status, resumable, latest, offered, refused in observed.values())
+        and observed.get('state_empty', ('',))[0] == 'PROBABLY_CLOSED', observed)
+
+    # PROBABLY_CLOSED is never latest_closed and its guidance names both branches.
+    run, project, interim = interim_run('p9-open')
+    write_text_file(run / 'audit.json', json.dumps(finish_interim(run, interim)))
+    update_state(run, phase='P9')
+    results_dir = root / 'p9-results'
+    shutil.copytree(run, results_dir / 'r1')
+    write_text_file(results_dir / 'r1' / 'RUN-STATE.json', (run / 'RUN-STATE.json').read_text(encoding='utf-8')[:40])
+    value = listing(results_dir)
+    info = next(iter(value.get('runs', [])), {})
+    guidance = str(info.get('resume_guidance'))
+    control(results, 'RUNS_PROBABLY_CLOSED_NOT_LATEST_CLOSED', info.get('status') == 'PROBABLY_CLOSED'
+            and value.get('latest_closed') is None and 'If the user confirms it was closed' in guidance
+            and 'If the run continues' in guidance and 'close records the closure' in guidance, value)
+
+    # A newer open run that is not resumable is not skipped for an older one; an older open run beside a newer
+    # closed run says in its own guidance that the user decides.
+    results_dir = root / 'newer-unreadable'
+    for name, stamp in (('older', '2026-03-01T00:00:00Z'), ('newer', '2026-04-01T00:00:00Z')):
+        run, project, data = write_example_run(root / ('newer-unreadable-' + name), 'interim')
+        update_state(run, created_at_utc=stamp)
+        shutil.copytree(run, results_dir / name)
+    write_text_file(results_dir / 'newer' / 'RUN-STATE.json', '{')
+    write_text_file(results_dir / 'newer' / 'audit.json', '{')
+    value = listing(results_dir)
+    control(results, 'RUNS_NEWER_UNREADABLE_OPEN_NOT_SKIPPED', value.get('latest_resumable') is None
+            and any('Newest open run newer' in note for note in value.get('notes', [])), value.get('notes'))
+    run, project = closed_run('older-open-closed')
+    results_dir = root / 'older-open'
+    shutil.copytree(run, results_dir / 'newer-closed')
+    update_state(results_dir / 'newer-closed', created_at_utc='2026-02-01T00:00:00Z')
+    run, project, data = write_example_run(root / 'older-open-run', 'interim')
+    update_state(run, created_at_utc='2026-01-01T00:00:00Z')
+    shutil.copytree(run, results_dir / 'older-open')
+    value = listing(results_dir)
+    info = next((item for item in value.get('runs', []) if item.get('dir') == 'older-open'), {})
+    control(results, 'RUNS_OLDER_OPEN_GUIDANCE_DEFERS_TO_USER', value.get('latest_resumable') is None
+            and str(info.get('resume_guidance')).startswith('Predates closed run newer-closed: resuming it is not the '
+                                                             'default; the user decides'), info.get('resume_guidance'))
+    return results
+
+
+def run_checkpoint_reanchor_controls(root: Path) -> list[dict[str, Any]]:
+    """checkpoint reanchor after a rebuilt run state, with its refusals and its trace; restore that stops halfway or
+    meets a link; the closure test that close, runs and validation share; messages of a missing or invalid checkpoint."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+
+    def cli_json(*arguments: str) -> tuple[int, dict[str, Any], str]:
+        code, output = run_cli(*arguments)
+        try:
+            value = json.JSONDecoder().raw_decode(output[output.find('{'):])[0]
+        except ValueError:
+            value = {}
+        return code, value if isinstance(value, dict) else {}, output
+
+    def in_process(*arguments: str) -> tuple[int, dict[str, Any], str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(list(arguments))
+        try:
+            value = json.loads(stdout.getvalue())
+        except ValueError:
+            value = {}
+        return code, value if isinstance(value, dict) else {}, stdout.getvalue() + stderr.getvalue()
+
+    def listing(run: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+        value = cli_json('runs', '--project', str(root), '--results-dir', str(run.parent))[1]
+        return value, next((info for info in value.get('runs', []) if info.get('dir') == run.name), {})
+
+    def update_state(run: Path, **changes: Any) -> None:
+        write_text_file(run / 'RUN-STATE.json', json.dumps({**read_json(run / 'RUN-STATE.json'), **changes}))
+
+    def drop_anchor(run: Path) -> None:
+        state = read_json(run / 'RUN-STATE.json')
+        state.pop('interim_checkpoint', None)
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+
+    def interim_run(name: str, phase: str | None = None, started: bool = False) -> tuple[Path, Path, dict[str, Any]]:
+        run, project, data = write_example_run(root / name, 'interim')
+        create_checkpoint(run, project)
+        if started:
+            started_security(data, run, project)
+            data['security_review']['status'] = 'IN_PROGRESS'
+            write_text_file(run / 'audit.json', json.dumps(data))
+        if phase:
+            update_state(run, phase=phase)
+        return run, project, data
+
+    def finished_run(name: str) -> tuple[Path, Path]:
+        run, project, data = interim_run(name, phase='P9')
+        write_text_file(run / 'audit.json', json.dumps(finish_interim(run, data)))
+        return run, project
+
+    def validation(run: Path, *final: str) -> tuple[int, set[str], set[str]]:
+        code, value, _ = cli_json('validate', str(run), '--json', *final)
+        return (code, {item['code'] for item in value.get('errors', [])},
+                {item['code'] for item in value.get('warnings', [])})
+
+    def rebuilt(original: dict[str, Any], guidance: str, phase: str) -> dict[str, Any]:
+        """RUN-STATE.json rebuilt with exactly the fields the guidance names, from what the lost state held."""
+        named = re.search(r'from audit\.json, RESUME\.md and the evidence \(([^)]*)\)', guidance)
+        state: dict[str, Any] = {}
+        for field in (item.strip() for item in (named.group(1).split(',') if named else [])):
+            key = 'phase' if field.startswith('phase') else field.replace(' ', '_')
+            if key in original:
+                state[key] = original[key]
+        state['phase'] = phase
+        return state
+
+    manifest_of = lambda run: run / 'checkpoints' / 'interim' / 'manifest.json'
+
+    # P9 run whose RUN-STATE.json was lost: rebuilt step by step as the guidance says, re-anchored, validate --final
+    # passes with the warning, close closes and prints it, runs shows it.
+    run, project = finished_run('p9-rebuilt')
+    original = read_json(run / 'RUN-STATE.json')
+    write_text_file(run / 'RUN-STATE.json', json.dumps(original)[:40])
+    _, lost = listing(run)
+    guidance = str(lost.get('resume_guidance'))
+    write_text_file(run / 'RUN-STATE.json', json.dumps(rebuilt(original, guidance, 'P9')))
+    code_before, errors_before, _ = validation(run, '--final')
+    marks = file_marks(run)
+    code_dry, dry, _ = cli_json('checkpoint', 'reanchor', str(run), '--dry-run')
+    dry_unchanged = file_marks(run) == marks
+    code, done, output = cli_json('checkpoint', 'reanchor', str(run))
+    anchor = read_json(run / 'RUN-STATE.json').get('interim_checkpoint') or {}
+    code_final, errors, warnings = validation(run, '--final')
+    _, _, interim_warnings = validation(run)
+    value, info = listing(run)
+    code_close, closed, close_output = cli_json('close', str(run), '--project', str(project))
+    control(results, 'REANCHOR_P9_REBUILT_STATE_CLOSES', lost.get('status') == 'PROBABLY_CLOSED'
+            and 'run checkpoint reanchor <run>' in guidance and 'E_CHECKPOINT_INVALID' in errors_before
+            and code_dry == 0 and dry.get('state') == 'DRY_RUN' and dry_unchanged
+            and code == 0 and done.get('state') == 'REANCHORED' and (done.get('checkpoint') or {}).get('state') == 'VALID'
+            and anchor.get('manifest_sha256') == sha256_file(manifest_of(run)) == (dry.get('anchor') or {}).get(
+                'manifest_sha256') and nonempty(anchor.get('reanchored_at_utc'))
+            and code_final == 0 and not errors and 'W_CHECKPOINT_REANCHORED' in warnings
+            and 'W_CHECKPOINT_REANCHORED' in interim_warnings
+            and (info.get('checkpoint') or {}).get('reanchored_at_utc') == anchor.get('reanchored_at_utc')
+            and any('re-anchored' in note and run.name in note for note in value.get('notes', []))
+            and code_close == 0 and 'REPORT.md must say so' in str(closed.get('checkpoint_reanchored')),
+            {'guidance': guidance, 'before': sorted(errors_before), 'reanchor': output[-600:], 'final': sorted(errors),
+             'warnings': sorted(warnings), 'runs': info.get('checkpoint'), 'close': close_output[-600:]})
+
+    # P8 run whose RUN-STATE.json was lost after the security review started: rebuilt as the guidance says, the
+    # checkpoint names the reanchor step, after reanchor the run is resumable with a VALID checkpoint.
+    run, project, data = interim_run('p8-rebuilt', phase='P8', started=True)
+    original = read_json(run / 'RUN-STATE.json')
+    write_text_file(run / 'RUN-STATE.json', '{"run_id": "trunc')
+    _, damaged = listing(run)
+    guidance = str(damaged.get('resume_guidance'))
+    write_text_file(run / 'RUN-STATE.json', json.dumps(rebuilt(original, guidance, 'P8')))
+    _, invalid = listing(run)
+    verified = verify_checkpoint(run)
+    code, _, output = cli_json('checkpoint', 'reanchor', str(run))
+    value, resumed = listing(run)
+    control(results, 'REANCHOR_P8_REBUILT_STATE_RESUMABLE', 'run checkpoint reanchor <run>' in guidance
+            and damaged.get('resumable_with_package') is True
+            and (invalid.get('checkpoint') or {}).get('state') == 'INVALID' and invalid.get('resumable_with_package') is False
+            and 'checkpoint reanchor <run>' in str(invalid.get('resume_guidance'))
+            and 'checkpoint reanchor <run>' in verified.get('remedy', '') and 'repeat the review' in verified.get('remedy', '')
+            and code == 0 and (resumed.get('checkpoint') or {}).get('state') == 'VALID'
+            and resumed.get('resumable_with_package') is True and value.get('latest_resumable') == run.name,
+            {'damaged': guidance, 'invalid': invalid.get('resume_guidance'), 'verified': verified,
+             'reanchor': output[-400:], 'resumed': resumed.get('resume_guidance')})
+
+    # Every refusal of checkpoint reanchor changes nothing and names its reason.
+    def handmade(run: Path, data: dict[str, Any], version: str) -> None:
+        """A checkpoint that checkpoint create never made, with the manifest of the given tool version."""
+        files, omitted, directories = checkpoint_files(run, data)
+        destination = run / 'checkpoints' / 'interim'
+        for rel in files:
+            (destination / 'files' / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(run / rel, destination / 'files' / rel)
+        for rel in directories:
+            (destination / 'files' / rel).mkdir(parents=True, exist_ok=True)
+        write_json_new(destination / 'manifest.json', {
+            'format': 'audit-interim-checkpoint/1', 'package': 'production-readiness-audit',
+            'schema_version': SCHEMA_VERSION, 'prompt_version': PROMPT_VERSION, 'tool_version': version,
+            'run_id': data['run_id'], 'baseline': data['baseline'],
+            'validation': {'result': 'PASS', 'final': True, 'errors': 0},
+            'sha256': {rel: sha256_file(run / rel) for rel in files}, 'not_snapshotted': omitted})
+
+    def fixture(name: str) -> Path:
+        run, project, data = write_example_run(root / ('refuse-' + name), 'interim')
+        if name == 'snapshot-invalid':
+            data['checks'] = []
+            write_text_file(run / 'audit.json', json.dumps(data))
+            handmade(run, data, TOOL_VERSION)
+        elif name == 'other-tool-version':
+            handmade(run, data, '3.0.0')
+        elif name != 'absent':
+            create_checkpoint(run, project)
+        if name == 'no-tool-version':
+            legacy_run(run)
+        if name == 'hash-mismatch':
+            drop_anchor(run)
+        if name == 'hash-mismatch':
+            write_text_file(run / 'checkpoints' / 'interim' / 'files' / 'RESUME.md', 'Changed.\n')
+        elif name == 'unreadable':
+            write_text_file(run / 'RUN-STATE.json', '{"run_id": "trunc')
+        elif name == 'anchor-differs':
+            write_text_file(manifest_of(run), json.dumps(read_json(manifest_of(run)), indent=4))
+        return run
+
+    refusals = {}
+    for name, expected in (('absent', 'no interim checkpoint'), ('no-tool-version', 'has no tool_version'),
+                           ('unreadable', 'missing or unreadable'), ('anchor-differs', 'never replaced'),
+                           ('anchor-intact', 'nothing to re-anchor'), ('hash-mismatch', 'hash mismatch'),
+                           ('snapshot-invalid', 'fails the final validation'),
+                           ('other-tool-version', 'created by tool version 3.0.0')):
+        run = fixture(name)
+        marks = file_marks(run)
+        code, _, output = cli_json('checkpoint', 'reanchor', str(run))
+        refusals[name] = (code == 2 and expected in output and 'Traceback' not in output and file_marks(run) == marks
+                          and (name != 'anchor-differs' or 'differs from the interim_checkpoint anchor' in output)
+                          and (name != 'other-tool-version' or 'checkpoint create replaces' in output), output[-300:])
+    control(results, 'REANCHOR_REFUSALS_CHANGE_NOTHING', all(ok for ok, _ in refusals.values()), refusals)
+
+    # A run state rebuilt without tool_version (audit.json prompt 5.1) is held to the anchor as with the field: verify
+    # demands it, reanchor writes it and does not refuse with "needs no anchor".
+    # The checkpoint manifest of this tool version makes the run current also where audit.json names no prompt version.
+    observed = {}
+    for name in ('prompt', 'manifest'):
+        run, project, data = interim_run('rebuilt-no-tool-version-' + name)
+        state = read_json(run / 'RUN-STATE.json')
+        state.pop('tool_version')
+        state.pop('interim_checkpoint')
+        write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+        if name == 'manifest':
+            write_text_file(run / 'audit.json', json.dumps({**data, 'prompt_version': None}))
+        code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+        code_reanchor, reanchored, output_reanchor = cli_json('checkpoint', 'reanchor', str(run))
+        observed[name] = (code_verify == 1 and verified.get('state') == 'INVALID'
+                          and 'no valid interim_checkpoint anchor' in str(verified.get('error')) and code_reanchor == 0
+                          and reanchored.get('state') == 'REANCHORED' and 'needs no anchor' not in output_reanchor,
+                          [verified.get('error'), output_reanchor[-200:]])
+    control(results, 'REANCHOR_CURRENT_RUN_WITHOUT_TOOL_VERSION', all(ok for ok, _ in observed.values()), observed)
+
+    # --dry-run belongs to restore and reanchor: create and verify refuse it and write nothing.
+    run, project, data = write_example_run(root / 'dry-run-create', 'interim')
+    marks = file_marks(run)
+    code_create, _, output_create = cli_json('checkpoint', 'create', str(run), '--project', str(project), '--dry-run')
+    created = (run / 'checkpoints').exists() or file_marks(run) != marks
+    run, project, data = interim_run('dry-run-verify')
+    code_verify, _, output_verify = cli_json('checkpoint', 'verify', str(run), '--dry-run')
+    control(results, 'CHECKPOINT_DRY_RUN_ONLY_RESTORE_REANCHOR', code_create == 2 and not created
+            and code_verify == 2 and all('--dry-run applies to checkpoint restore and checkpoint reanchor only' in text
+                                         for text in (output_create, output_verify)),
+            [output_create[-200:], output_verify[-200:]])
+
+    # restore stops at a file it cannot move or write, reports what moved and what is missing, and a second run
+    # completes it without moving a recovery directory into another.
+    run, project, data = interim_run('restore-stops', phase='P8')
+    write_text_file(run / 'audit.json', '{interrupted')
+    write_text_file(run / 'evidence' / 'logs' / 'CHK-002.log', 'Live log written after the checkpoint.\n')
+    snapshot = run / 'checkpoints' / 'interim' / 'files'
+    manifest = read_json(manifest_of(run))
+    order = sorted(manifest['sha256'], key=lambda rel: (rel == 'RUN-STATE.json', rel))
+    real_replace, real_write = os.replace, replace_file_atomic
+
+    def held_open(source: Any, target: Any) -> None:
+        if Path(source).name == 'CHK-002.log' and 'recovery-' not in str(source):
+            raise PermissionError(13, 'Synthetic: the file is held open', str(source))
+        real_replace(source, target)
+
+    def unwritable(path: Path, content: bytes) -> None:
+        if path.name == 'CHK-002.meta.json':
+            raise PermissionError(13, 'Synthetic: the file cannot be written', str(path))
+        real_write(path, content)
+
+    with patch('os.replace', side_effect=held_open):
+        code_held, held, output_held = in_process('checkpoint', 'restore', str(run))
+    with patch(f'{__name__}.replace_file_atomic', side_effect=unwritable):
+        code_write, written, output_write = in_process('checkpoint', 'restore', str(run))
+    code_done, done, _ = in_process('checkpoint', 'restore', str(run))
+    first, second = Path(str(held.get('recovery_dir', root / 'missing'))), Path(str(written.get('recovery_dir', root / 'missing')))
+    stop = order.index('evidence/logs/CHK-002.log')
+    state = read_json(run / 'RUN-STATE.json') if (run / 'RUN-STATE.json').is_file() else {}
+    restored = all((run / rel).is_file() and (run / rel).read_bytes() == (snapshot / rel).read_bytes()
+                   for rel in order if rel != 'RUN-STATE.json')
+    recoveries = sorted(path.name for path in run.iterdir() if path.name.startswith('recovery-'))
+    nested = [str(path) for path in run.glob('recovery-*/**/recovery-*')]
+    control(results, 'RESTORE_STOPS_REPORTS_AND_COMPLETES', code_held == 1 and held.get('state') == 'INCOMPLETE'
+            and held.get('failed_at') == 'evidence/logs/CHK-002.log' and held.get('moved_to_recovery') == order[:stop]
+            and held.get('copied') == order[:stop] and held.get('missing_live') == []
+            and held.get('not_yet_restored') == order[stop:] and 'Checkpoint input unreadable' not in output_held
+            and 'run checkpoint restore again' in str(held.get('next'))
+            and f'stopped at evidence/logs/CHK-002.log ({held.get("error")}).' in str(held.get('next'))
+            and f'stopped at evidence/logs/CHK-002.meta.json ({written.get("error")}).' in str(written.get('next'))
+            and '(error)' not in str(held.get('next')) + str(written.get('next'))
+            and (first / 'audit.json').read_text(encoding='utf-8') == '{interrupted'
+            and code_write == 1 and written.get('state') == 'INCOMPLETE'
+            and written.get('missing_live') == ['evidence/logs/CHK-002.meta.json'] and second != first
+            and (second / 'evidence' / 'logs' / 'CHK-002.log').read_text(encoding='utf-8')
+            == 'Live log written after the checkpoint.\n'
+            and code_done == 0 and done.get('state') == 'RESTORED' and restored
+            and (state.get('interim_checkpoint') or {}).get('manifest_sha256') == sha256_file(manifest_of(run))
+            and (done.get('checkpoint') or {}).get('state') == 'VALID' and len(recoveries) == 3 and not nested,
+            {'held': held, 'written': written, 'done': done.get('state'), 'recoveries': recoveries, 'nested': nested,
+             'output': output_held[-300:]})
+
+    # RUN-STATE.json is restored last.
+    run, project, data = interim_run('restore-order', phase='P8')
+    write_text_file(run / 'audit.json', '{interrupted')
+    written_paths: list[str] = []
+
+    def recording(path: Path, content: bytes) -> None:
+        written_paths.append(path.name)
+        real_write(path, content)
+    with patch(f'{__name__}.replace_file_atomic', side_effect=recording):
+        restore_checkpoint(run, False)
+    control(results, 'RESTORE_WRITES_RUN_STATE_LAST', len(written_paths) == len(read_json(manifest_of(run))['sha256'])
+            and written_paths[-1] == 'RUN-STATE.json' and written_paths.count('RUN-STATE.json') == 1, written_paths)
+
+    # A live directory replaced by a link to a place outside the run: restore and its dry run refuse and change nothing.
+    run, project, data = interim_run('restore-link', phase='P8')
+    write_text_file(run / 'audit.json', '{interrupted')
+    logs, outside = run / 'evidence' / 'logs', root / 'restore-link-outside'
+    shutil.copytree(logs, outside)
+    write_text_file(outside / 'CHK-002.log', 'Edited outside the run.\n')
+    remove_tree(logs)
+    try:
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(logs))
+        else:
+            os.symlink(str(outside), str(logs), target_is_directory=True)
+        link_error = None
+    except (OSError, ImportError, AttributeError) as exc:
+        link_error = str(exc)
+    if link_error is not None:
+        results.append({'id': 'RESTORE_REFUSES_LINK_OUT_OF_RUN', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': f'Neither a junction nor a symbolic link can be created here: {link_error}'})
+    else:
+        outside_marks = file_marks(outside)
+        code_dry, _, output_dry = cli_json('checkpoint', 'restore', str(run), '--dry-run')
+        code, _, output = cli_json('checkpoint', 'restore', str(run))
+        control(results, 'RESTORE_REFUSES_LINK_OUT_OF_RUN', code_dry == 2 and code == 2 and all(
+            'pass through a link' in text and 'evidence/logs' in text for text in (output_dry, output))
+            and file_marks(outside) == outside_marks and not list(run.glob('recovery-*'))
+            and (run / 'audit.json').read_text(encoding='utf-8') == '{interrupted', [output_dry[-300:], output[-300:]])
+
+    # restore writes the anchor when the live anchor is missing or RUN-STATE.json is unreadable, with
+    # reanchored_at_utc; a matching live anchor is taken over as it is.
+    run, project, data = interim_run('restore-unreadable-state', phase='P8')
+    write_text_file(run / 'RUN-STATE.json', '{"run_id": "trunc')
+    code_unreadable, _, _ = cli_json('checkpoint', 'restore', str(run))
+    unreadable_anchor = read_json(run / 'RUN-STATE.json').get('interim_checkpoint') or {}
+    _, _, unreadable_warnings = validation(run)
+    digest_unreadable = sha256_file(manifest_of(run))
+    run, project, data = write_example_run(root / 'restore-earlier-tool', 'interim')
+    create_checkpoint(run, project)
+    legacy_run(run)
+    write_text_file(run / 'audit.json', '{interrupted')
+    code_earlier, _, _ = cli_json('checkpoint', 'restore', str(run))
+    earlier_anchor = read_json(run / 'RUN-STATE.json').get('interim_checkpoint') or {}
+    digest_earlier = sha256_file(manifest_of(run))
+    run, project, data = interim_run('restore-kept-anchor', phase='P8')
+    kept = read_json(run / 'RUN-STATE.json').get('interim_checkpoint')
+    write_text_file(run / 'audit.json', '{interrupted')
+    code_kept, _, _ = cli_json('checkpoint', 'restore', str(run))
+    control(results, 'RESTORE_ANCHORS_WITHOUT_LIVE_ANCHOR', code_unreadable == 0 and code_earlier == 0 and code_kept == 0
+            and unreadable_anchor.get('manifest_sha256') == digest_unreadable
+            and nonempty(unreadable_anchor.get('reanchored_at_utc')) and 'W_CHECKPOINT_REANCHORED' in unreadable_warnings
+            and earlier_anchor.get('manifest_sha256') == digest_earlier
+            and nonempty(earlier_anchor.get('reanchored_at_utc'))
+            and read_json(run / 'RUN-STATE.json').get('interim_checkpoint') == kept,
+            {'unreadable': unreadable_anchor, 'earlier': earlier_anchor, 'kept': kept})
+
+    # Final validation of a run whose RUN-STATE.json is unreadable or no object reports the state error.
+    run, project = finished_run('final-unreadable-state')
+    observed = {}
+    for name, text in (('truncated', '{"run_id": "trunc'), ('not_an_object', '[]')):
+        write_text_file(run / 'RUN-STATE.json', text)
+        observed[name] = sorted(validation(run, '--final')[1])
+    control(results, 'FINAL_VALIDATION_UNREADABLE_RUN_STATE_REPORTED', all('E_RUN_STATE' in codes
+                                                                           for codes in observed.values()), observed)
+
+    # One closure test for close, runs and validation: closed_at_utc or closure alone is an unrecorded closure with
+    # one remedy; a whitespace closed_at_utc is empty everywhere.
+    run, project = finished_run('closure-source')
+    code, output = run_cli('close', str(run), '--project', str(project))
+    closed_state = read_json(run / 'RUN-STATE.json') if code == 0 else {}
+    observed = {}
+    for name, changes, drop in (('receipt_only', {'closed_at_utc': None}, None),
+                                ('blank_timestamp_receipt', {'closed_at_utc': '  '}, None),
+                                ('timestamp_only', {}, 'closure'), ('blank_timestamp_only', {'closed_at_utc': '  '},
+                                                                    'closure')):
+        copy = root / ('closure-' + name.replace('_', '-')) / 'run'
+        shutil.copytree(run, copy)
+        state = {**closed_state, **changes}
+        state.pop(drop or '', None)
+        write_text_file(copy / 'RUN-STATE.json', json.dumps(state))
+        value, info = listing(copy)
+        codes = validation(copy, '--final')[1]
+        marks = file_marks(copy)
+        code_close, _, output_close = cli_json('close', str(copy), '--project', str(project))
+        observed[name] = {'status': info.get('status'), 'recorded': info.get('closure_recorded', 'absent'),
+                          'unrecorded_error': 'E_CLOSURE_UNRECORDED' in codes,
+                          'noted': any(CLOSURE_UNRECORDED_REMEDY in note for note in value.get('notes', [])),
+                          'close': 'closed' if code_close == 0 else (
+                              'remedy' if code_close == 2 and CLOSURE_UNRECORDED_REMEDY in output_close
+                              and file_marks(copy) == marks else output_close[-200:])}
+    unrecorded = {'status': 'CLOSED', 'recorded': False, 'unrecorded_error': True, 'noted': True, 'close': 'remedy'}
+    control(results, 'CLOSURE_ONE_FIELD_UNRECORDED_EVERYWHERE', observed == {
+        'receipt_only': unrecorded, 'blank_timestamp_receipt': unrecorded, 'timestamp_only': unrecorded,
+        'blank_timestamp_only': {'status': 'OPEN', 'recorded': 'absent', 'unrecorded_error': False, 'noted': False,
+                                 'close': 'closed'}}, observed)
+
+    # A failed rollback names the fields to remove; following it, final validation passes and close closes.
+    run, project = finished_run('close-rollback')
+    target = Path(str(run)).resolve()
+    real_validate = validate_audit
+    calls = {'validate': 0, 'write': 0}
+
+    def fails_after_recording(data: Any, run_dir: Path, project_dir: Path | None, final: bool = False) -> Any:
+        issues, counts = real_validate(data, run_dir, project_dir, final=final)
+        if Path(run_dir) == target:
+            calls['validate'] += 1
+            if calls['validate'] == 2:
+                issues.error('E_SYNTHETIC', 'audit.json', 'Synthetic failure after the closure was recorded.')
+        return issues, counts
+
+    def rollback_fails(path: Path, content: bytes) -> None:
+        if path.name == 'RUN-STATE.json':
+            calls['write'] += 1
+            if calls['write'] == 2:
+                raise PermissionError(13, 'Synthetic: RUN-STATE.json is locked', str(path))
+        real_write(path, content)
+    with patch(f'{__name__}.validate_audit', side_effect=fails_after_recording), \
+            patch(f'{__name__}.replace_file_atomic', side_effect=rollback_fails):
+        code_rollback, _, output_rollback = in_process('close', str(run), '--project', str(project))
+    state = read_json(run / 'RUN-STATE.json')
+    for key in ('closed_at_utc', 'closure'):
+        state.pop(key, None)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    code_final, errors, _ = validation(run, '--final')
+    code_close, _, output_close = cli_json('close', str(run), '--project', str(project))
+    control(results, 'CLOSE_ROLLBACK_FAILURE_NAMES_FIELDS', code_rollback == 2
+            and 'remove closed_at_utc and closure from RUN-STATE.json by hand' in output_rollback
+            and 'updated_at_utc' not in output_rollback.split('Error:')[-1] and code_final == 0 and code_close == 0,
+            {'rollback': output_rollback[-400:], 'errors': sorted(errors), 'close': output_close[-300:]})
+
+    # The receipt hashes the audit.json bytes close validated: a file changed after reading makes the receipt stale, so
+    # close rolls back instead of recording a hash of bytes it never validated.
+    run, project = finished_run('close-hash')
+    target = Path(str(run)).resolve()
+    validated = (run / 'audit.json').read_bytes()
+
+    def changes_after_reading(data: Any, run_dir: Path, project_dir: Path | None, final: bool = False) -> Any:
+        if Path(run_dir) == target and (run / 'audit.json').read_bytes() == validated:
+            (run / 'audit.json').write_bytes(validated + b'\n')
+        return real_validate(data, run_dir, project_dir, final=final)
+    with patch(f'{__name__}.validate_audit', side_effect=changes_after_reading):
+        code, _, output = in_process('close', str(run), '--project', str(project))
+    state = read_json(run / 'RUN-STATE.json')
+    control(results, 'CLOSE_RECEIPT_HASHES_VALIDATED_BYTES', code == 1 and 'E_CLOSURE_STALE' in output
+            and 'closure' not in state and not nonempty(state.get('closed_at_utc')),
+            {'state': state.get('closure'), 'output': output[-300:]})
+
+    # Without a checkpoint, verify, restore and reanchor say so and what it means for the phase; no repair advice.
+    observed = {}
+    for name, started in (('absent-before', False), ('absent-started', True)):
+        run, project, data = write_example_run(root / name, 'interim')
+        if started:
+            started_security(data, run, project)
+            data['security_review']['status'] = 'IN_PROGRESS'
+            write_text_file(run / 'audit.json', json.dumps(data))
+        code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+        code_restore, _, output_restore = cli_json('checkpoint', 'restore', str(run))
+        code_reanchor, _, output_reanchor = cli_json('checkpoint', 'reanchor', str(run))
+        phase = 'has started' if started else 'has not started'
+        observed[name] = (code_verify == 1 and verified.get('state') == 'ABSENT' and code_restore == 2
+                          and code_reanchor == 2 and all(
+                              'no interim checkpoint' in text and phase in text and 'repair a checkpoint' not in text
+                              and 'does not verify' not in text
+                              for text in (str(verified.get('note')), output_restore, output_reanchor)),
+                          [verified.get('note'), output_restore[-300:], output_reanchor[-300:]])
+    control(results, 'CHECKPOINT_ABSENT_NAMES_PHASE', all(ok for ok, _ in observed.values()), observed)
+
+    # The way out of an invalid checkpoint appears once per message.
+    counts = {}
+    run, project, data = interim_run('way-out-differs', phase='P8')
+    write_text_file(manifest_of(run), json.dumps(read_json(manifest_of(run)), indent=4))
+    counts['restore_anchor_differs'] = cli_json('checkpoint', 'restore', str(run))[2]
+    started_security(data, run, project)
+    write_text_file(run / 'audit.json', json.dumps(data))
+    counts['create_after_start'] = cli_json('checkpoint', 'create', str(run), '--project', str(project))[2]
+    run, project, data = interim_run('way-out-hash', phase='P8')
+    write_text_file(run / 'checkpoints' / 'interim' / 'files' / 'RESUME.md', 'Changed.\n')
+    counts['restore_hash_mismatch'] = cli_json('checkpoint', 'restore', str(run))[2]
+    run, project, data = interim_run('way-out-rebuilt', phase='P8', started=True)
+    drop_anchor(run)
+    counts['create_rebuilt_state'] = cli_json('checkpoint', 'create', str(run), '--project', str(project))[2]
+    control(results, 'CHECKPOINT_WAY_OUT_ONCE_PER_MESSAGE', all(
+        output.count('never repair the checkpoint or its anchor by hand') == 1
+        and output.count('checkpoint create replaces') <= 1 and output.count('security_review back to PENDING') <= 1
+        for output in counts.values()) and 'checkpoint reanchor <run>' in counts['create_rebuilt_state'],
+        {name: output[-700:] for name, output in counts.items()})
+
+    # runs: an INVALID checkpoint gets the way out of its phase; a new linked run is the last resort.
+    observed = {}
+    for name, phase, started, damage, way_out in (
+            ('invalid-before', None, False, 'manifest', 'checkpoint create replaces the checkpoint'),
+            ('invalid-started', 'P8', True, 'manifest', 'set security_review back to PENDING'),
+            ('invalid-rebuilt', 'P8', True, 'anchor', 'run checkpoint reanchor <run>')):
+        run, project, data = interim_run('runs-' + name, phase=phase, started=started)
+        if damage == 'manifest':
+            write_text_file(manifest_of(run), json.dumps(read_json(manifest_of(run)), indent=4))
+        else:
+            drop_anchor(run)
+        guidance = str(listing(run)[1].get('resume_guidance'))
+        observed[name] = (0 <= guidance.find(way_out) < guidance.find('new linked re-audit run')
+                          and 'verify the interim checkpoint before P8' not in guidance, guidance)
+    control(results, 'RUNS_INVALID_CHECKPOINT_WAY_OUT_BY_PHASE', all(ok for ok, _ in observed.values()), observed)
+
+    # restore reads the whole snapshot before the first move: a read failure on the file read last (the state file) or
+    # on the last file before it, and a snapshot file that changes between the verification and the read, end it with
+    # nothing moved.
+    run, project, data = interim_run('restore-reads-first', phase='P8')
+    write_text_file(run / 'audit.json', '{interrupted')
+    write_text_file(run / 'evidence' / 'later.txt', 'Written after the checkpoint.\n')
+    snapshot = run / 'checkpoints' / 'interim' / 'files'
+    order = sorted(read_json(manifest_of(run))['sha256'], key=lambda rel: (rel == 'RUN-STATE.json', rel))
+    real_verify, real_read = verify_checkpoint, Path.read_bytes
+    unreadable = {'armed': False, 'rel': ''}
+
+    def verified_then_armed(*arguments: Any, **options: Any) -> dict[str, Any]:
+        outcome = real_verify(*arguments, **options)
+        unreadable['armed'] = True
+        return outcome
+
+    def snapshot_unreadable(self: Path) -> bytes:
+        if unreadable['armed'] and self == snapshot / unreadable['rel']:
+            raise PermissionError(13, 'Synthetic: the snapshot file cannot be read', str(self))
+        return real_read(self)
+    observed = {}
+    for rel in (order[-2], order[-1]):
+        marks = file_marks(run)
+        unreadable.update(armed=False, rel=rel)
+        with patch(f'{__name__}.verify_checkpoint', side_effect=verified_then_armed), \
+                patch.object(Path, 'read_bytes', snapshot_unreadable):
+            code, _, output = in_process('checkpoint', 'restore', str(run))
+        observed[rel] = (code == 2 and 'Synthetic: the snapshot file cannot be read' in output and 'Traceback' not in output
+                         and not list(run.glob('recovery-*')) and file_marks(run) == marks, output[-300:])
+    control(results, 'RESTORE_READS_SNAPSHOT_BEFORE_FIRST_MOVE', len(order) > 2 and order[-1] == 'RUN-STATE.json'
+            and all(ok for ok, _ in observed.values()), observed)
+    run, project, data = interim_run('restore-snapshot-changes', phase='P8')
+    write_text_file(run / 'audit.json', '{interrupted')
+    changed_file = run / 'checkpoints' / 'interim' / 'files' / 'RESUME.md'
+
+    def verified_then_changed(*arguments: Any, **options: Any) -> dict[str, Any]:
+        outcome = real_verify(*arguments, **options)
+        with open(changed_file, 'ab') as handle:
+            handle.write(b'Changed after the verification.\n')
+        return outcome
+    live_marks = lambda folder: {rel: mark for rel, mark in file_marks(folder).items() if not rel.startswith('checkpoints/')}
+    marks = live_marks(run)
+    with patch(f'{__name__}.verify_checkpoint', side_effect=verified_then_changed):
+        code, _, output = in_process('checkpoint', 'restore', str(run))
+    control(results, 'RESTORE_REFUSES_SNAPSHOT_CHANGED_AFTER_VERIFICATION', code == 2
+            and 'Checkpoint files changed after verification: RESUME.md; nothing restored. Run checkpoint verify.' in output
+            and not list(run.glob('recovery-*')) and live_marks(run) == marks, output[-300:])
+
+    # A null or malformed anchor counts as missing: verify names checkpoint reanchor, reanchor writes the anchor again.
+    observed = {}
+    for name, value in (('null', None), ('string', 'x'), ('number', 5), ('list', []), ('empty_object', {}),
+                        ('hash_number', {'manifest_sha256': 5})):
+        run, project, data = interim_run('malformed-anchor-' + name)
+        update_state(run, interim_checkpoint=value)
+        code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+        marks = file_marks(run)
+        code_dry, dry, _ = cli_json('checkpoint', 'reanchor', str(run), '--dry-run')
+        ok = (code_verify == 1 and verified.get('state') == 'INVALID'
+              and 'RUN-STATE.json has no valid interim_checkpoint anchor' in str(verified.get('error'))
+              and 'checkpoint reanchor <run>' in str(verified.get('remedy'))
+              and code_dry == 0 and dry.get('state') == 'DRY_RUN' and file_marks(run) == marks)
+        if name in ('string', 'empty_object'):
+            code, done, _ = cli_json('checkpoint', 'reanchor', str(run))
+            ok = (ok and code == 0 and done.get('state') == 'REANCHORED'
+                  and cli_json('checkpoint', 'verify', str(run))[1].get('state') == 'VALID')
+        observed[name] = (ok, verified.get('error'))
+    control(results, 'REANCHOR_TREATS_MALFORMED_ANCHOR_AS_MISSING', all(ok for ok, _ in observed.values()), observed)
+
+    # The snapshot of an interim checkpoint is an interim state: a checkpoint assembled by hand from the finished state,
+    # or from any state that create refuses, does not verify, is not re-anchored and does not let close pass.
+    def assembled(name: str, change: Callable[[dict[str, Any]], Any] | None, anchored: bool,
+                  version: str = TOOL_VERSION, legacy: bool = False) -> tuple[Path, Path]:
+        """With version a manifest of another tool, whose snapshot is not validated again; legacy: a run
+        of the previous prompt and tool (legacy_run)."""
+        run, project, data = write_example_run(root / ('assembled-' + name), 'interim')
+        if change is None:
+            data = finish_interim(run, data)
+            update_state(run, phase='P9')
+        else:
+            change(data)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        handmade(run, data, version)
+        if anchored:
+            update_state(run, interim_checkpoint={'manifest_sha256': sha256_file(manifest_of(run)),
+                                                  'created_at_utc': utc_now(), 'tool_version': version})
+        if legacy:
+            legacy_run(run)
+        return run, project
+
+    prefix = 'Checkpoint snapshot is no interim state: its audit.json has '
+    suffix = '; an interim checkpoint holds PARTIAL with the security review PENDING and not started.'
+    observed = {}
+    for name, anchored in (('finished-no-anchor', False), ('finished-hand-anchor', True)):
+        run, project = assembled(name, None, anchored)
+        code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+        marks = file_marks(run)
+        code_reanchor, _, output_reanchor = cli_json('checkpoint', 'reanchor', str(run))
+        code_final, errors, _ = validation(run, '--final')
+        code_close, _, output_close = cli_json('close', str(run), '--project', str(project))
+        observed[name] = (code_verify == 1 and verified.get('state') == 'INVALID'
+                          and verified.get('error') == prefix + 'audit_status PARTIAL and security review DONE, started' + suffix
+                          and verified.get('remedy') == checkpoint_remedy(run, False)
+                          and code_reanchor == 2 and 'no interim state' in output_reanchor and file_marks(run) == marks
+                          and code_final == 1 and 'E_CHECKPOINT_INVALID' in errors
+                          and code_close != 0 and file_marks(run) == marks, [verified.get('error'), output_close[-200:]])
+    # The test holds for every manifest tool version: the snapshot of another tool's manifest is not validated again.
+    for name, anchored, legacy in (('finished-other-version-hand-anchor', True, False),
+                                   ('finished-other-version-legacy-state', False, True)):
+        run, project = assembled(name, None, anchored, '0.0.1', legacy)
+        code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+        marks = file_marks(run)
+        code_final, errors, _ = validation(run, '--final')
+        code_close, _, output_close = cli_json('close', str(run), '--project', str(project))
+        observed[name] = (code_verify == 1 and verified.get('state') == 'INVALID'
+                          and verified.get('error') == prefix + 'audit_status PARTIAL and security review DONE, started' + suffix
+                          and code_final == 1 and 'E_CHECKPOINT_INVALID' in errors
+                          and code_close != 0 and file_marks(run) == marks, [verified.get('error'), output_close[-200:]])
+    control(results, 'CHECKPOINT_OF_FINISHED_STATE_INVALID', all(ok for ok, _ in observed.values()), observed)
+
+    def with_review(**changes: Any) -> Callable[[dict[str, Any]], None]:
+        return lambda data: data['security_review'].update(changes)
+    observed = {}
+    for name, change, expected in (
+            ('audit-status', lambda data: data.update(audit_status='BLOCKED'),
+             'audit_status BLOCKED and security review PENDING' + suffix),
+            ('review-status', with_review(status='NOT_PERFORMED'),
+             'audit_status PARTIAL and security review NOT_PERFORMED' + suffix),
+            ('started', with_review(started_at_utc='2026-01-01T00:00:00Z'),
+             'audit_status PARTIAL and security review PENDING, started' + suffix),
+            ('completed', with_review(completed_at_utc='2026-01-01T00:00:00Z'),
+             'audit_status PARTIAL and security review PENDING, started' + suffix),
+            ('executed-by', with_review(executed_by='Synthetic reviewer'),
+             'audit_status PARTIAL and security review PENDING, started' + suffix)):
+        run, project = assembled('single-' + name, change, True)
+        verified = cli_json('checkpoint', 'verify', str(run))[1]
+        observed[name] = (verified.get('state') == 'INVALID' and verified.get('error') == prefix + expected,
+                          verified.get('error'))
+    control(results, 'CHECKPOINT_SNAPSHOT_STATE_CONDITIONS_SEPARATE', all(ok for ok, _ in observed.values()), observed)
+    observed = {}
+    for name, change, expected in (
+            ('audit-status', lambda data: data.update(audit_status='BLOCKED'),
+             'Interim checkpoint requires PARTIAL with security review PENDING.'),
+            ('review-status', with_review(status='NOT_PERFORMED'),
+             'Interim checkpoint requires PARTIAL with security review PENDING.'),
+            ('started', with_review(started_at_utc='2026-01-01T00:00:00Z'), 'requires the security review not started'),
+            ('completed', with_review(completed_at_utc='2026-01-01T00:00:00Z'), 'requires the security review not started'),
+            ('executed-by', with_review(executed_by='Synthetic reviewer'), 'requires the security review not started')):
+        run, project, data = write_example_run(root / ('create-' + name), 'interim')
+        change(data)
+        write_text_file(run / 'audit.json', json.dumps(data))
+        marks = file_marks(run)
+        code, _, output = cli_json('checkpoint', 'create', str(run), '--project', str(project))
+        observed[name] = (code == 2 and expected in output and not (run / 'checkpoints').exists()
+                          and file_marks(run) == marks, output[-300:])
+    control(results, 'CHECKPOINT_CREATE_REQUIRES_INTERIM_REVIEW_STATE', all(ok for ok, _ in observed.values()), observed)
+
+    # A closed run is not told to change its review: the remedy of an altered or unanchored checkpoint of a recorded
+    # closed run is the closed-run remedy; reanchor stays possible and leaves the closure as recorded.
+    def closed_recorded(name: str) -> tuple[Path, Path]:
+        run, project = finished_run(name)
+        code, output = run_cli('close', str(run), '--project', str(project))
+        if code != 0:
+            raise ToolError('Synthetic closure failed: ' + output[-500:])
+        return run, project
+
+    wrong_advice = ('set security_review back', 'checkpoint create replaces')
+    run, project = closed_recorded('closed-altered')
+    write_text_file(run / 'checkpoints' / 'interim' / 'files' / 'RESUME.md', 'Changed.\n')
+    code_verify, verified, _ = cli_json('checkpoint', 'verify', str(run))
+    _, errors_altered, _ = validation(run, '--final')
+    final_message = ' '.join(item['message'] for item in cli_json('validate', str(run), '--json', '--final')[1].get(
+        'errors', []) if item['code'] == 'E_CHECKPOINT_INVALID')
+    run_anchor, project_anchor = closed_recorded('closed-unanchored')
+    drop_anchor(run_anchor)
+    code_missing, missing, _ = cli_json('checkpoint', 'verify', str(run_anchor))
+    code_reanchor, reanchored, _ = cli_json('checkpoint', 'reanchor', str(run_anchor))
+    code_final, errors_final, warnings_final = validation(run_anchor, '--final')
+    _, info = listing(run_anchor)
+    control(results, 'CLOSED_RUN_INVALID_CHECKPOINT_NAMES_NO_REVIEW_CHANGE', code_verify == 1
+            and verified.get('remedy') == CLOSED_WAY_OUT and CLOSED_WAY_OUT in final_message
+            and 'E_CHECKPOINT_INVALID' in errors_altered
+            and not any(text in str(verified.get('remedy')) + final_message for text in wrong_advice)
+            and code_missing == 1 and 'checkpoint reanchor <run>' in str(missing.get('remedy'))
+            and CLOSED_WAY_OUT in str(missing.get('remedy'))
+            and not any(text in str(missing.get('remedy')) for text in wrong_advice)
+            and code_reanchor == 0 and reanchored.get('state') == 'REANCHORED'
+            and code_final == 0 and not errors_final and 'W_CHECKPOINT_REANCHORED' in warnings_final
+            and info.get('status') == 'CLOSED' and info.get('closure_recorded') is True,
+            {'altered': verified.get('remedy'), 'final': final_message[-300:], 'missing': missing.get('remedy'),
+             'reanchor': reanchored.get('state'), 'final_codes': sorted(errors_final), 'runs': info.get('status')})
+
+    # The closed-run texts agree with runs and close: a closure that close did not record gets its repair, not the
+    # closed-run remedy; a recorded closed run without its checkpoint is told neither to set the review back nor to
+    # keep the run open.
+    run, project = closed_recorded('closed-typed')
+    state = read_json(run / 'RUN-STATE.json')
+    state.pop('closure', None)
+    write_text_file(run / 'RUN-STATE.json', json.dumps(state))
+    write_text_file(run / 'checkpoints' / 'interim' / 'files' / 'RESUME.md', 'Changed.\n')
+    _, typed, _ = cli_json('checkpoint', 'verify', str(run))
+    _, typed_info = listing(run)
+    run_absent, _ = closed_recorded('closed-absent')
+    (run_absent / 'checkpoints' / 'interim').rename(run_absent / 'checkpoints' / 'interim-set-aside')
+    _, absent, _ = cli_json('checkpoint', 'verify', str(run_absent))
+    absent_final = ' '.join(item['message'] for item in cli_json('validate', str(run_absent), '--json', '--final')[1].get(
+        'errors', []) if item['code'] == 'E_CHECKPOINT_REQUIRED')
+    absent_texts = str(absent.get('note')) + ' ' + absent_final
+    control(results, 'CLOSED_RUN_TEXTS_AGREE_WITH_RUNS_AND_CLOSE', typed_info.get('closure_recorded') is not True
+            and CLOSURE_UNRECORDED_REMEDY in str(typed.get('remedy')) and CLOSED_WAY_OUT not in str(typed.get('remedy'))
+            and CLOSED_WAY_OUT in str(absent.get('note')) and CLOSED_WAY_OUT in absent_final
+            and not any(text in absent_texts for text in (*wrong_advice, 'keep the run open')),
+            {'typed': typed.get('remedy'), 'runs': typed_info.get('closure_recorded'), 'absent_note': absent.get('note'),
+             'absent_final': absent_final[-400:]})
+
+    # A whitespace closed_at_utc without a receipt is no closure: validate, runs and close treat the run as open.
+    run, project, data = interim_run('blank-closed-at')
+    update_state(run, closed_at_utc='  ')
+    marks = file_marks(run)
+    _, errors_interim, _ = validation(run)
+    _, errors_final, _ = validation(run, '--final')
+    _, info = listing(run)
+    code_close, _, output_close = cli_json('close', str(run), '--project', str(project))
+    control(results, 'WHITESPACE_CLOSED_AT_IS_OPEN_EVERYWHERE', 'E_RUN_SECURITY_CLOSURE' not in errors_interim | errors_final
+            and info.get('status') == 'OPEN' and code_close == 2 and 'keeps the run open' in output_close
+            and 'already closed' not in output_close and file_marks(run) == marks,
+            {'interim': sorted(errors_interim), 'final': sorted(errors_final), 'status': info.get('status'),
+             'close': output_close[-200:]})
+
+    # A listed live directory replaced by a link that stays inside the run, also one into the snapshot, is not followed.
+    def make_link(target: Path, link: Path) -> str | None:
+        try:
+            if os.name == 'nt':
+                import _winapi
+                _winapi.CreateJunction(str(target), str(link))
+            else:
+                os.symlink(str(target), str(link), target_is_directory=True)
+            return None
+        except (OSError, ImportError, AttributeError) as exc:
+            return str(exc)
+    observed = {}
+    link_error = None
+    for kind in ('elsewhere', 'snapshot'):
+        run, project, data = interim_run('restore-link-inside-' + kind, phase='P8')
+        write_text_file(run / 'audit.json', '{interrupted')
+        logs = run / 'evidence' / 'logs'
+        target = run / 'elsewhere' if kind == 'elsewhere' else run / 'checkpoints' / 'interim' / 'files' / 'evidence' / 'logs'
+        if kind == 'elsewhere':
+            shutil.copytree(logs, target)
+        remove_tree(logs)
+        link_error = make_link(target, logs)
+        if link_error is not None:
+            break
+        marks = file_marks(run)
+        code_dry, _, output_dry = cli_json('checkpoint', 'restore', str(run), '--dry-run')
+        code, _, output = cli_json('checkpoint', 'restore', str(run))
+        observed[kind] = (code_dry == 2 and code == 2 and all(
+            f'evidence/logs/CHK-002.log (evidence/logs -> {os.path.realpath(target)})' in text
+            and 'The restore follows no link. Nothing moved or restored' in text for text in (output_dry, output))
+            and not list(run.glob('recovery-*')) and file_marks(run) == marks
+            and (run / 'audit.json').read_text(encoding='utf-8') == '{interrupted'
+            and verify_checkpoint(run)['state'] == 'VALID', [output_dry[-300:], output[-300:]])
+    if link_error is not None:
+        results.append({'id': 'RESTORE_REFUSES_LINK_INSIDE_RUN', 'kind': 'TOOL_CONTROL', 'result': 'SKIPPED',
+                        'detail': f'Neither a junction nor a symbolic link can be created here: {link_error}'})
+    else:
+        control(results, 'RESTORE_REFUSES_LINK_INSIDE_RUN', all(ok for ok, _ in observed.values()), observed)
+    return results
+
+
+# Every control group of the selftest: group name (its abort is reported as <group>_CONTROLS_COMPLETE), runner
+# function, fixture folder, and whether the runner appends to the list it is given.
+SELFTEST_GROUPS = (
+    ('VALIDATOR', 'run_validator_controls', 'validator', False),
+    ('VALIDATOR_CONTRACT', 'run_validator_contract_controls', 'validator-contract', False),
+    ('CLOSURE_EVIDENCE', 'run_closure_evidence_controls', 'closure-evidence', False),
+    ('DOWNGRADE', 'run_downgrade_controls', 'downgrade', False),
+    ('VALIDATOR_FOLLOWUP', 'run_validator_followup_controls', 'validator-followup', False),
+    ('TOOL', 'run_tool_controls', 'tools', False), ('CORE2', 'run_core2_controls', 'core2', False),
+    ('CHECKPOINT_WORKFLOW', 'run_checkpoint_workflow_controls', 'checkpoint-workflow', False),
+    ('RECOVERY_INTEGRITY', 'run_recovery_integrity_controls', 'recovery-integrity', False),
+    ('CHECKPOINT_INPUT', 'run_checkpoint_input_controls', 'checkpoint-input', False),
+    ('CLOSURE', 'run_closure_controls', 'closure', False),
+    ('SELECTION_CHECKPOINT', 'run_selection_checkpoint_controls', 'selection-checkpoint', False),
+    ('WORKSPACE_SAFEGUARD', 'run_workspace_safeguard_controls', 'workspace-safeguards', True),
+    ('WORKSPACE_FIX', 'run_workspace_fix_controls', 'workspace-fixes', True),
+    ('WORKSPACE_ISOLATION', 'run_workspace_isolation_controls', 'workspace-isolation', True),
+    ('WORKSPACE_CLEANUP_GIT', 'run_workspace_cleanup_git_controls', 'workspace-cleanup-git', True),
+    ('ENVIRONMENT_PROCESS', 'run_environment_process_controls', 'environment-process', True),
+    ('EXECUTION_MASKING', 'run_execution_masking_controls', 'execution-masking', True),
+    ('KEY_BLOCK_MASKING', 'run_key_block_masking_controls', 'key-block-masking', False),
+    ('RUNNER_HARDENING', 'run_runner_hardening_controls', 'runner-hardening', False),
+    ('CHECKPOINT_ANCHOR', 'run_checkpoint_anchor_controls', 'checkpoint-anchor', False),
+    ('GUARD_MASKING', 'run_guard_masking_controls', 'guard-masking', False),
+    ('INTEGRATION', 'run_integration_controls', 'integration', False),
+    ('CHECKPOINT_RECOVERY', 'run_checkpoint_recovery_controls', 'checkpoint-recovery', False),
+    ('CHECKPOINT_REANCHOR', 'run_checkpoint_reanchor_controls', 'checkpoint-reanchor', False),
+)
+SELFTEST_RUNNERS = tuple(runner for _, runner, _, _ in SELFTEST_GROUPS)
+
+
+# Controls of run_guard_masking_controls. Arguments of ordinary commands: none of them names a path in the original.
+ORDINARY_COMMAND_SHAPES: tuple[tuple[str, ...], ...] = (
+    ('--define', 'KEY=value', 'a=b', 'x@y.org', 'pkg@1.2.3', '@scope/pkg@1.2.3'),
+    ('-Iinc', '-I./inc', '-I/usr/include', '-DNAME=/usr/include', '-IC:\\Windows\\System32'),
+    ('/p:Configuration=Release', '/t:Build', '/nologo', '/m:4', '/v:minimal'),
+    ('https://example.org/a?b=c', 'file:///C:/Windows/win.ini', 'git+https://example.org/x.git@v1'),
+    ('file:./src/data.txt', 'file:../copy/src', 'src/data.txt'),
+    ('@w.py', '@inc/a.h', '--config=inc/a.h', '-oinc/out.o', '/out:inc\\x.dll'),
+    ('proj', 'proj/src', '..', '../..'),
+    ('-k', 'test_a or test_b', '-m', 'not slow', '-n4', '-x', '--tb=short', 'tests/test_a.py::TestX::test_y[param=1]'),
+    ('-v', './src:/app/src:ro', '-p', '8080:80', '-e', 'A=b', '--mount', 'type=bind,source=./src,target=/src'),
+    ('-Dfile.encoding=UTF-8', '-Xmx512m', '-cp', 'lib/*;classes', '-jar', 'app.jar'),
+    ('a:b', 'C:', 'con', 'nul', 'NUL', '*', '?', 'src/**/*.py', '{a,b}', '[abc]', 'tests/*'),
+)
+# Output that quotes private-key markers without holding a key: a search for markers, a scanner report, a failed test.
+KEY_MARKER_OUTPUTS: dict[str, list[str]] = {
+    'search': [
+        './certs/dev.key:1:-----BEGIN PRIVATE KEY-----',
+        './docs/setup.md:88:Paste the block starting with -----BEGIN OPENSSH PRIVATE KEY----- into the deploy key field.',
+        './tests/fixtures/expired_cert_and_key.pem:30:-----BEGIN RSA PRIVATE KEY-----',
+        './src/crypto/pem.py:14:    if not text.startswith("-----BEGIN PRIVATE KEY-----"):',
+        './src/crypto/pem.py:15:        raise ValueError("not a PKCS#8 key")',
+        './src/services/payments/providers/acquirer/client.py:201:    key = load(path)',
+        './node_modules/somepackage/dist/vendor/bundle/chunk/a1b2c3d4e5f60718293a4b5c6d7e8f90.js:1:var k=1',
+    ],
+    'scanner': [
+        'Finding:     -----BEGIN RSA PRIVATE KEY-----',
+        'Secret:      -----BEGIN RSA PRIVATE KEY-----',
+        'RuleID:      private-key',
+        'Entropy:     5.875',
+        'File:        config/keys/dev_signing.pem',
+        'Line:        1',
+        'Commit:      3f9a2b7c1d4e5f60718293a4b5c6d7e8f9012345',
+        'Author:      Ann Example',
+        'Email:       ann@example.org',
+        'Date:        2026-01-01T00:00:00Z',
+        'Fingerprint: 3f9a2b7c1d4e5f60718293a4b5c6d7e8f9012345:config/keys/dev_signing.pem:private-key:1',
+        '',
+        'Finding:     AWS_ACCESS_KEY_ID=AKIA' 'IOSFODNN7EXAMPLE',
+        'RuleID:      aws-access-token',
+        'File:        deploy/terraform/environments/staging/main.tf',
+        'Commit:      9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807',
+        'Fingerprint: 9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807:deploy/terraform/environments/staging/main.tf:'
+        'aws-access-token:14',
+        '10:00AM INF 2 commits scanned.',
+        '10:00AM WRN leaks found: 2',
+    ],
+    'failed_test': [
+        'tests/test_pem.py::test_rejects_garbage FAILED',
+        'E   ValueError: expected -----BEGIN PRIVATE KEY----- at start of input',
+        'tests/unit/services/payments/providers/test_acquirer.py::test_sign PASSED',
+        'tests/test_hash.py::test_digest FAILED',
+        "E   AssertionError: assert '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824' == "
+        "'9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'",
+        'Python Version: 3.13.1',
+        'Content-Type: text/html; Charset: utf-8',
+        'commit 3f9a2b7c1d4e5f60718293a4b5c6d7e8f9012345',
+        'coverage: src/services/payments/providers/acquirer/client 91%',
+        'see https://ci.example.org/artifacts/9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807/report',
+        '1 failed',
+    ],
+}
+# Env files as loaders read them: (case, file text, what the program prints, the part that must not be readable).
+ENV_FILE_LOADER_CASES: list[tuple[str, str, str, str]] = [
+    ('unquoted_blanks', 'SECRET_PHRASE=correct horse battery staple\n', 'correct horse battery staple',
+     'horse battery staple'),
+    ('quoted_blanks', 'SECRET_PHRASE="correct horse battery staple"\n', 'correct horse battery staple', 'horse battery'),
+    ('inline_comment', 'API_TOKEN=Tq7vWx2Lp9Rm4Zk8 # production\n', 'Tq7vWx2Lp9Rm4Zk8', 'Tq7vWx2Lp9Rm4Zk8'),
+    ('hash_in_value', 'API_TOKEN=Tq7vWx2Lp#9Rm4Zk8\n', 'Tq7vWx2Lp#9Rm4Zk8', 'Tq7vWx2Lp#9Rm4Zk8'),
+    ('semicolon', 'API_TOKEN=Tq7vWx2Lp9Rm4Zk8;\n', 'Tq7vWx2Lp9Rm4Zk8', 'Tq7vWx2Lp9Rm4Zk8'),
+    ('escaped_quote', 'DB_PASSWORD="Synth\\"Quote9Pw"\n', 'Synth"Quote9Pw', 'Quote9Pw'),
+    ('escaped_newline', 'DB_PASSWORD="SynthLine1Aa9\\nSynthLine2Bb8"\n', 'SynthLine1Aa9\nSynthLine2Bb8', 'SynthLine2Bb8'),
+    ('multi_line', 'DB_PASSWORD="SynthLine1Aa9\nSynthLine2Bb8"\n', 'SynthLine1Aa9\nSynthLine2Bb8', 'SynthLine1Aa9'),
+    ('braced_reference', 'PREFIX=live\nAPI_TOKEN=${PREFIX}_Tq7vWx2Lp9Rm4Zk8\n', 'live_Tq7vWx2Lp9Rm4Zk8', 'Tq7vWx2Lp9Rm4Zk8'),
+    ('plain_reference', 'DB_PASSWORD=Synth9Pw$ENVNAME-77zq\nENVNAME=prod\n', 'Synth9Pwprod-77zq', 'Synth9Pwprod-77zq'),
+    ('escaped_dollar', 'DB_PASSWORD=Synth9\\$Pw77zq\n', 'Synth9$Pw77zq', 'Synth9$Pw77zq'),
+    ('name_pw', 'ADMIN_PW=Synth9Pass77zq\n', 'Synth9Pass77zq', 'Synth9Pass77zq'),
+    ('name_salt', 'HASH_SALT=Synth9Salt77zqAb\n', 'Synth9Salt77zqAb', 'Synth9Salt77zqAb'),
+    ('name_auth', 'BASIC_AUTH=ciuser:Synth9Pass77zq\n', 'ciuser:Synth9Pass77zq', 'Synth9Pass77zq'),
+    ('name_creds', 'SMTP_CREDS=Synth9Pass77zq\n', 'Synth9Pass77zq', 'Synth9Pass77zq'),
+    ('name_login', 'SONAR_LOGIN=sqp_Synth9Pass77zq1234567890abcdef\n', 'sqp_Synth9Pass77zq1234567890abcdef',
+     'Synth9Pass77zq1234567890'),
+    ('name_mnemonic', 'WALLET_MNEMONIC="abandon ability able about above absent absorb abstract"\n',
+     'abandon ability able about above absent absorb abstract', 'ability able about'),
+    ('name_seed', 'SIGNING_SEED=Synth9Seed77zqAbCd\n', 'Synth9Seed77zqAbCd', 'Synth9Seed77zqAbCd'),
+    ('name_license', 'APP_LICENSE=Synth9Lic77zqAbCdEf\n', 'Synth9Lic77zqAbCdEf', 'Synth9Lic77zqAbCdEf'),
+    ('connection_string', 'DB_CONNECTION=Server=db;User Id=sa;Pwd=Synth9Pass77zq;\n', 'Synth9Pass77zq', 'Synth9Pass77zq'),
+    ('url_password', 'DATABASE_URL=postgres://app:Synth9Pass77zq@db.internal:5432/app\n', 'Synth9Pass77zq',
+     'Synth9Pass77zq'),
+    ('query_password', 'JDBC_URL=jdbc:postgresql://db/app?user=app&password=Synth9Pass77zq&ssl=true\n', 'Synth9Pass77zq',
+     'Synth9Pass77zq'),
+    ('url_password_encoded', 'DATABASE_URL=postgres://app:Synth9%40Pass77zq@db.internal:5432/app\n', 'Synth9@Pass77zq',
+     'Synth9@Pass77zq'),
+    ('nested_reference', 'A_BASE=live\nB_MID=${A_BASE}_Synth9Nest77zq\nDB_PASSWORD=${B_MID}-x\n', 'live_Synth9Nest77zq-x',
+     'Synth9Nest77zq'),
+    ('connection_blank', 'DB_CONNECTION=Server=db;User Id=sa;Password=correct horse battery staple;Trusted=no\n',
+     'correct horse battery staple', 'horse battery'),
+    ('escape_hex_unicode', 'DB_PASSWORD="Synth\\u0041\\x42Pw9zq"\n', 'SynthABPw9zq', 'SynthABPw9zq'),
+    ('query_token', 'API_URL=https://api.example.org/v1?token=Synth9Tok77zq&x=1\n', 'Synth9Tok77zq', 'Synth9Tok77zq'),
+]
+
+
+def run_guard_masking_controls(root: Path) -> list[dict[str, Any]]:
+    """Paths into the original project in every argument form and in inherited values; ordinary output around key
+    markers; short values; over-long lines; credentials in the recorded command; env files as loaders read them; key
+    material without PEM armor; UTF-16 output."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    results: list[dict[str, Any]] = []
+    original, workspace, evidence, sibling = root / 'proj', root / 'copy', root / 'logs', root / 'proj-data'
+    source = original / 'src'
+    write_text_file(source / 'data.txt', 'original\n')
+    write_text_file(original / 'rootfile.txt', 'original\n')
+    write_text_file(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'notes.txt', 'results\n')
+    write_text_file(sibling / 'data.txt', 'sibling\n')
+    write_json_new(workspace / WORKSPACE_MARKER, {'project_root': str(original)})
+    write_text_file(workspace / 'src' / 'data.txt', 'copy\n')
+    write_text_file(workspace / 'inc' / 'a.h', 'x\n')
+    write_text_file(workspace / 'w.py', 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+    write_text_file(workspace / 'cat.py', 'import sys\nsys.stdout.buffer.write(open(sys.argv[1], "rb").read())\n')
+    python = sys.executable
+    common = ('--evidence-dir', str(evidence), '--cwd', str(workspace), '--tail', '0')
+    link = workspace / 'linked'
+    try:
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(source), str(link))
+        else:
+            os.symlink(source, link)
+    except OSError:
+        pass
+
+    def log_lines(stem: str) -> list[str]:
+        path = evidence / f'{stem}.log'
+        text = path.read_bytes().decode('utf-8', 'replace') if path.is_file() else ''
+        return text.replace('\r\n', '\n').split('\n') if text else []
+
+    def meta_of(stem: str) -> dict[str, Any]:
+        path = evidence / f'{stem}.meta.json'
+        value = read_json(path) if path.is_file() else {}
+        return value if isinstance(value, dict) else {}
+
+    def as_json(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+
+    # The original's root wherever it occurs in a string, and every part of a string that resolves into the original
+    # from the working directory, also through a link: refused in every form.
+    guard = OriginalGuard(workspace, workspace, None)
+    posix = original.as_posix()
+    refused = {
+        'second_equals': '--define=OUT=' + str(source / 'x.txt'),
+        'colon_option': '--out:' + str(source / 'x.txt'),
+        'attached_letters': '-isystem' + str(source),
+        'comma_list': 'src,' + str(source),
+        'path_list': 'src' + os.pathsep + str(source),
+        'quoted': '/out:"' + str(source / 'x.dll') + '"',
+        'at_quoted': '@"' + str(source / 'args.rsp') + '"',
+        'sqlite_url': 'sqlite:///' + posix + '/src/db.sqlite',
+        'git_file_url': 'git+file:///' + posix,
+        'percent_encoded': 'file:///' + posix[:-1] + '%6A/src/data.txt',
+        'after_other_text': 'map@' + str(source),
+        'relative': os.path.join('..', 'proj', 'src', 'data.txt'),
+        'link': os.path.join('linked', 'data.txt'),
+        'link_after_equals': '--out=' + os.path.join('linked', 'new.txt'),
+        'link_at_file': '@' + os.path.join('linked', 'args.rsp'),
+        'link_attached': '-isystem' + os.path.join('linked', 'inc'),
+        'link_in_list': 'src,' + os.path.join('linked', 'x'),
+        'link_then_parent': os.path.join('linked', '..', 'rootfile.txt'),
+        # percent-encoded: a URL that is no file URL, a bare path, an encoded slash, a relative path (judged as a part)
+        'percent_url_not_file': 'sqlite:///' + posix[:-1] + '%6A/src/db.sqlite',
+        'percent_bare_path': posix[:-1] + '%6A/src/data.txt',
+        'percent_slash': posix[:-len('/proj')] + '%2Fproj/src/data.txt',
+        'percent_relative': '..%2Fproj%2Fsrc%2Fdata.txt',
+        # the bare name of a link or junction, alone and after an option
+        'link_bare': 'linked',
+        'link_bare_after_equals': '--out=linked',
+    }
+    if os.name == 'nt':
+        drive, rest = posix[0].lower(), posix[3:]
+        refused.update({'percent_drive_colon': posix.replace(':', '%3A', 1) + '/src/data.txt', 'link_bare_upper': 'LINKED'})
+        refused.update({'forward_slashes': posix + '/src/data.txt', 'upper_case': str(source).upper() + '\\DATA.TXT',
+                        'git_bash': f'/{drive}/{rest}/src/data.txt', 'wsl': f'/mnt/{drive}/{rest}/src',
+                        'rooted_after_option': '/out:\\' + rest.replace('/', '\\') + '\\x.dll',
+                        'rooted_file_url': 'file:///' + rest + '/src/data.txt'})
+    shell_refused = {'quoted_redirect': f'echo x > "{source / "out.txt"}"',
+                     'redirect_without_blank': 'echo x>' + str(source / 'out.txt'),
+                     'link_word': ('type ' if os.name == 'nt' else 'cat ') + os.path.join('linked', 'data.txt')}
+    missed = [name for name, text in refused.items() if guard.reference(text) is None]
+    missed += [name for name, text in shell_refused.items() if guard.reference(text, shell=True) is None]
+    started = []
+    for name, extra in (('ARGUMENT', ['--', python, 'w.py', refused['second_equals']]),
+                        ('ENV-LIST', ['--env', 'SYNTH_PATHS=tests' + os.pathsep + str(source), '--', python, 'w.py']),
+                        ('ENV-OPTION', ['--env', 'SYNTH_OPTS=--out=' + str(source / 'x'), '--', python, 'w.py']),
+                        ('SHELL', ['--shell', '--', shell_refused['quoted_redirect']])):
+        code, output = run_cli('run', '--id', 'G2-' + name, *common, *extra)
+        if (code != 2 or 'points into the original project' not in output or 'Traceback' in output
+                or list(evidence.glob(f'G2-{name}*'))):
+            started.append(name)
+    control(results, 'RUN_REFUSES_ORIGINAL_IN_EVERY_ARGUMENT_FORM', not missed and not started and link.exists()
+            and not (source / 'out.txt').exists(), {'missed': missed, 'started': started})
+
+    # Reverse direction: ordinary command shapes, the results directory, the working copy, a sibling whose name starts
+    # with the original's name and directories above the original are accepted, and the arguments arrive unchanged.
+    ordinary = [argument for shape in ORDINARY_COMMAND_SHAPES for argument in shape]
+    elsewhere = ['-I' + str(workspace / 'inc'), 'file:' + workspace.as_posix() + '/src/data.txt',
+                 str(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'evidence' / 'x.json'),
+                 '--junitxml=' + str(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'evidence' / 'j.xml'),
+                 str(root), str(sibling / 'data.txt'), str(original) + '2', str(original) + '-data', root.anchor,
+                 tempfile.gettempdir(), 'x' * 20000, '\\\\?\\', 'NODE_ENV=test',
+                 'DATABASE_URL=postgres://u:p@localhost:5432/db', 'OPTS=--a=b --c=d', 'EMPTY=']
+    false_refusals = [text[:200] for text in ordinary + elsewhere if guard.reference(text) is not None]
+    false_refusals += [text for text in ('python w.py a=b && echo done > inc/out.txt',)
+                       if guard.reference(text, shell=True) is not None]
+    passed_on = [*ordinary, str(sibling / 'data.txt'), str(original / DEFAULT_RESULTS_DIRNAME / 'run' / 'notes.txt')]
+    code, output = run_cli('run', '--id', 'G2-ORDINARY', *common, '--env', 'NODE_ENV=test', '--env',
+                           'DATABASE_URL=postgres://u:p@localhost:5432/db', '--env', 'OPTS=--a=b --c=d', '--env', 'EMPTY=',
+                           '--', python, 'w.py', *passed_on)
+    arrived = as_json(log_lines('G2-ORDINARY')[0]) if log_lines('G2-ORDINARY') else None
+    control(results, 'RUN_ACCEPTS_ORDINARY_COMMAND_SHAPES', not false_refusals and code == 0 and arrived == passed_on,
+            {'false_refusals': false_refusals, 'exit': code, 'output': output[-600:] if code else '',
+             'changed': [[a, b] for a, b in zip(passed_on, arrived or []) if a != b]})
+
+    # Inherited values that point into the original are not passed on: a list loses its entries, any other value is
+    # removed with its variable, PWD names the working directory; nothing is refused and the command starts through
+    # the remaining PATH entries. Values that point elsewhere stay as they are.
+    venv = original / 'venv' / ('Scripts' if os.name == 'nt' else 'bin')
+    write_text_file(venv / Path(python).name, 'not a program\n')
+    os.chmod(venv / Path(python).name, 0o755)
+    kept = {'SYNTH_KEPT_ELSEWHERE': str(root / 'elsewhere'), 'SYNTH_KEPT_COPY': str(workspace / 'src'),
+            'SYNTH_KEPT_RESULTS': str(original / DEFAULT_RESULTS_DIRNAME / 'run'), 'SYNTH_KEPT_SIBLING': str(sibling),
+            'SYNTH_KEPT_URLS': 'https://example.org/a;https://example.org/b', 'SYNTH_KEPT_SEPARATORS': os.pathsep * 2}
+    dropped = {'PYTHONPATH': str(source), 'SYNTH_TRACE_FILE': str(source / 'trace.txt'),
+               'SYNTH_ADDOPTS': '--junitxml=' + str(source / 'report.xml'), 'OLDPWD': str(original),
+               'SYNTH_ALL_GONE': os.pathsep.join([str(source), str(original / 'rootfile.txt')])}
+    urls = ['https://example.org/a', 'https://example.org/b']
+    lists = {'SYNTH_LIBS': os.pathsep.join([str(workspace / 'src'), str(source), str(root / 'elsewhere')]),
+             'SYNTH_URLS': os.pathsep.join([urls[0], 'file:///' + posix.lstrip('/') + '/src', urls[1]]),
+             'PATH': os.pathsep.join([str(venv), str(Path(python).parent), os.environ.get('PATH', '')])}
+    write_text_file(workspace / 'env.py', 'import json, os, sys\n'
+                    'print(json.dumps({name: os.environ.get(name) for name in sys.argv[1:]}))\n')
+    names = [*kept, *dropped, *lists, 'PWD']
+    code, output = run_cli('run', '--id', 'G1-INHERITED', *common, '--', Path(python).name, 'env.py', *names,
+                           env={**os.environ, **kept, **dropped, **lists, 'PWD': str(original)})
+    seen = as_json(log_lines('G1-INHERITED')[0]) if log_lines('G1-INHERITED') else None
+    seen = seen if isinstance(seen, dict) else {}
+    meta = meta_of('G1-INHERITED')
+    meta_text = json.dumps(meta)
+    note = 'Inherited environment values that point into the original project are not passed on'
+    path_entries = (seen.get('PATH') or '').split(os.pathsep)
+    control(results, 'RUN_DROPS_INHERITED_VALUES_INTO_ORIGINAL', code == 0
+            and all(seen.get(name) == value for name, value in kept.items())
+            and all(seen.get(name, '') is None for name in dropped)
+            and seen.get('SYNTH_LIBS') == os.pathsep.join([str(workspace / 'src'), str(root / 'elsewhere')])
+            and str(venv) not in path_entries and str(Path(python).parent) in path_entries
+            and same_file(seen.get('PWD'), workspace)
+            and seen.get('SYNTH_URLS') == os.pathsep.join(urls)
+            and set(dropped) <= set(meta.get('stripped_env', []))
+            and meta.get('shortened_env') == ['PATH', 'SYNTH_LIBS', 'SYNTH_URLS']
+            and not set(kept) & set(meta.get('stripped_env', []))
+            and json.dumps(str(original))[1:-1] not in meta_text and output.count(note) == 1
+            and 'removed OLDPWD, PYTHONPATH, SYNTH_ADDOPTS, SYNTH_ALL_GONE, SYNTH_TRACE_FILE; entries dropped from PATH, '
+            'SYNTH_LIBS, SYNTH_URLS' in output and any(note in item for item in meta.get('notes', [])),
+            {'exit': code, 'seen': {name: value for name, value in seen.items() if name != 'PATH'},
+             'stripped': meta.get('stripped_env'), 'shortened': meta.get('shortened_env'), 'notes': output.count(note)})
+
+    # A key marker in ordinary output: the text before the marker stays, lines after it stay readable unless they hold
+    # base64 key text; digests, paths and lower-case runs are no key text; armor header words count only at the start
+    # of a line before the first key line; the masking after a block without END needs a key line. Key material
+    # without PEM armor and the value line of a PHP var_dump are masked, the lines around them are not.
+    begin, end = '-----BEGIN PRIVATE KEY-----', '-----END PRIVATE KEY-----'
+    b1 = 'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7SynthKeyBodyAAAA'
+    b2 = 'q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2Rt5WxSecretLine2'
+    b3 = 'SynthTail=='
+    late = 'Zx9LateKeyLine' + b2[:40]
+    key = '[REDACTED:PRIVATE_KEY]'
+    digest = 'integrity sha512-Kq7vWx2Lp9Rm4Zk8Ns3JdQw5Er6Ty7Ui8Op9As0DfGhJkLzXcVbNm1Qw2Er3Ty4U=='
+    six = [f'[worker {i}] collected {i} items' for i in range(6)]
+    five = ['line one', 'line two', 'line three', 'line four', 'line five']
+    public = {'kty': 'EC', 'crv': 'P-256', 'x': 'PublicXPublicXPublicXPublicXPublicXPublicX1',
+              'y': 'PublicYPublicYPublicYPublicYPublicYPublicY1'}
+    rsa = {'kty': 'RSA', 'n': 'PublicN' * 8, 'e': 'AQAB', 'd': 'SynthKeyBodyD' * 6, 'p': 'SecretLine2P' * 5,
+           'q': 'q8vLm2Q' * 8, 'dp': 'SynthKeyBodyDp' * 3, 'dq': 'SynthKeyBodyDq' * 3, 'qi': 'SynthKeyBodyQi' * 3}
+    jwk = '[REDACTED:JWK_PRIVATE_KEY]'
+    no_key = ('{"d": "2026-11-10T10:00:00", "q": "search words here", "p": "page-number-12", "k": "cache-key-000001", '
+              '"e": "AQAB"}')
+    ahead = {'d': 'SynthKeyBody_q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2', 'crv': 'P-256', 'x': public['x'], 'y': public['y'],
+             'kty': 'EC'}
+    ahead_masked = {**ahead, 'd': jwk}
+    others = {'kty': 'RSA', 'n': 'PublicN' * 8, 'e': 'AQAB', 'oth': [{'r': 'SynthOthR9' * 3, 'd': 'SynthOthD9' * 3,
+                                                                        't': 'SynthOthT9' * 3}]}
+    others_masked = {**others, 'oth': [{'r': jwk, 'd': jwk, 't': jwk}]}
+    far = {'d': 'SynthKeyBody_q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2', **{f'filler{i}': f'ordinary value {i}' for i in range(900)},
+           'kty': 'EC'}
+    far_masked = {**far, 'd': jwk}
+    ppk = ['PuTTY-User-Key-File-3: ssh-ed25519', 'Encryption: none', 'Comment: synthetic', 'Public-Lines: 2',
+           'AAAAC3NzaC1lZDI1NTE5AAAAIPublicPublicPublicPublicPublicPublic', 'AAAAPublicTail', 'Private-Lines: 1',
+           'AAAAIQ' + b2[:40], 'Private-MAC: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0']
+    ppk_lines = [*ppk[:6], 'Private-Lines: 3', 'AAAAIQ' + b2[:40], 'AAAAIQ' + b1[:40], 'AAAAIQ' + b2[20:60], ppk[8]]
+
+    def marked(lines: list[str]) -> list[str]:
+        return [re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*', key, line).replace(
+            'AKIA' 'IOSFODNN7EXAMPLE', '[REDACTED:AWS_ACCESS_KEY]') for line in lines]
+    # case -> (output lines, the log lines expected for them)
+    cases: dict[str, tuple[list[str], list[str]]] = {
+        name: (lines, marked(lines)) for name, lines in KEY_MARKER_OUTPUTS.items()}
+    cases.update({
+        'after_end': ([begin, b1, b2, b3, end, digest], [key] * 5 + [digest]),
+        'end_after_ordinary_lines': ([begin, b1, *five, end, digest], [key, key, *five, key, digest]),
+        'ordinary_lines_then_run': (['Error: expected ' + begin, *six, digest], ['Error: expected ' + key, *six, digest]),
+        'runs_that_are_no_key': (['Error: expected ' + begin, 'digest 0123456789abcdefABCDEF0123456789abcdef',
+                                  'src/main/java/com/example/security/KeyLoaderIntegrationTest1.java:42: error',
+                                  'etag w3k9bq7xw2p9rm4zk8ns3jdqw5er6ty7ui8op'],
+                                 ['Error: expected ' + key, 'digest 0123456789abcdefABCDEF0123456789abcdef',
+                                  'src/main/java/com/example/security/KeyLoaderIntegrationTest1.java:42: error',
+                                  'etag w3k9bq7xw2p9rm4zk8ns3jdqw5er6ty7ui8op']),
+        'header_word_inside_line': ([begin, 'see Version: 2 in the docs', '', 'ordinary text'],
+                                    [key, 'see Version: 2 in the docs', '', 'ordinary text']),
+        'header_word_after_prose': (['note: expected ' + begin, 'Version: 2.1 deployed'],
+                                    ['note: expected ' + key, 'Version: 2.1 deployed']),
+        'blank_lines': ([begin, '', b1, '', b2, end, 'after text here'], [key, '', key, '', key, key, 'after text here']),
+        'text_before_marker': (['./certs/dev.key:1:' + begin, b1, b2, b3, end, 'after text here'],
+                               ['./certs/dev.key:1:' + key, key, key, key, key, 'after text here']),
+        'ordinary_between_key_lines': ([begin, *(line for i in range(5) for line in (b1, f'warning {i}')), *[b2] * 200,
+                                        late, end, 'after text here'],
+                                       [key, *(line for i in range(5) for line in (key, f'warning {i}')), *[key] * 200,
+                                        key, key, 'after text here']),
+        'lower_case_marker': (['-----BEGIN private key-----', b1, b2, b3, '-----END private key-----', 'after text here'],
+                              [key] * 5 + ['after text here']),
+        'escaped_marker': ([json.dumps('\n'.join([begin, b1, b2, b3, end])).replace('-', '\\u002d'), 'after text here'],
+                           ['"' + key, 'after text here']),
+        'ssh_com_armor': (['---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----', 'Comment: "synthetic"', b1, b2, b3,
+                           '---- END SSH2 ENCRYPTED PRIVATE KEY ----', 'after text here'], [key] * 6 + ['after text here']),
+        'age_key': (['# created: 2026-01-01T00:00:00Z', 'AGE-SECRET-KEY-1SYNTHKEYBODY' + 'Q' * 40],
+                    ['# created: 2026-01-01T00:00:00Z', '[REDACTED:AGE_SECRET_KEY]']),
+        'putty_key_file': (ppk, [*ppk[:7], key, 'Private-MAC: [REDACTED:Private-MAC]']),
+        'putty_key_file_lines': (ppk_lines, [*ppk_lines[:7], key, key, key, 'Private-MAC: [REDACTED:Private-MAC]']),
+        'var_dump': (['  ["password":protected]=>', '  string(15) "Synth9Pass-77zq"', '  ["name"]=>',
+                      '  string(11) "Ann Example"', '  ["api_token":"App\\Models\\User":private]=>',
+                      '  string(16) "Tq7vWx2Lp9Rm4Zk8"'],
+                     ['  ["password":protected]=>', '  string(15) "[REDACTED:password]"', '  ["name"]=>',
+                      '  string(11) "Ann Example"', '  ["api_token":"App\\Models\\User":private]=>',
+                      '  string(16) "[REDACTED:api_token]"']),
+        'json_without_kty': ([no_key], [no_key]),
+        'jwk_one_line': ([json.dumps({**public, 'd': 'SynthKeyBody_q8vLm2Rt5WxZq8vLm2Rt5WxZq8vLm2'})],
+                         [json.dumps({**public, 'd': jwk})]),
+        'jwk_private_before_kty': ([json.dumps(ahead)], [json.dumps(ahead_masked)]),
+        'jwk_private_before_kty_pretty': (json.dumps(ahead, indent=2).split('\n'),
+                                          json.dumps(ahead_masked, indent=2).split('\n')),
+        'jwk_oth_entries': (json.dumps(others, indent=2).split('\n'), json.dumps(others_masked, indent=2).split('\n')),
+        'jwk_in_json_string': ([json.dumps(json.dumps(ahead))], [json.dumps(json.dumps(ahead_masked))]),
+        'jwk_private_far_before_kty': (json.dumps(far, indent=2).split('\n'), json.dumps(far_masked, indent=2).split('\n')),
+        'jwk_pretty': (json.dumps(rsa, indent=2).split('\n'),
+                       json.dumps({name: value if name in ('kty', 'n', 'e') else jwk for name, value in rsa.items()},
+                                  indent=2).split('\n')),
+    })
+    lines, spans = [], {}
+    for name, (case, _) in cases.items():
+        spans[name] = (len(lines), len(lines) + len(case))
+        lines += case + [end, f'=== end of case {name} ===']  # the END line resets the key state between cases
+    write_text_file(workspace / 'markers.txt', '\n'.join(lines) + '\n')
+    code, _ = run_cli('run', '--id', 'KEY-MARKERS', *common, '--', python, 'cat.py', 'markers.txt')
+    log = log_lines('KEY-MARKERS')
+    differing = {name: [[want, got] for want, got in zip(expected, log[spans[name][0]:spans[name][1]]) if want != got][:3]
+                 for name, (_, expected) in cases.items()}
+    differing = {name: pairs for name, pairs in differing.items() if pairs}
+    control(results, 'RUN_KEY_MARKERS_KEEP_ORDINARY_OUTPUT_READABLE', code == 0 and len(log) == len(lines) + 1
+            and not {name for name in differing if name in KEY_MARKER_OUTPUTS}, {
+                name: pairs for name, pairs in differing.items() if name in KEY_MARKER_OUTPUTS} or len(log))
+    control(results, 'RUN_KEY_TEXT_TESTS_KEEP_AND_MASK_THE_RIGHT_LINES', code == 0 and len(log) == len(lines) + 1
+            and not differing, differing or len(log))
+
+    # Output in UTF-16 is tested as text: the key block and the assignment are masked, the log stays UTF-16.
+    wide = ['before text', begin, b1, b2, b3, end, 'DB_PASSWORD=Synth9Pass-77zq', 'after text here']
+    (workspace / 'wide.txt').write_bytes(b'\xff\xfe' + ('\r\n'.join(wide) + '\r\n').encode('utf-16-le'))
+    code, _ = run_cli('run', '--id', 'UTF16', *common, '--', python, 'cat.py', 'wide.txt')
+    raw = (evidence / 'UTF16.log').read_bytes() if (evidence / 'UTF16.log').is_file() else b''
+    decoded = raw.decode('utf-16', 'replace').split('\r\n')
+    control(results, 'RUN_MASKS_KEYS_AND_ASSIGNMENTS_IN_UTF16_OUTPUT', code == 0 and decoded == [
+        'before text', *[key] * 5, 'DB_PASSWORD=[REDACTED:DB_PASSWORD]', 'after text here', ''], decoded)
+
+    # A value shorter than 12 characters or of letters only is masked only as a whole word; a longer mixed value
+    # wherever it occurs. The note names such --env, env-file and inherited variables, never a value.
+    redactor = Redactor({'DB_PASSWORD': 'test', 'SECRET_KEY': 'development', 'API_PIN': '1234',
+                         'APP_SECRET': 'Synth9Pass-77zq'})
+    words = {'tests/test_api.py::test_login PASSED in 0.12345s': 'tests/test_api.py::test_login PASSED in 0.12345s',
+             'the latest contest had 12340 developments': 'the latest contest had 12340 developments',
+             'running in development mode': 'running in [REDACTED:SECRET_KEY] mode',
+             'login test accepted, code 1234 sent': 'login [REDACTED:DB_PASSWORD] accepted, code [REDACTED:API_PIN] sent',
+             'xSynth9Pass-77zqy': 'x[REDACTED:APP_SECRET]y'}
+    wrong = {text: [redactor.redact_text(text), redactor.redact_bytes(text.encode())[0].decode(),
+                    redactor.redact_bytes(text.encode('utf-16-le'))[0].decode('utf-16-le')]
+             for text in words}
+    wrong = {text: found for text, found in wrong.items() if found != [words[text]] * 3}
+    env_copy = root / 'copy-env'
+    write_json_new(env_copy / WORKSPACE_MARKER, {'project_root': str(original), 'secret_value_files': ['.env']})
+    write_text_file(env_copy / '.env', 'SECRET_KEY=development\nAPI_TOKEN=Tq7vWx2Lp9Rm4Zk8\n')
+    write_text_file(env_copy / 'out.txt', 'tests/test_api.py::test_login PASSED\nrunning in development mode\n'
+                    'started as postgres user\ntoken xTq7vWx2Lp9Rm4Zk8x\n')
+    code, output = run_cli('run', '--id', 'M2-NOTES', '--evidence-dir', str(evidence), '--cwd', str(env_copy), '--tail',
+                           '0', '--inherit', 'SYNTH_DB_PASSWORD', '--', python, '-c',
+                           'import sys; sys.stdout.write(open("out.txt").read())',
+                           env={**os.environ, 'SYNTH_DB_PASSWORD': 'postgres'})
+    log = [re.sub(r'#\d+\]', ']', line) for line in log_lines('M2-NOTES')]
+    notes = meta_of('M2-NOTES').get('notes', [])
+    expected_notes = ['Env-file value of SECRET_KEY is shorter than 12 characters or of letters only',
+                      'Inherited value of SYNTH_DB_PASSWORD is shorter than 12 characters or of letters only']
+    control(results, 'RUN_MASKS_SHORT_VALUES_ONLY_AS_WHOLE_WORDS', not wrong and code == 0 and log == [
+        'tests/test_api.py::test_login PASSED', 'running in [REDACTED:SECRET_KEY] mode',
+        'started as [REDACTED:SYNTH_DB_PASSWORD] user', 'token x[REDACTED:API_TOKEN]x', '']
+            and all(note in output and any(note in item for item in notes) for note in expected_notes)
+            and not any(word in ' '.join(notes) for word in ('API_TOKEN', 'development', 'postgres')),
+            {'wrong': wrong, 'log': log, 'notes': notes})
+
+    # A line longer than the bound is cut after a separator and not continued: an ordinary line keeps its beginning,
+    # nothing of a secret that would cross the cut is written, the lines after it are intact.
+    secret = 'Kq7vWx2Lp9Rm4Zk8Ns3JdQw5'
+    floor = LONG_LINE_BYTES - LONG_LINE_BACK
+    token = 'eyJhbGciOiJIUzI1NiJ9.' + 'Sy9nThJwtPayLoad' * 500 + '.' + 'Sy9nThJwtSignature' * 20
+    long_lines = {
+        'ordinary': ''.join(f'word{i:07d} ' for i in range(3 * LONG_LINE_BYTES // 12)),
+        'bare_token': 'x' * (LONG_LINE_BYTES - 4000) + ' ' + token + ' ' + 'y' * 300000,
+        'quoted_words': '{"passphrase": "' + 'x' * (LONG_LINE_BYTES - 2000) + ' Sy9nTh pass phrase' * 20000 + '"}',
+        'value_at_cut': 'x' * (floor - 10) + secret + 'y' * 400000,
+        # last: the lines after a key marker are judged as lines of its block
+        'key_marker': '{"k": "' + 'x' * (LONG_LINE_BYTES - 3000) + begin + '\\n' + b1 + '\\n' + b2 + ' ' + b1 * 5000 + '"}',
+    }
+    write_text_file(workspace / 'long.txt', '\n'.join(long_lines.values()) + '\nafter the long lines\n')
+    code, output = run_cli('run', '--id', 'M3-CUT', '--evidence-dir', str(evidence), '--cwd', str(workspace), '--tail', '3',
+                           '--env', 'APP_SECRET=' + secret, '--', python, 'cat.py', 'long.txt')
+    log = log_lines('M3-CUT')
+    at = long_lines['ordinary'].rfind(' ', floor, LONG_LINE_BYTES) + 1
+    omitted = [int(m.group(1)) if m else None for m in (re.search(r'\[LINE CUT: (\d+) bytes omitted\]$', line)
+                                                         for line in log[:5])]
+    readable = [needle for needle in ('SynthKeyBody', 'SecretLine2', token[:30], 'Sy9nTh pass', secret[:10])
+                if any(needle in line for line in log) or needle in output]
+    meta = meta_of('M3-CUT')
+    control(results, 'RUN_CUTS_LONG_LINES_AT_A_SEPARATOR_AND_DROPS_THE_REST', code == 0 and len(log) == 7
+            and log[0] == long_lines['ordinary'][:at] + f'[LINE CUT: {len(long_lines["ordinary"]) - at} bytes omitted]'
+            and None not in omitted and not readable and key + '[LINE CUT: ' in log[4]
+            and log[3] == 'x' * (floor - 10) + f'[LINE CUT: {len(secret) + 400000} bytes omitted]'
+            and log[5:] == ['after the long lines', '']
+            and all(len(line) <= LONG_LINE_BYTES + 64 for line in log)
+            and meta.get('long_lines_cut') == 5 and meta.get('long_line_bytes_omitted') == sum(n or 0 for n in omitted)
+            and meta.get('log_lines') == 6 and meta.get('output_truncated') is False,
+            {'exit': code, 'lines': len(log), 'omitted': omitted, 'readable': readable,
+             'cut': meta.get('long_lines_cut'), 'bytes': meta.get('long_line_bytes_omitted')})
+
+    def peak_memory(proc: Any) -> int | None:
+        """Peak resident memory in bytes of an ended child process; on POSIX of the largest child so far."""
+        if os.name == 'nt':
+            class Counters(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
+                    (name, ctypes.c_size_t) for name in (
+                        'PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage', 'QuotaPagedPoolUsage',
+                        'QuotaPeakNonPagedPoolUsage', 'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage')]
+            counters = Counters()
+            counters.cb = ctypes.sizeof(counters)
+            query = ctypes.WinDLL('kernel32', use_last_error=True).K32GetProcessMemoryInfo
+            query.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            query.restype = wintypes.BOOL
+            return counters.PeakWorkingSetSize if query(int(proc._handle), ctypes.byref(counters), counters.cb) else None
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        return peak if sys.platform == 'darwin' else peak * 1024
+
+    # 300 MB without a line break are read with bounded memory: the beginning is kept, the rest counted.
+    chunks, limit = 4578, 200 * 1024 * 1024
+    write_text_file(workspace / 'big.py', 'import sys\nchunk = b"x" * 65536\n'
+                    f'for _ in range({chunks}):\n    sys.stdout.buffer.write(chunk)\n')
+    before = 0 if os.name == 'nt' else peak_memory(None) or 0
+    proc = subprocess.Popen([python, str(Path(__file__).resolve()), 'run', '--id', 'M3-MEMORY', *common, '--', python,
+                             'big.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        code = proc.wait(timeout=600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        code = proc.wait(timeout=30)
+    peak = peak_memory(proc)
+    meta = meta_of('M3-MEMORY')
+    control(results, 'RUN_READS_A_LINE_WITHOUT_END_WITH_BOUNDED_MEMORY', code == 0
+            and meta.get('output_bytes_read') == chunks * 65536 and meta.get('long_lines_cut') == 1
+            and meta.get('long_line_bytes_omitted') == chunks * 65536 - floor and meta.get('output_truncated') is False
+            and meta.get('log_bytes', limit) < LONG_LINE_BYTES + 64
+            and peak is not None and (peak < limit or peak <= before),
+            {'exit': code, 'peak_bytes': peak, 'before': before, 'read': meta.get('output_bytes_read'),
+             'omitted': meta.get('long_line_bytes_omitted'), 'log_bytes': meta.get('log_bytes')})
+
+    # The recorded command is masked like a log line: a value also given with --env and a password given as pass:X are
+    # readable neither in the log nor in the metadata nor in the running marker; ordinary option values stay.
+    registry, database, passin = 'Zr8kQ2mVx7Lp4Nd9', 'Hq5tW9zKc3Bn7Xs2', 'Jw4nR8sYd2Gk6Tb1'
+    write_text_file(workspace / 'args.py', 'import shutil, sys\nprint(" ".join(sys.argv[2:]))\n'
+                    'shutil.copyfile(sys.argv[1], "marker-copy.json")\n')
+    given = ['login', '-u', 'ci', '-p', registry, '-p' + database, '-u', 'ci:' + registry, '-passin', 'pass:' + passin,
+             '-p', '8080', '-u', '1000:1000', '--define', 'KEY=value']
+    shown = ['login', '-u', 'ci', '-p', '[REDACTED:SYNTH_REGISTRY]', '-p[REDACTED:SYNTH_DB]',
+             '-u', 'ci:[REDACTED:SYNTH_REGISTRY]', '-passin', 'pass:[REDACTED:pass:]', '-p', '8080', '-u', '1000:1000',
+             '--define', 'KEY=value']
+    code, output = run_cli('run', '--id', 'S1-ARGS', *common, '--env', 'SYNTH_REGISTRY=' + registry, '--env',
+                           'SYNTH_DB=' + database, '--', python, 'args.py', str(evidence / 'S1-ARGS.running.json'), *given)
+    meta = meta_of('S1-ARGS')
+    marker = read_json(workspace / 'marker-copy.json') if (workspace / 'marker-copy.json').is_file() else {}
+    texts = output + json.dumps(meta) + json.dumps(marker) + '\n'.join(log_lines('S1-ARGS'))
+    control(results, 'RUN_MASKS_CREDENTIALS_IN_THE_RECORDED_COMMAND', code == 0
+            and log_lines('S1-ARGS') == [' '.join(shown), ''] and meta.get('command', [])[3:] == shown
+            and marker.get('command', [])[3:] == shown and not any(value in texts for value in (registry, database, passin)),
+            {'exit': code, 'log': log_lines('S1-ARGS'), 'meta': meta.get('command'), 'marker': marker.get('command')})
+
+    # Env files are read as loaders read them; ordinary values of such a file are not recorded.
+    readable = {}
+    for name, text, printed, needle in ENV_FILE_LOADER_CASES:
+        values: dict[str, str] = {}
+        for key_name, value in assignment_secrets(text):
+            values.setdefault(f'{key_name}#{len(values) + 1}', value)
+        redactor = Redactor(values)
+        shown_text = redactor.redact_text(f'loaded {printed} ok')
+        shown_bytes = b''.join(redactor.redact_bytes(line)[0]
+                               for line in f'loaded {printed} ok\n'.encode().splitlines(True)).decode()
+        if (needle in shown_text or needle in shown_bytes or not shown_text.startswith('loaded ')
+                or not shown_text.endswith(' ok') or not shown_bytes.endswith(' ok\n')):
+            readable[name] = [shown_text, shown_bytes]
+    plain = ('APP_LICENSE=Apache-2.0\nRANDOM_SEED=12345678\nLOG_LEVEL=debug\nPORT=8080\n'
+             'SERVICE_URL=https://api.example.org/v1\nAPI_TOKEN=Tq7vWx2Lp9Rm4Zk8 # rotated monthly\n'
+             'GREETING=hello world from the app\nSECRET_KEY=changeme\n')
+    recorded = [value for _, value in assignment_secrets(plain)]
+    script = 'import os\n\n\ndef token():\n    return os.environ["API_TOKEN"]\n\n\nAPI_TOKEN = token() or fail("no token")\n'
+    queried = [value for _, value in assignment_secrets('API_URL=https://api.example.org/v1?token=Synth9Tok77zq&x=1\n')]
+    control(results, 'ENV_FILE_VALUES_RECORDED_AS_LOADERS_READ_THEM', not readable and recorded == ['Tq7vWx2Lp9Rm4Zk8']
+            and queried == ['Synth9Tok77zq'] and env_file_assignments(script) == [],
+            {'readable': readable, 'recorded': recorded, 'queried': queried})
+
+    # A recorded value is masked in the escaped and encoded forms programs print; other text in such forms stays.
+    value = 'Kq7+Wx2/Lp9=Rm4&Zk8<Ns3'
+    forms = {'url_lower_case': re.sub('%[0-9A-F]{2}', lambda m: m.group().lower(), quote(value, safe='')),
+             'html': html.escape(value), 'xml_numeric': value.replace('&', '&#38;').replace('<', '&#60;'),
+             'json_slash': value.replace('/', '\\/'),
+             'json_unicode': value.replace('+', '\\u002B').replace('&', '\\u0026').replace('<', '\\u003C'),
+             'json_unicode_lower_case': value.replace('&', '\\u0026').replace('<', '\\u003c'),
+             'base64': base64.b64encode(value.encode()).decode(),
+             'base64url': base64.urlsafe_b64encode(value.encode()).decode().rstrip('='), 'hex': value.encode().hex()}
+    redactor = Redactor({'APP_SECRET': value})
+    masked = 'value shown: [REDACTED:APP_SECRET] end'
+    unmasked = [name for name, form in forms.items()
+                if redactor.redact_text(f'value shown: {form} end') != masked
+                or redactor.redact_bytes(f'value shown: {form} end'.encode())[0].decode() != masked]
+    other = 'value shown: ' + base64.b64encode(b'another ordinary text 123').decode() + ' Kq7 Wx2 Lp9 &amp; %2b end'
+    control(results, 'MASKING_COVERS_ESCAPED_AND_ENCODED_VALUE_FORMS', not unmasked
+            and redactor.redact_text(other) == other, unmasked)
+
+    # Variables with further credential names and JDBC URLs with a password are not passed on; similar names are.
+    credentials = {'TS_AUTHKEY': 'x', 'TAILSCALE_AUTHKEY': 'x', 'OTEL_EXPORTER_OTLP_HEADERS': 'x', 'VPN_PSK': 'x',
+                   'OTP_SEED': 'x', 'WALLET_MNEMONIC': 'x', 'SEED_PHRASE': 'x', 'ACCOUNT_RECOVERY_CODE': 'x',
+                   'PASSWORD_PEPPER': 'x', 'OAUTH_REFRESH': 'x', 'HTTP_BEARER_VALUE': 'x',
+                   'SYNTH_JDBC': 'jdbc:postgresql://db/app?user=app&password=Synth9Pass77zq'}
+    ordinary_names = {'SYNTH_SEEDLING': 'x', 'REFRESH_INTERVAL': '30', 'SEED_DATA_DIR': 'seeds', 'PSKREPORTER': 'x',
+                      'SYNTH_JDBC_PLAIN': 'jdbc:postgresql://db/app?user=app&passwordless=1'}
+    control(results, 'RUN_STRIPS_FURTHER_CREDENTIAL_VARIABLES',
+            all(should_strip(name, value) for name, value in credentials.items())
+            and not any(should_strip(name, value) for name, value in ordinary_names.items()),
+            {'passed_on': [name for name, value in credentials.items() if not should_strip(name, value)],
+             'stripped': [name for name, value in ordinary_names.items() if should_strip(name, value)]})
+    # A key marker in the part of a cut line that is not written arms the key masking for the lines after it, also
+    # when the marker is split between two reads; the lines after an ordinary cut line stay readable.
+    prefix = LONG_LINE_BYTES + 2 * LONG_LINE_BACK + 5000
+    scripts = {
+        'whole': f'w.write(b"x" * {prefix} + b"{begin}\\n")',
+        'split': f'w.write(b"x" * {prefix}); w.flush(); time.sleep(2.5); w.write(b"-----BEGIN PRIV"); w.flush(); '
+                 'time.sleep(1.5); w.write(b"ATE KEY-----\\n")',
+        'plain': f'w.write(b"x" * {prefix} + b"\\n")',
+        'masked': f'w.write(b"{begin} " + b"x" * {prefix} + b"\\n")',
+    }
+    cut_tails, shown_tails = {}, {}
+    for name, head in scripts.items():
+        write_text_file(workspace / f'cut_{name}.py', 'import sys, time\nw = sys.stdout.buffer\n' + head + '\n'
+                        f'w.write(b"{b1}\\n{b2}\\nafter text here\\n")\n')
+        code, shown = run_cli('run', '--id', 'CUT-' + name.upper(), '--evidence-dir', str(evidence), '--cwd', str(workspace),
+                              '--tail', '5', '--', python, f'cut_{name}.py')
+        cut_tails[name] = (code, log_lines('CUT-' + name.upper())[1:])
+        shown_tails[name] = shown
+    control(results, 'RUN_KEY_MARKER_IN_THE_OMITTED_TAIL_OF_A_CUT_LINE_ARMS_THE_MASKING',
+            all(cut_tails[name] == (0, [key, key, 'after text here', '']) for name in ('whole', 'split'))
+            and cut_tails['plain'] == (0, [b1, b2, 'after text here', ''])
+            and re.search(re.escape(key) + r' \[LINE CUT: \d+ bytes omitted\]', shown_tails['masked']) is not None,
+            {'logs': cut_tails, 'tail': shown_tails['masked'][-300:]})
+
+    # Whole-word values are masked in bytes as in text: next to quotes, box characters and no-break spaces, not next
+    # to letters of any script.
+    redactor = Redactor({'DB_PASSWORD': 'hunter2', 'APP_SECRET': 'correcthorse'})
+    word_texts = ['pw=hunter2 ok', '“hunter2”', '│hunter2│', 'x hunter2 y', 'hunter2…',
+                  '✓ correcthorse ✓', 'ühunter2x', '密码hunter2', 'hunter2x', 'ücorrecthorse',
+                  'x correcthorse']
+    unequal = {text: [redactor.redact_text(text), redactor.redact_bytes(text.encode('utf-8'))[0].decode('utf-8')]
+               for text in word_texts}
+    unequal = {text: found for text, found in unequal.items() if found[0] != found[1]}
+    control(results, 'MASKING_WHOLE_WORDS_ARE_JUDGED_IN_BYTES_AS_IN_TEXT', not unequal
+            and redactor.redact_text('“hunter2”') == '“[REDACTED:DB_PASSWORD]”'
+            and redactor.redact_text('ühunter2x') == 'ühunter2x', unequal)
+
+    # A string with more parts than the guard judges is refused with the reason, an inherited one is removed and listed;
+    # the bound itself and a long ordinary list below it pass.
+    alphabet = '0123456789abcdefghijklmnopqrstuvwxyz'
+
+    def distinct_names(count: int) -> str:
+        """count distinct short names joined by `,` (a list of that size stays below the 32767 characters of a Windows
+        environment value)."""
+        names: list[str] = []
+        for size in range(1, 4):
+            names += [''.join(chosen) for chosen in itertools.islice(itertools.product(alphabet, repeat=size),
+                                                                     count - len(names))]
+        return ','.join(names)
+    many = distinct_names(PATH_PARTS_PER_STRING + 2)
+    limit_ok = len(path_parts(distinct_names(PATH_PARTS_PER_STRING - 2))) <= PATH_PARTS_PER_STRING
+    try:
+        path_parts(many)
+        limit_hit = False
+    except TooManyParts:
+        limit_hit = True
+    refused_text = ''
+    args = build_parser().parse_args(['run', '--id', 'G4-MANY', *common])
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            cmd_run(args, [python, '-c', 'pass', many])
+        except ToolError as exc:
+            refused_text = str(exc)
+    args = build_parser().parse_args(['run', '--id', 'G4-INHERITED', *common, '--inherit', 'SYNTH_MANY', '--inherit',
+                                      'SYNTH_LONG'])
+    longer = distinct_names(2000)
+    with patch.dict(os.environ, {'SYNTH_MANY': many, 'SYNTH_LONG': longer}), contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        cmd_run(args, [python, '-c', 'import os; print(sorted(k for k in os.environ if k.startswith("SYNTH_")))'])
+    meta = meta_of('G4-INHERITED')
+    control(results, 'GUARD_REFUSES_WHAT_IT_CANNOT_JUDGE_INSTEAD_OF_CUTTING_IT', limit_ok and limit_hit
+            and refused_text == (f'Argument 3 has more than {PATH_PARTS_PER_STRING} path-like parts; the run guard judges every '
+                                 'part and refuses the rest unseen. Split the command or pass the list through a file inside '
+                                 'the working copy.')
+            and meta.get('not_judged_env') == {'SYNTH_MANY': 'not judged: too many parts'}
+            and 'SYNTH_MANY' in meta.get('stripped_env', []) and 'SYNTH_LONG' not in meta.get('stripped_env', [])
+            and "'SYNTH_LONG'" in (log_lines('G4-INHERITED') or [''])[0] and 'SYNTH_MANY' not in (log_lines('G4-INHERITED') or [''])[0],
+            {'limit_ok': limit_ok, 'limit_hit': limit_hit, 'refused': refused_text, 'not_judged': meta.get('not_judged_env'),
+             'stripped': meta.get('stripped_env'), 'log': log_lines('G4-INHERITED')[:1]})
+
+    # --env values are masked wherever they occur from 6 characters on, whatever their shape and name; shorter ones
+    # under ordinary names are not recorded, so that words such as `true` stay readable.
+    write_text_file(workspace / 'envvals.txt', 'a Summer2024! b\nthe correcthorsebatterystaple phrase\nhunter2hunter2\n'
+                    'ordinary true story\nxSummer2024!x\n')
+    code, output = run_cli('run', '--id', 'ENV-ANY-NAME', *common, '--env', 'SYNTH_NOTE=Summer2024!', '--env',
+                           'SYNTH_PHRASE=correcthorsebatterystaple', '--env', 'SYNTH_REPEAT=hunter2hunter2', '--env',
+                           'SYNTH_FLAG=true', '--', python, 'cat.py', 'envvals.txt')
+    log = [re.sub(r'#\d+\]', ']', line) for line in log_lines('ENV-ANY-NAME')]
+    meta_text = json.dumps(meta_of('ENV-ANY-NAME'))
+    control(results, 'RUN_MASKS_ENV_VALUES_UNDER_ANY_NAME_FROM_SIX_CHARACTERS', code == 0 and log == [
+        'a [REDACTED:SYNTH_NOTE] b', 'the [REDACTED:SYNTH_PHRASE] phrase', '[REDACTED:SYNTH_REPEAT]', 'ordinary true story',
+        'xSummer2024!x', ''] and not any(item in meta_text + output for item in (
+            'Summer2024!', 'correcthorsebatterystaple', 'hunter2hunter2')), {'log': log})
+
+    # The user information of a URL without a colon is masked when it is long or generated-looking; names stay.
+    url_texts = {
+        'git clone https://ghp_Synth9Token77zqAbCdEfGh@github.com/o/r.git': 'git clone https://[REDACTED]@github.com/o/r.git',
+        'ssh://Kq7vWx2Lp9@host/x': 'ssh://[REDACTED]@host/x', 'https://octocat@github.com/o': 'https://octocat@github.com/o',
+        'git@github.com:org/repo.git': 'git@github.com:org/repo.git', 'mail me@example.org': 'mail me@example.org',
+        'https://deploy@host/p': 'https://deploy@host/p'}
+    redactor = Redactor({})
+    wrong = {}
+    for text, want in url_texts.items():
+        got = [redactor.redact_text(text), redactor.redact_bytes(text.encode())[0].decode()]
+        if got != [want, want]:
+            wrong[text] = got
+    control(results, 'MASKING_URL_USER_INFORMATION_THAT_IS_A_TOKEN', not wrong, wrong)
+    return results
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
+    chosen = set(getattr(args, 'group', None) or ())
+    names = [group for group, _, _, _ in SELFTEST_GROUPS if not chosen or group in chosen]
     # Synthetic fixtures only; inherit TEMP's ACL also in Windows sandboxes (3.13 mkdir(mode=0o700) restricts it).
     root = Path(tempfile.gettempdir()) / ('audit-tools-selftest-' + os.urandom(8).hex())
     root.mkdir()
     try:
-        results = (run_validator_controls(root / 'validator') + run_tool_controls(root / 'tools')
-                   + run_core2_controls(root / 'core2') + run_checkpoint_workflow_controls(root / 'checkpoint-workflow')
-                   + run_recovery_integrity_controls(root / 'recovery-integrity') + run_checkpoint_input_controls(root / 'checkpoint-input'))
-        workspace_controls: list[dict[str, Any]] = []
-        try:
-            run_workspace_safeguard_controls(root / 'workspace-safeguards', workspace_controls)
-        except Exception as exc:
-            control(workspace_controls, 'WORKSPACE_SAFEGUARD_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
-        results += workspace_controls
-        environment_controls: list[dict[str, Any]] = []
-        try:
-            run_environment_process_controls(root / 'environment-process', environment_controls)
-        except Exception as exc:
-            control(environment_controls, 'ENVIRONMENT_PROCESS_CONTROLS_COMPLETE', False, f'Control group aborted: {exc.__class__.__name__}')
-        results += environment_controls
+        results: list[dict[str, Any]] = []
+        for group, runner, folder, appends in SELFTEST_GROUPS:
+            if group in names:
+                control_group(results, group, globals()[runner], root / folder, appends)  # looked up when called
     finally:
         remove_tree(root)
     summary = {
@@ -5550,9 +17279,17 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     }
     summary['summary']['failed'] = [r['id'] for r in results if r['result'] == 'FAIL']
     summary['summary']['skipped'] = [r['id'] for r in results if r['result'] == 'SKIPPED']
+    summary['summary']['groups'] = names
+    summary['summary']['partial'] = len(names) < len(SELFTEST_GROUPS)
+    if summary['summary']['partial']:
+        summary['summary']['note'] = ('Only the named groups ran: this is no selftest result for the tool. Run '
+                                      'selftest without --group for that.')
     if args.out:
         write_json_new(Path(args.out), summary)
-    print_json(summary if not args.out else summary['summary'])
+    printed = dict(summary['summary'])
+    if not args.out and printed['failed']:
+        printed['failed_results'] = [r for r in results if r['result'] == 'FAIL']
+    print_json(printed)
     return 0 if not summary['summary']['failed'] else 1
 
 
@@ -5574,11 +17311,21 @@ def add_snapshot_options(parser: argparse.ArgumentParser) -> None:
                         help='Filesystem mode without default exclusions (node_modules, dist, ...)')
 
 
+CHECKPOINT_HELP = ('Create, verify, restore or re-anchor the immutable interim checkpoint. create records the manifest '
+                   'hash in RUN-STATE.json (interim_checkpoint) and, before P8, replaces a checkpoint that does not '
+                   'verify (moved to checkpoints/invalid-<UTC>/); verify compares it and revalidates the snapshot; '
+                   'restore moves the live files the manifest lists to recovery-<UTC>/ and copies the checkpoint back; '
+                   'reanchor writes the anchor again into a RUN-STATE.json rebuilt after damage (with tool_version, '
+                   'without an anchor) when the checkpoint verifies against its manifest, and records '
+                   'reanchored_at_utc. This detects accidents and careless repairs, not a party that rewrites both '
+                   'files.')
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='audit_tools.py', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
-    p = sub.add_parser('init', help='Create run directory and capture start baseline')
+    p = sub.add_parser('init', help='Create run directory, capture start baseline and write audit.json skeleton')
     add_snapshot_options(p)
     p = sub.add_parser('cleanup', help='Remove working copy from workspace (checks marker and location)')
     p.add_argument('--dest', required=True, help='Working copy with .audit-workspace.json')
@@ -5602,7 +17349,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Additional paths to copy, e.g. ignored paths (credentials only with exact filename)')
     p.add_argument('--no-git-snapshot', action='store_true', help='No Git repository with snapshot commit in the copy')
     p.add_argument('--record', help='Also save summary as a new JSON file')
-    p = sub.add_parser('run', help='Execute command in the working copy: run [options] -- command ...')
+    p = sub.add_parser('run', help='Execute command in the working copy: run [options] -- command ...',
+                       epilog='A command that points into the original project is refused: wherever the path of the '
+                              'original occurs in an argument, a --env value or the --shell string, and where a part of '
+                              'them (split at quotes, =, commas, list separators and blanks of a shell string) resolves '
+                              'into it from the working directory, also through a link. Inherited variables that point '
+                              'into the original are not passed on. A string with more than 8192 distinct parts is '
+                              'refused (an inherited value of that kind is not passed on), as the guard judges every '
+                              'part or none. Not detected: a path that the command assembles '
+                              'itself (from variables, configuration files or code) and a string that the tool cannot '
+                              'split into parts (other encodings, shell expansions).')
     p.add_argument('--id', required=True, help='Check ID, becomes filename (e.g. CHK-012)')
     p.add_argument('--evidence-dir', required=True, help='Destination directory for log and metadata (evidence/logs of the run)')
     p.add_argument('--cwd', help='Working directory in the working copy')
@@ -5610,10 +17366,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Deliberately outside a working copy; only for read-only commands')
     p.add_argument('--timeout', type=float, default=1800, help='Seconds; 0 = no limit (default 1800)')
     p.add_argument('--tail', type=int, default=30, help='Number of final log lines to display')
-    p.add_argument('--shell', action='store_true', help='Execute command through the system shell')
+    p.add_argument('--shell', action='store_true',
+                   help='Execute command through the system shell (cmd.exe on Windows, /bin/sh on POSIX); the check for paths into the original project '
+                        'splits the shell string into words on a best-effort basis and does not expand variables')
     p.add_argument('--ci', action='store_true', help='Set CI=true')
     p.add_argument('--no-color', action='store_true', help='Disable color output')
-    p.add_argument('--env', action='append', metavar='NAME=VALUE', help='Set environment variable (repeatable)')
+    p.add_argument('--env', action='append', metavar='NAME=VALUE',
+                   help='Set environment variable (repeatable). A credential that must appear in an argument is also '
+                        'given with --env (any variable name): a value given here is masked wherever it occurs (log, '
+                        'metadata, running marker, output, recorded command) when it has 6 or more characters, '
+                        'whatever its shape, and as a whole word only when it is shorter than 12 characters or of '
+                        'letters only; a value under a credential name (..._PASSWORD, ..._TOKEN) or named with '
+                        '--redact is masked from 4 characters on')
     p.add_argument('--inherit', action='append', metavar='NAME',
                    help='Deliberately pass through an otherwise stripped variable (credentials, cloud accounts)')
     p.add_argument('--isolated-home', action='store_true',
@@ -5630,12 +17394,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--project', help='Original project (default: from the start baseline)')
     p.add_argument('--final', action='store_true', help='Final check: verdict, artifacts and contents required')
     p.add_argument('--json', action='store_true', help='Print result as JSON')
-    p = sub.add_parser('checkpoint', help='Create or verify the immutable interim checkpoint')
-    p.add_argument('action', choices=['create', 'verify'])
+    p = sub.add_parser('checkpoint', help=CHECKPOINT_HELP, description=CHECKPOINT_HELP)
+    p.add_argument('action', choices=['create', 'verify', 'restore', 'reanchor'])
     p.add_argument('run_dir')
     p.add_argument('--project', help='Original project (create; default from baseline)')
+    p.add_argument('--dry-run', action='store_true',
+                   help='restore and reanchor only: show what would be moved, copied or written; change nothing')
+    p = sub.add_parser('close', help='Record closure after final validation, or supersession by a linked run')
+    p.add_argument('run_dir')
+    p.add_argument('--project', help='Original project (default: from the start baseline)')
+    p.add_argument('--superseded-by', metavar='RUN_ID',
+                   help='Successor run beside this run that lists it in previous_run_ids; skips final validation')
     p = sub.add_parser('selftest', help='Run positive and negative controls of the tools')
     p.add_argument('--out', help='Save result as a new JSON file')
+    p.add_argument('--group', action='append', choices=[group for group, _, _, _ in SELFTEST_GROUPS], metavar='NAME',
+                   help='Run only this control group (repeatable, run in registration order). A partial run is '
+                        'no selftest result for the tool; it serves maintenance, such as the mutation probe. '
+                        'Groups: ' + ', '.join(group for group, _, _, _ in SELFTEST_GROUPS))
     p = sub.add_parser('example', help='Print fictional audit.json (materialize referenced artifacts before validating)')
     p.add_argument('--variant', choices=['go', 'nogo', 'interim'], default='go')
     return parser
@@ -5655,7 +17430,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(arguments)
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         'init': cmd_init, 'runs': cmd_runs, 'cleanup': cmd_cleanup, 'baseline': cmd_baseline, 'workspace': cmd_workspace, 'stop': cmd_stop,
-        'envkeys': cmd_envkeys, 'validate': cmd_validate, 'checkpoint': cmd_checkpoint, 'selftest': cmd_selftest, 'example': cmd_example,
+        'envkeys': cmd_envkeys, 'validate': cmd_validate, 'checkpoint': cmd_checkpoint, 'close': cmd_close, 'selftest': cmd_selftest, 'example': cmd_example,
     }
     try:
         if args.command == 'run':

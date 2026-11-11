@@ -202,7 +202,8 @@ WORKFLOW_TEXT: dict[str, tuple[str, ...]] = {
     'DELEGATION_LIMITS': ('allocated budget, provider/authorization limits, deferred-security restriction',
                          'prohibition on writing central state (audit.json, RUN-STATE.json)',
                          'condensed results with file:line evidence'),
-    'P9_CLOSURE': ('**P9 merge and final closure.**', 'Only after successful closure checks set `closed_at_utc`',
+    'P9_CLOSURE': ('**P9 merge and final closure.**',
+                   'Only after successful closure checks write the final RESUME.md, then record closure with `close <run>',
                    'NOT_PERFORMED is only for the user\'s decision not to run the review'),
     'FALSE_POSITIVE_LIMITS': ('User statements about the actual state (known problems) are hypotheses to check',
                              'Create tasks only for `MISLEADING` tests',
@@ -251,6 +252,48 @@ WORKFLOW_TEXT: dict[str, tuple[str, ...]] = {
     'CLOSURE_MARKER_RULE': ('Set `closed_at_utc` only at P9, a user-authorized terminal closure (§16.1) or supersession (§16)',
                             'write `executed_by: undisclosed` rather than guessing a model name'),
     'SECURITY_DOC_CLAIMS_ONLY_DEFERRED': ('Add `doc_claims` entries for security promises only in P8.',),
+    # Pins for the tool-aligned rules, grouped by topic; a changed sentence is adjusted in its group.
+    'RUN_MASKING_AND_COPY_RULES': ('distinctive and at least 12 characters',
+                                   'a private-key block is masked through its END line',
+                                   'Give a credential needed in an argument also with `--env`',
+                                   'paths a script assembles stay unseen',
+                                   '`.git` entries and files named like the copy marker are never copied',
+                                   "Act on the copy's notes and `incomplete` flag"),
+    'CHECK_PROGRAM_AND_CLARIFICATION_RULES': ('each stating a result that can change a claim, finding or gate',
+                                              'a `gap` alone fails closure',
+                                              'Persist prioritized uninspected work in RUN-STATE and REPORT',
+                                              'A user answer does not remove a conflict with contracts or external obligations',
+                                              'The answer starts the clarified investigation, not a finish line',
+                                              'each core objective has at least one T1 journey'),
+    'EXECUTION_EVIDENCE_RULES': ('it passes only on a run that exits with 0',
+                                 'Only a user-decided `exclusion: {reason, source_ids}`',
+                                 'terminating the client does not remove containers',
+                                 'quote its own result lines verbatim in `log_excerpts',
+                                 'A replacing re-run runs the same program or gives `rerun_reason`',
+                                 'A failed start leaves a one-line log that can evidence BLOCKED',
+                                 "the run's one STATIC sham-sweep check"),
+    'CLAIM_AND_REVIEW_RULES': ('Another agent, model or provider alone does not guarantee independent knowledge',
+                               'never by the evidence that confirmed it',
+                               'A claim with basis ASSUMED or UNKNOWN is never SUPPORTED or VIOLATED',
+                               'a successor that is not weaker (never itself or a cycle)'),
+    'TOOL_AND_CHECKPOINT_HANDLING': ('when the tool reports a too-old interpreter, try the next one',
+                                     'The interim checkpoint and its anchor are never edited or repaired by hand',
+                                     'with `checkpoint restore <run>`, never by copying files',
+                                     'repeat an INCOMPLETE restore after removing its cause',
+                                     'Of the checkpoint actions, only reanchor and restore take `--dry-run`',
+                                     'Repair an unrecorded closure by removing `closed_at_utc` and `closure`, then `close`'),
+    'CLOSURE_REVIEW_RULES': ('a checkpoint answer that does not address the check defers nothing',
+                             "answer each `closure_review` entry that `validate --final` prints",
+                             'A "no" reopens the check or finding'),
+    'RESUME_AND_CHECKPOINT_STATE': ('never fall back to an older run yourself',
+                                    'before P8 `checkpoint create` replaces it',
+                                    'never certify P8 results as interim',
+                                    'the `init` skeleton says `INITIAL` and `[]`',
+                                    'The checkpoint is a precondition of P8 and of every COMPLETE or GO verdict',
+                                    'afterwards entries are never removed from the registers',
+                                    'An empty file is no evidence',
+                                    'DONE also needs one executed security check with qualifying evidence',
+                                    "the number of `closure_review_entries` that `close` printed"),
 }
 
 # Other package files the agent follows; they must agree with the master prompt.
@@ -268,9 +311,11 @@ SKILL_TEXT = ('${CLAUDE_SKILL_DIR}', 'MASTER_PROMPT.md', 'START_PROMPT.md', 'RES
               'In P9 remove the copy', 'In every new session, including resume, security, re-audit and implementation',
               'neutral indexes also treat legacy H as security',
               'Never continue or start silently when earlier runs exist',
-              're-audit the latest closed run (Variant B, checks repairs) or start a new independent run')
+              're-audit the latest closed run (Variant B, checks repairs) or start a new independent run',
+              '`resume_guidance` is authoritative and `latest_resumable` agrees with it',
+              'unless `resume_guidance` offers a restore')
 SKILL_MAX_BYTES = 14_000  # retained entry-point/context budget; not a harness behavior test
-MASTER_MAX_WORDS = 16_000
+MASTER_MAX_WORDS = 17_000
 IMPLEMENTATION_TEXT = ('candidate_complete', 'IMPLEMENTATION.md', 'Decisions', 'RESUME_PROMPT.md, Variant B',
                        'audit_tools.py" runs --project .', 'Protection rules as in the audit', 'no additional provider',
                        'Initially skip security details in REPORT.md/audit.json',
@@ -282,7 +327,10 @@ RESUME_TEXT = ('Dispatch by persisted state under §16', 'unfinished P9', 'lates
                'Refuse security mode without a valid interim checkpoint',
                'review AND required P9 consolidation and closure', 'BEFORE reading SECURITY_REVIEW.md',
                'read only on reaching P8 after checkpoint verification',
-               'neutral indexes also treat legacy H as security')
+               'neutral indexes also treat legacy H as security',
+               'resume_guidance is authoritative',
+               'A PROBABLY_CLOSED run is no closed base until the user confirms it',
+               'Never edit or repair a checkpoint or its anchor by hand', 'never by copying files')
 PACKAGE_FILES = ('MASTER_PROMPT.md', 'START_PROMPT.md', 'RESUME_PROMPT.md',
                  'IMPLEMENTATION_PROMPT.md', 'SECURITY_REVIEW.md', 'SKILL.md', 'README.md', 'MANIFEST.json')
 EARLY_FILES = ('MASTER_PROMPT.md', 'SKILL.md', 'START_PROMPT.md', 'RESUME_PROMPT.md', 'IMPLEMENTATION_PROMPT.md')
@@ -321,6 +369,39 @@ README_TEXT = {
                              'name/value pairs in separate fields', 'values under four characters',
                              'names not classified as sensitive', 'follow §6'),
     'README_NEUTRALITY_LIMIT': ('Neutral wording cannot guarantee that project content never triggers model behavior.',),
+    # Workflow, requirements, commands and limits that the tool's behavior backs; grouped by topic.
+    'README_WORKFLOW_PROGRAM': ('valid `audit.json` skeleton, and the registers grow from it',
+                                'pre-registers the check program as `NOT_RUN` checks',
+                                'Every T1 journey gets a check of its own',
+                                '`close` records the closure after repeating the final validation',
+                                'can span several sessions'),
+    'README_RUN_STATUSES': ('`OPEN`, `CLOSED`, `PROBABLY_CLOSED`, `CORRUPT` or `LEGACY_*`',
+                            'its interim checkpoint is never restored over it',
+                            'is never reported as `latest_closed`'),
+    'README_TOOL_COMMANDS': ('| `close` |', '| `checkpoint` |', '`--out <new-file>` writes the full report'),
+    'README_REQUIREMENTS': ('then `python3`, then `py -3.10` or newer',
+                            'requires Python 3.10 or newer, found <version>'),
+    'README_PROBE_DOCS': ('`--group NAME` (repeatable)', 'is no selftest result for the tool',
+                          '`MUTATION_PROBE_FULL=1`', '`MUTATION_PROBE_WORKERS`'),
+    'README_INTEGRITY_LIMITS': ('there is no ledger of runs', '`W_CHECKPOINT_REANCHORED`',
+                                'is listed as `CORRUPT`', 'not held to the closure receipt and anchor rules'),
+    'README_PROCESS_LIMITS': ('No console control event is sent and there is no grace period',
+                              'leaves the job and is not ended', 'leaves the group and is not ended',
+                              'terminating the client does not remove containers',
+                              'An argument with `%`, `"`, `!` or a line break is refused'),
+    'README_PATH_LIMITS': ('refuses a program in the original', 'a path that the command assembles itself',
+                           'something other than `workspace` creates inside the working copy',
+                           'Runtimes that ask the operating system for the profile directory directly still see the real profile'),
+    'README_VALUE_MASKING_LIMITS': ('masked only as a whole word, not inside longer words',
+                                    'Shell, PowerShell, cmd and YAML re-quoted or escaped renderings',
+                                    'Key material without any marker',
+                                    'JWK private members are recognised in JSON only',
+                                    'a credential in another argument, such as `curl -u user:secret`, is not',
+                                    'An agent that rewrites such a file in the copy with synthetic values should do so before the first run'),
+    'README_WORKSPACE_LIMITS': ('`.git` entries and files named like the working-copy marker are never copied',
+                                'Alternate data streams are not fingerprinted',
+                                'trace2 targets off',
+                                'A file that cannot be read stops the command with a message'),
 }
 README_AGENTS = ('Claude Code', 'Codex CLI', 'Antigravity CLI', 'Antigravity app/IDE',
                  'Cursor', 'GitHub Copilot', 'OpenCode', 'Windsurf')
@@ -333,7 +414,37 @@ LEAK_EXAMPLES = {
     'maintenance/check_prompt_structure.py': (
         'Q:/fixture/project', r'Q:\\fixture\\project', '/Users/example/project', '/home/example/project',
         r'\\\\fixture-server\\share\\project', 'fixture@example.invalid'),
-    'tools/audit_tools.py': ('secret123' + '@db.example', 'UrlSecret7791' + '@registry.invalid'),
+    'tools/audit_tools.py': ('secret123' + '@db.example', 'UrlSecret7791' + '@registry.invalid',
+        # Windows path forms, URL and command-line fixtures of the selftest and help texts.
+        '(\\\\\\\\?\\\\C:\\\\x -> C:' + '\\\\x, \\\\\\\\?\\\\UNC\\\\s\\\\x -> \\\\\\\\s\\\\x)',
+        "'C:" + "\\\\Windows'",
+        'file:///C:' + '/x, file://localhost/x, file://server/share/x',
+        '/data/home' + '/u/proj is another path than /home' + '/u/proj',
+        "'C:" + "\\\\Python312\\\\python3.12.exe'",
+        '\'"C:' + '\\\\Windows\\\\System32\\\\cmd.exe" /d /s /c ""C:' + '\\\\Program Files\\\\nodejs\\\\%s.cmd" %s"\'',
+        "'C:" + "\\\\Python312\\\\python.exe -m pytest tests'",
+        "'\\\\\\\\srv\\\\share\\\\x', '\\\\\\\\?\\\\UNC\\\\srv\\\\share\\\\x'",
+        '-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEsynthetic\\\\n-----END RSA PRIVATE KEY-----',
+        "'C:" + "\\\\a b\\\\'",
+        "'\\\\src\\\\data.txt'",
+        "'\\\\src\\\\new.txt'",
+        "'-IC:\\\\Windows\\\\System32'",
+        "'file:///C:" + "/Windows/win.ini'",
+        '(`git@github.c' + 'om`, `ssh://git@host`)',
+        "'4410@git.i" + "nvalid/r'",
+        "'x@y.o" + "rg'",
+        "'Email:       ann@example.o" + "rg'",
+        'postgres://app:Synth9Pass77zq@db.i' + 'nternal:5432/app',
+        'postgres://app:Synth9%40Pass77zq@db.i' + 'nternal:5432/app',
+        'https://ghp_Synth9Token77zqAbCdEfGh@github.c' + 'om/o/r.git',
+        "'https://octocat@github.c" + "om/o'",
+        "'git@github.c" + "om:org/repo.git'",
+        "'mail me@example.o" + "rg'",
+    ),
+    # Byte-order marks, matched as a share path.
+    'maintenance/mutation_probe.py': (
+        "(b'\\\\xff\\\\xfe', b'\\\\xfe\\\\xff')",
+    ),
 }
 EVAL_PLAN_TEXT = ('Status: TEST PLAN - NOT EXECUTED', '### E40 - Early-file warning and model/runtime observation',
                   'where switching is not observable, record UNKNOWN',
@@ -342,7 +453,10 @@ EVAL_PLAN_TEXT = ('Status: TEST PLAN - NOT EXECUTED', '### E40 - Early-file warn
                   '### E60 - Session plans, yields and repeated-reading measurement',
                   '### E61 - Global budget across delegates and nested workers',
                   'RESUME_PROMPT.md, IMPLEMENTATION_PROMPT.md',
-                  'a matched fresh-session read of SECURITY_REVIEW.md as a warning-observation control')
+                  'a matched fresh-session read of SECURITY_REVIEW.md as a warning-observation control',
+                  '### E64 - Shallow audit: all T1 journeys behind one whole-suite check',
+                  '### E70 - False GO routes',
+                  '### E71 - Resume after closure, damaged state and a missing checkpoint')
 SECURITY_FINAL_LINE = 'Continue with P9 consolidation and final closure in the master prompt.'
 SECURITY_REVIEW_TEXT = {
     'SECURITY_REVIEW_DEFENSIVE_SCOPE': ("This is a defensive review of the user's own project within the start assignment's authorizations.",),
@@ -702,7 +816,7 @@ def check_package(text: str, files: dict[str, str | None]) -> list[dict[str, Any
         record(check_id, not missing, {'missing': missing})
     evaluation = files.get('maintenance/EVAL_PLAN.md') or ''
     scenarios = re.findall(r'^### E(\d+) - ', evaluation, flags=re.MULTILINE)
-    record('EVAL_PLAN_CONTRACT', scenarios == [f'{i:02d}' for i in range(1, len(scenarios) + 1)] and len(scenarios) >= 63
+    record('EVAL_PLAN_CONTRACT', scenarios == [f'{i:02d}' for i in range(1, len(scenarios) + 1)] and len(scenarios) >= 71
            and all(fragment in evaluation for fragment in EVAL_PLAN_TEXT))
     for check_id, pattern in (('NO_PERSONAL_PATHS_SHIPPED', PERSONAL_PATH), ('NO_EMAIL_ADDRESSES_SHIPPED', EMAIL_ADDRESS)):
         hits = {}

@@ -67,10 +67,10 @@ Apply Appendix A: an unexecuted mandatory security check prevents DONE; FAIL can
 
 On refusal, disclosed model change, tool failure or context stop, preserve checkpoint and last valid live state; persist reason, remaining checks and exact continuation, stop own services and retain the copy. No silent model/provider/data-flow changes. Leave unexecuted checks NOT_RUN with catch-up plans; BLOCKED requires evidenced impediment. Completed checks retain results. Use PENDING before review, IN_PROGRESS/BLOCKED after start under Appendix A; BLOCKED needs reason/start/executor. The run stays open; no GO.
 
-Resume under master prompt §16 with live/checkpoint/baseline checks; warn that restoring loses progress since interim closure, never overwrite usable progress automatically. NOT_PERFORMED, decision source and HUMAN/VERIFY task references apply only to the user's decision not to run review; refusal alone is no such decision. Performed-but-BLOCKED review follows section 8 and master prompt §16.1.
+Resume under master prompt §16 with live/checkpoint/baseline checks and follow `resume_guidance`: restore only when it offers one, with `checkpoint restore` after telling the user that restoring loses progress since interim closure; never overwrite usable progress automatically. NOT_PERFORMED, decision source and HUMAN/VERIFY task references apply only to the user's decision not to run review; refusal alone is no such decision. Performed-but-BLOCKED review follows section 8 and master prompt §16.1.
 
 ## 10. Merge and final closure (P9)
 
-Continue to P9 even when entered through `security` mode: consolidate, validate, review semantics, compare baseline and clean up under master prompt §16.1, including PARTIAL closure with security status BLOCKED; if P9 cannot finish, leave the run open with its next step.
+Continue to P9 even when entered through `security` mode: consolidate, validate, review semantics, compare baseline and clean up under master prompt §16.1, then record closure with the tool's `close` command, including PARTIAL closure with security status BLOCKED; if P9 cannot finish, leave the run open with its next step.
 
 Continue with P9 consolidation and final closure in the master prompt.

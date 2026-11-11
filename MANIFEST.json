@@ -1,7 +1,7 @@
 {
   "package": "production-readiness-audit",
-  "prompt_version": "5.0",
-  "tool_version": "3.0.0",
+  "prompt_version": "5.1",
+  "tool_version": "3.1.0",
   "schema_version": "audit-core/2",
   "scope": "Prompt package files and helper tools; not a software audit or model benchmark.",
   "files": [
@@ -27,58 +27,58 @@
     },
     {
       "name": "maintenance/build_manifest.py",
-      "size_bytes": 4506,
-      "sha256": "b58b46d0098a1f92db9d9268dbb0e78da8a1946cdef48ec6b204d540836dd8bb"
+      "size_bytes": 5030,
+      "sha256": "ca3fc52ee3583d77ca11f9399aeb73fb1ac3be8caf9f27155461d2b484d4a602"
     },
     {
       "name": "maintenance/check_prompt_structure.py",
-      "size_bytes": 80501,
-      "sha256": "50feba416239d3b10dd1f2906eca952d9ff53dee22bd20131949a4801f7dc76e"
+      "size_bytes": 89834,
+      "sha256": "d87ed3c91094b6b6684799d937733c92f158333a51a665ea78c05a93a44b8a26"
     },
     {
       "name": "maintenance/EVAL_PLAN.md",
-      "size_bytes": 38754,
-      "sha256": "dcfe0cb5b96825a3c0d18e55955338cad0ad56cbdc06f3cc3374244762169bab"
+      "size_bytes": 43689,
+      "sha256": "bd055aa55bb7b77405b9230e6bbc5709eb3303fd6ed6b6679ebedd6459b144af"
     },
     {
       "name": "maintenance/mutation_probe.py",
-      "size_bytes": 43861,
-      "sha256": "e232a6ebd39d1cac98356d6fc18713176052f33ead59d0949d81548906a73231"
+      "size_bytes": 197424,
+      "sha256": "0bbcb501936bce3f8acbb57eba0748fb30d0cb7a381154105b83efbea6d8c2ee"
     },
     {
       "name": "MASTER_PROMPT.md",
-      "size_bytes": 118663,
-      "sha256": "c69b650edd6870d3b4b4112769d6fc5c2ccd5ed543a9bdfbab9220369d97d989"
+      "size_bytes": 123707,
+      "sha256": "d17dee54dfb58941e2544155d5993f3d35559efdb8215436f326f33190b8473f"
     },
     {
       "name": "README.md",
-      "size_bytes": 23471,
-      "sha256": "c56d6ab4e387af14177344af30b74ef6a6f3f1966d4cff71af82788d1f5ec728"
+      "size_bytes": 39133,
+      "sha256": "55975bf66256c9ce47aad9b56e6a92542b10a640f87e1dad0d0d39dd3b09562c"
     },
     {
       "name": "RESUME_PROMPT.md",
-      "size_bytes": 6191,
-      "sha256": "99cb8ced4e993ca1abe1ff1839dd15327f1c22ba432d85ea9c50941ea6ae3a16"
+      "size_bytes": 7570,
+      "sha256": "43c6ec55fe7e2ac883a2ab864e3d838dc2c67bf3284cf3f73b2abe240a704eb3"
     },
     {
       "name": "SECURITY_REVIEW.md",
-      "size_bytes": 10947,
-      "sha256": "3aae1ec920e360f80469fd6ea0c7394fce3b872db7ea40f4542e9f63d384d794"
+      "size_bytes": 11106,
+      "sha256": "48138589e088360964a24216459405865b7d139155d34b0423b4ea25e7927fe4"
     },
     {
       "name": "SKILL.md",
-      "size_bytes": 10136,
-      "sha256": "9ce070e97ffee85af652d30ed2c96f9b3245bb0724026624178dd623df9e39ad"
+      "size_bytes": 11586,
+      "sha256": "305813c5ace8829bcf257543d7c936ca441f30119cf3d0c6ab19fc6cbb6f0bde"
     },
     {
       "name": "START_PROMPT.md",
-      "size_bytes": 6156,
-      "sha256": "ef471d028e49bd7766f854f52449208010d4cd87d67da2117595e123d67d5daf"
+      "size_bytes": 6504,
+      "sha256": "2ded5eba0c71d8237f1be4f975f7fe1e608a83a3a07fb6c22484dcad1632298b"
     },
     {
       "name": "tools/audit_tools.py",
-      "size_bytes": 348080,
-      "sha256": "50ff0d108801a8f0b49a855c0a28c35b6f6dd942053ec0316ff5dd375585cb7e"
+      "size_bytes": 1146424,
+      "sha256": "7efb3fcd10227bf8f841c6ca917f01aafd63139f8499dae109949b00a0e968b0"
     }
   ],
   "note": "This manifest does not hash itself. Hashes establish byte identity, not truth."

@@ -52,8 +52,8 @@
     },
     {
       "name": "README.md",
-      "size_bytes": 39133,
-      "sha256": "55975bf66256c9ce47aad9b56e6a92542b10a640f87e1dad0d0d39dd3b09562c"
+      "size_bytes": 39366,
+      "sha256": "162170e938bba5a98f1b9eddba97f7441c19ff5e83da9ec0f509eed8501df1e6"
     },
     {
       "name": "RESUME_PROMPT.md",
@@ -77,8 +77,8 @@
     },
     {
       "name": "tools/audit_tools.py",
-      "size_bytes": 1146424,
-      "sha256": "7efb3fcd10227bf8f841c6ca917f01aafd63139f8499dae109949b00a0e968b0"
+      "size_bytes": 1148668,
+      "sha256": "d378c16f21a9ca6108d65147e546fc2ce302373d7d1e5079a663da8e3cfc89d4"
     }
   ],
   "note": "This manifest does not hash itself. Hashes establish byte identity, not truth."

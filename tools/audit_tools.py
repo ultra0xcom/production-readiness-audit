@@ -244,6 +244,7 @@ OMITTED_PREFIX = b'\0'
 # WHOLE_WORD_BELOW_CHARS (or of letters only) is masked only as a whole word; a line of a multi-line value is recorded
 # on its own from MULTILINE_PART_CHARS characters on.
 SECRET_FORMS_MAX_CHARS = 4096
+SECRET_CONTENT_SCAN_MAX_BYTES = 2_000_000
 WHOLE_WORD_BELOW_CHARS = 12
 ENV_VALUE_MIN_CHARS = 6  # a value given with --env under any name is recorded from this length on
 MULTILINE_PART_CHARS = 8
@@ -1422,23 +1423,31 @@ def symlink_is_safe(link: Path, target: str, project: Path) -> bool:
     return True
 
 
-def scan_secret_content(path: Path) -> list[str]:
-    """Names of credential patterns found in a small text file (values are never returned)."""
+def scan_secret_content(path: Path) -> tuple[list[str], str | None]:
+    """Names of credential patterns found in a small text file (values are never returned).
+
+    The second result explains why the file was not content-scanned; callers must
+    surface it instead of treating an empty first result as proof that the file is clean.
+    """
     try:
-        if path.stat().st_size > 2_000_000:
-            return []
+        size = path.stat().st_size
+    except OSError as exc:
+        return [], f'file cannot be inspected ({exc.strerror or exc.__class__.__name__})'
+    if size > SECRET_CONTENT_SCAN_MAX_BYTES:
+        return [], f'file is larger than {SECRET_CONTENT_SCAN_MAX_BYTES} bytes; content not scanned'
+    try:
         data = path.read_bytes()
-    except OSError:
-        return []
+    except OSError as exc:
+        return [], f'file cannot be read ({exc.strerror or exc.__class__.__name__})'
     if b'\0' in data[:8192]:
-        return []
+        return [], 'file contains NUL in its first 8192 bytes; content not scanned'
     hits = []
     if re.search(URL_CREDENTIALS.encode(), data):
         hits.append('URL_CREDENTIALS')
     if PRIVATE_KEY_BEGIN.search(data):
         hits.append('PRIVATE_KEY')
     hits.extend(name for name, pattern in TOKEN_PATTERNS if name != 'JWT' and re.search(pattern.encode(), data))
-    return hits
+    return hits, None
 
 
 def looks_like_placeholder(value: str) -> bool:
@@ -2153,14 +2162,16 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         target = dest / rel
         if not target.is_file() or sha256_file(target) != digest:
             mismatches.append(rel)
-    content_hits, original_refs, value_files = [], [], []
+    content_hits, content_scan_gaps, original_refs, value_files = [], [], [], []
     needles = original_path_needles(project)
     for rel in sorted({*copied, *included}):
         path = dest / rel
         if path.is_file() and not path.is_symlink():
-            names = scan_secret_content(path)
+            names, scan_gap = scan_secret_content(path)
             if names:
                 content_hits.append({'path': rel, 'patterns': names})
+            if scan_gap:
+                content_scan_gaps.append({'path': rel, 'reason': scan_gap})
             file_text = read_text_file(path)
             if file_text is not None and assignment_secrets(file_text):
                 value_files.append(rel)
@@ -2192,7 +2203,8 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         'unsafe_symlinks_not_created': unsafe[:50], 'links_not_created': not_created[:100],
         'explicitly_included': included[:200],
         'secret_like_files_copied': sorted(rel for rel in {*copied, *included} if looks_secret(rel, dest / rel)),
-        'secret_content_hits': content_hits[:100], 'secret_value_files': value_files[:100],
+        'secret_content_hits': content_hits[:100], 'secret_content_scan_gaps': content_scan_gaps[:100],
+        'secret_content_scan_gaps_total': len(content_scan_gaps), 'secret_value_files': value_files[:100],
         'secret_value_files_total': len(value_files),
         'original_path_refs': original_refs[:100],
         'include_unmatched': [value for value, _pattern, matches in include_matches if not matches],
@@ -2223,9 +2235,12 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     if unsafe:
         hints.append('Symlinks targeting paths outside the project were not created so writes cannot reach the '
                      'original.')
-    if summary['secret_like_files_copied'] or content_hits or value_files:
+    if summary['secret_like_files_copied'] or content_hits or value_files or content_scan_gaps:
         hints.append('The copy contains files with secret names or patterns. Check before each run and replace real '
                      'credentials with synthetic values; a committed secret is itself a finding.')
+    if content_scan_gaps:
+        hints.append('Copied files that were not content-scanned for secrets are listed in secret_content_scan_gaps; '
+                     'inspect them manually before sharing results or running untrusted code.')
     if original_refs:
         hints.append('Files in the copy reference the absolute path of the original (original_path_refs). Code, scripts '
                      'or configuration would read or write in the original from the copy: check before each run '
@@ -12283,6 +12298,22 @@ def run_tool_controls(root: Path) -> list[dict[str, Any]]:
             {'exit': code_ws, 'withheld': summary.get('withheld_credential_files'), 'head': head_ok})
     code_inside, _ = run_cli('workspace', '--project', str(project), '--dest', str(project / 'copy'))
     control(results, 'WORKSPACE_REFUSES_DEST_INSIDE_PROJECT', code_inside == 2 and not (project / 'copy').exists())
+
+    scan_project = root / 'scanproject'
+    write_text_file(scan_project / 'large.txt', FAKE_LIVE_KEY + '\n' + 'x' * 2_000_000)
+    write_text_file(scan_project / 'binary.txt', 'binary placeholder\n')
+    (scan_project / 'binary.txt').write_bytes(b'\x00' + FAKE_LIVE_KEY.encode('utf-8'))
+    scan_copy = root / 'workspace-scan-gaps'
+    code_scan, output_scan = run_cli('workspace', '--project', str(scan_project), '--dest', str(scan_copy),
+                                     '--no-git-snapshot')
+    scan_summary = json_head(output_scan)
+    gap_paths = sorted(item.get('path') for item in scan_summary.get('secret_content_scan_gaps', [])
+                       if isinstance(item, dict))
+    scan_ok = (code_scan == 0 and gap_paths == ['binary.txt', 'large.txt']
+               and scan_summary.get('secret_content_scan_gaps_total') == 2
+               and (scan_copy / 'large.txt').is_file() and (scan_copy / 'binary.txt').is_file())
+    control(results, 'WORKSPACE_REPORTS_SECRET_CONTENT_SCAN_GAPS', scan_ok,
+            {'exit': code_scan, 'gaps': scan_summary.get('secret_content_scan_gaps')})
 
     link_project = root / 'linkproject'
     write_text_file(link_project / 'inner.txt', 'inside\n')
